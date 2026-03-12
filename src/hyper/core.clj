@@ -288,6 +288,10 @@
    - :watches           — Vector of Watchable sources added to every page route.
                           Useful for top-level atoms that should trigger a re-render
                           on any page (e.g. a global config or feature-flags atom).
+   - :hiccup-transform  — (fn [hiccup] hiccup) applied to body and head hiccup before
+                          Chassis serialization. Useful for expanding component systems
+                          (e.g. lambdaisland/ornament defstyled components) into plain
+                          keyword-first hiccup vectors that Chassis can serialize.
 
    Example:
      (def routes
@@ -314,13 +318,14 @@
      (def app (start! handler {:port 3000}))
      ;; Later...
      (stop! app)"
-  [routes & {:keys [app-state head static-resources static-dir watches]
+  [routes & {:keys [app-state head static-resources static-dir watches hiccup-transform]
              :or   {app-state (atom (state/init-state))}}]
   (server/create-handler routes app-state
                          {:head             head
                           :static-resources static-resources
                           :static-dir       static-dir
-                          :watches          watches}))
+                          :watches          watches
+                          :hiccup-transform hiccup-transform}))
 
 (defn start!
   "Start the hyper application server.

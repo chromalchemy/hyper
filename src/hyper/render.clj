@@ -27,10 +27,17 @@
    event: datastar-patch-elements
    data: elements <html content>
 
-   (blank line to end event)"
+   (blank line to end event)
+
+   Per the SSE spec, literal newlines inside a data field must be split
+   across multiple `data:` lines — the client concatenates them with \\n.
+   However, for HTML payloads the newlines are insignificant whitespace,
+   so we replace them with spaces to keep the event on a single data line.
+   This avoids truncation when rendered HTML contains multi-line strings."
   [html]
-  (str "event: datastar-patch-elements\n"
-       "data: elements " html "\n\n"))
+  (let [safe-html (clojure.string/replace html "\n" " ")]
+    (str "event: datastar-patch-elements\n"
+         "data: elements " safe-html "\n\n")))
 
 (defn mark-head-elements
   "Add `{:data-hyper-head true}` to each top-level hiccup element in a
@@ -65,7 +72,7 @@
 
 (defn format-head-update
   "Build a self-removing <script> SSE event that imperatively updates
-   the document title and swaps user-provided <head> elements.
+   the document title and (optionally) swaps user-provided <head> elements.
 
    Why not morph?  Morphing <head> inner content via idiomorph can
    disconnect <style>/<link> elements from the browser's CSSOM — the
@@ -73,26 +80,33 @@
    remove-then-append we guarantee the browser re-evaluates them.
 
    User-managed head elements are tagged with `data-hyper-head` on the
-   initial page load.  On each SSE cycle we remove all `[data-hyper-head]`
-   nodes and insert the freshly-rendered set, supporting dynamic fns,
-   cache-busted asset URLs, etc.
+   initial page load.  When head elements change, we remove all
+   `[data-hyper-head]` nodes and insert the freshly-rendered set,
+   supporting dynamic fns, cache-busted asset URLs, etc.
+
+   When `swap-head?` is false (or omitted), only the document title is
+   updated — head elements are left untouched.  This avoids FOUC (Flash
+   of Unstyled Content) caused by briefly removing and re-adding
+   `<link>` stylesheet tags on every render cycle.
 
    The script tag uses Datastar's `mode append` + `selector body` pattern
    (the SDK's ExecuteScript convention) with `data-effect=\"el.remove()\"`
    so it auto-cleans after execution."
-  [title extra-head-html]
-  (let [js (str "(function(){"
-                "document.title='" (utils/escape-js-string (or title "Hyper App")) "';"
-                (when (seq extra-head-html)
-                  (str "document.querySelectorAll('[data-hyper-head]').forEach(function(el){el.remove()});"
-                       "var f=document.createRange().createContextualFragment('"
-                       (utils/escape-js-string extra-head-html) "');"
-                       "document.head.appendChild(f);"))
-                "})();")]
-    (str "event: datastar-patch-elements\n"
-         "data: mode append\n"
-         "data: selector body\n"
-         "data: elements <script data-effect=\"el.remove()\">" js "</script>\n\n")))
+  ([title extra-head-html]
+   (format-head-update title extra-head-html true))
+  ([title extra-head-html swap-head?]
+   (let [js (str "(function(){"
+                 "document.title='" (utils/escape-js-string (or title "Hyper App")) "';"
+                 (when (and swap-head? (seq extra-head-html))
+                   (str "document.querySelectorAll('[data-hyper-head]').forEach(function(el){el.remove()});"
+                        "var f=document.createRange().createContextualFragment('"
+                        (utils/escape-js-string extra-head-html) "');"
+                        "document.head.appendChild(f);"))
+                 "})();")]
+     (str "event: datastar-patch-elements\n"
+          "data: mode append\n"
+          "data: selector body\n"
+          "data: elements <script data-effect=\"el.remove()\">" js "</script>\n\n"))))
 
 (defn render-error-fragment
   "Render an error message as hiccup."
@@ -183,7 +197,10 @@
                                 (routes/find-route-title route-index (:name route)))
                    title      (routes/resolve-title title-spec req)
                    head       (some-> (routes/resolve-head (get @app-state* :head) req)
-                                      mark-head-elements)]
+                                      mark-head-elements)
+                   transform  (get @app-state* :hiccup-transform)
+                   body       (if transform (transform body) body)
+                   head       (if (and transform head) (transform head) head)]
                {:title     title
                 :head-html (some-> head c/html)
                 :body-html (c/html body)

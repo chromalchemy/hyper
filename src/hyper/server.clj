@@ -69,37 +69,43 @@
                                                             :body    payload}
                                                    false))]
         (when sent?
-          ;; Main render loop
-          (loop []
+          ;; Main render loop — tracks prev-head-html to avoid FOUC.
+          ;; Head elements (CSS links, fonts, etc.) are only swapped when
+          ;; the rendered head-html actually changes.  Title is always updated.
+          (loop [prev-head-html nil]
             (.acquire semaphore)
             (.drainPermits semaphore)
             (when-not (realized? shutdown-renderer*)
-              (let [sent? (try
-                            ;; Clean slate — remove stale actions before re-rendering
-                            (actions/cleanup-tab-actions! app-state* tab-id)
-                            (when-let [{:keys [title head-html body-html url]}
-                                       (render/render-tab app-state* session-id tab-id)]
-                              (let [head-event   (render/format-head-update title head-html)
-                                    div-attrs    (cond-> {:id "hyper-app"}
-                                                   url (assoc :data-hyper-url url))
-                                    wrapped-html (c/html [:div div-attrs (c/raw body-html)])
-                                    body-event   (render/format-datastar-fragment wrapped-html)
-                                    sse-payload  (str head-event body-event)
-                                    payload      (if br-stream
-                                                   (br/compress-stream br-out br-stream sse-payload)
-                                                   sse-payload)]
-                                (boolean (http-kit/send! channel payload false))))
-                            (catch Throwable e
-                              (t/error! e {:id   :hyper.error/renderer
-                                           :data {:hyper/tab-id tab-id}})
-                              nil))]
+              (let [result (try
+                             ;; Clean slate — remove stale actions before re-rendering
+                             (actions/cleanup-tab-actions! app-state* tab-id)
+                             (when-let [{:keys [title head-html body-html url]}
+                                        (render/render-tab app-state* session-id tab-id)]
+                               (let [head-changed? (not= head-html prev-head-html)
+                                     head-event    (render/format-head-update title head-html head-changed?)
+                                     div-attrs     (cond-> {:id "hyper-app"}
+                                                     url (assoc :data-hyper-url url))
+                                     wrapped-html  (c/html [:div div-attrs (c/raw body-html)])
+                                     body-event    (render/format-datastar-fragment wrapped-html)
+                                     sse-payload   (str head-event body-event)
+                                     payload       (if br-stream
+                                                     (br/compress-stream br-out br-stream sse-payload)
+                                                     sse-payload)
+                                     sent?         (boolean (http-kit/send! channel payload false))]
+                                 {:sent? sent? :head-html head-html}))
+                             (catch Throwable e
+                               (t/error! e {:id   :hyper.error/renderer
+                                            :data {:hyper/tab-id tab-id}})
+                               nil))
+                    sent?     (if (map? result) (:sent? result) nil)
+                    head-html (if (map? result) (:head-html result) prev-head-html)]
                 ;; sent? is true (ok), nil (no render-fn or error), false (channel closed)
                 (when-not (false? sent?)
                   ;; Throttle: sleep so triggers during this window accumulate
                   ;; as semaphore permits, which drainPermits collapses into
                   ;; a single render on the next iteration.
                   (Thread/sleep throttle-ms)
-                  (recur)))))))
+                  (recur head-html)))))))
       (catch Throwable e
         (when-not (realized? shutdown-renderer*)
           (t/error! e {:id   :hyper.error/renderer
@@ -499,6 +505,7 @@
    - :watches           Vector of Watchable sources added to every page route.
                         Useful for top-level atoms that should trigger a re-render
                         on any page (e.g. a global config or feature-flags atom).
+   - :hiccup-transform  (fn [hiccup] hiccup) applied before Chassis serialization.
 
    Routes should use :get handlers that return hiccup (Chassis vectors).
    Hyper will wrap them to provide full HTML responses and SSE connections."
@@ -516,7 +523,8 @@
          _                                        (swap! app-state* assoc
                                                          :routes-source routes
                                                          :global-watches (vec watches)
-                                                         :head head)
+                                                         :head head
+                                                         :hiccup-transform (:hiccup-transform opts))
          initial-routes                           (if (var? routes) @routes routes)
          initial-handler                          (build-ring-handler initial-routes app-state* page-wrapper system-routes)
          handler                                  (if (var? routes)
