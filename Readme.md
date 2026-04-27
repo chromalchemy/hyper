@@ -617,6 +617,42 @@ redefine it at the REPL, all connected tabs automatically update their `<head>`.
 
 This is typically how you’d include your compiled Tailwind stylesheet.
 
+## Reverse proxy: subfolder deployments
+
+If your app is served under a subfolder (e.g. `/my-app`) by a reverse proxy
+such as nginx or Caddy, pass `:base-path` to `create-handler`. Hyper will
+mount its internal endpoints (`/hyper/events`, `/hyper/actions`,
+`/hyper/navigate`) under that prefix and generate all client-side URLs
+accordingly — no manual path editing required.
+
+```clojure
+(def handler
+  (h/create-handler
+    #'routes
+    :base-path "/my-app"))
+```
+
+The value must start with `"/"` and have no trailing slash. With the above
+example, Hyper mounts its endpoints at:
+
+- `GET  /my-app/hyper/events`   — SSE stream
+- `POST /my-app/hyper/actions`  — action handler
+- `POST /my-app/hyper/navigate` — SPA back/forward navigation
+
+Your own application routes (e.g. `"/"`, `"/about"`) are unaffected — prefix
+those in your reverse proxy config as you normally would.
+
+A minimal nginx snippet for the above:
+
+```nginx
+location /my-app/ {
+  proxy_pass http://localhost:3000/;
+  proxy_http_version 1.1;
+  proxy_set_header Connection "";
+  proxy_buffering off;
+}
+```
+
 ## SSE connection behavior
 
 By default, Hyper keeps the SSE connection open even when the browser tab is

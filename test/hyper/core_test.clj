@@ -1,5 +1,6 @@
 (ns hyper.core-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.string :as string]
+            [clojure.test :refer [deftest is testing]]
             [hyper.context :as context]
             [hyper.core :as hy]
             [hyper.state :as state]
@@ -186,7 +187,16 @@
                             :get  (fn [_req] [:div "Home"])}]]
           handler    (hy/create-handler routes :app-state app-state*)]
       (is (fn? handler))
-      (is (= app-state* app-state*)))))
+      (is (= app-state* app-state*))))
+
+  (testing ":base-path is passed through to server and stored in app-state"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          _handler   (hy/create-handler routes
+                                        :app-state app-state*
+                                        :base-path "/sub")]
+      (is (= "/sub" (:base-path @app-state*))))))
 
 (deftest test-server-lifecycle
   (testing "start! and stop! work together"
@@ -435,3 +445,81 @@
           (is (.contains action-expr "hyper.encodeClientParams"))
           (is (.contains action-expr "value:evt.target.value"))
           (is (not (.contains action-expr " && "))))))))
+
+(deftest test-base-path-action
+  (testing "action macro uses /hyper/actions without :base-path"
+    (let [app-state* (atom (state/init-state))
+          session-id "test-session-bp"
+          tab-id     "test_tab_bp"]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (binding [context/*request* {:hyper/session-id session-id
+                                   :hyper/tab-id     tab-id
+                                   :hyper/app-state  app-state*}]
+        (let [action-expr (hy/action (swap! (hy/tab-cursor :n 0) inc))]
+          (is (string/includes? action-expr "@post('/hyper/actions?"))))))
+
+  (testing "action macro prefixes /hyper/actions with :base-path"
+    (let [app-state* (atom (assoc (state/init-state) :base-path "/my-app"))
+          session-id "test-session-bp"
+          tab-id     "test_tab_bp"]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (binding [context/*request* {:hyper/session-id session-id
+                                   :hyper/tab-id     tab-id
+                                   :hyper/app-state  app-state*}]
+        (let [action-expr (hy/action (swap! (hy/tab-cursor :n 0) inc))]
+          (is (string/includes? action-expr "@post('/my-app/hyper/actions?"))
+          (is (not (string/includes? action-expr "@post('/hyper/actions?")))))))
+
+  (testing "action macro with client params also prefixes the URL"
+    (let [app-state* (atom (assoc (state/init-state) :base-path "/sub"))
+          session-id "test-session-bp2"
+          tab-id     "test_tab_bp2"]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (binding [context/*request* {:hyper/session-id session-id
+                                   :hyper/tab-id     tab-id
+                                   :hyper/app-state  app-state*}]
+        (let [action-expr (hy/action (reset! (hy/tab-cursor :v) $value))]
+          (is (string/includes? action-expr "@post('/sub/hyper/actions?"))
+          (is (string/includes? action-expr "hyper.encodeClientParams"))))))
+
+  (testing "action macro with :when guard and :base-path"
+    (let [app-state* (atom (assoc (state/init-state) :base-path "/app"))
+          session-id "test-session-bp3"
+          tab-id     "test_tab_bp3"]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (binding [context/*request* {:hyper/session-id session-id
+                                   :hyper/tab-id     tab-id
+                                   :hyper/app-state  app-state*}]
+        (let [action-expr (hy/action {:when "evt.key === 'Enter'"}
+                                     (swap! (hy/tab-cursor :n 0) inc))]
+          (is (string/includes? action-expr "@post('/app/hyper/actions?"))
+          (is (string/starts-with? action-expr "evt.key === 'Enter' && ")))))))
+
+(deftest test-base-path-navigate
+  (testing "navigate uses /hyper/actions without :base-path"
+    (let [routes [["/" {:name :home :get (fn [_] [:div "Home"])}]
+                  ["/about" {:name :about :get (fn [_] [:div "About"])}]]
+          ctx    (make-test-context routes)]
+      (binding [context/*request* ctx]
+        (let [nav-attrs (hy/navigate :about)]
+          (is (string/includes? (str (:data-on:click__prevent nav-attrs))
+                                "@post('/hyper/actions?"))))))
+
+  (testing "navigate prefixes /hyper/actions with :base-path"
+    (let [routes     [["/" {:name :home :get (fn [_] [:div "Home"])}]
+                      ["/about" {:name :about :get (fn [_] [:div "About"])}]]
+          app-state* (atom (assoc (state/init-state) :base-path "/my-app"))
+          session-id "test-session-nav-bp"
+          tab-id     "test_tab_nav_bp"
+          router     (ring/router routes {:conflicts nil})]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (swap! app-state* assoc :router router :routes routes)
+      (binding [context/*request* {:hyper/session-id session-id
+                                   :hyper/tab-id     tab-id
+                                   :hyper/app-state  app-state*
+                                   :hyper/router     router}]
+        (let [nav-attrs (hy/navigate :about)]
+          (is (string/includes? (str (:data-on:click__prevent nav-attrs))
+                                "@post('/my-app/hyper/actions?"))
+          (is (not (string/includes? (str (:data-on:click__prevent nav-attrs))
+                                     "@post('/hyper/actions?"))))))))

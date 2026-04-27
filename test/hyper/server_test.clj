@@ -570,3 +570,83 @@
           response   (handler {:uri "/" :request-method :get})]
       (is (= 200 (:status response)))
       (is (.contains (:body response) "Static")))))
+
+(deftest test-base-path
+  (testing "Default (no :base-path) uses /hyper/* paths"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          handler    (server/create-handler routes app-state*)
+          response   (handler {:uri "/" :request-method :get})
+          body       (:body response)]
+      (is (= 200 (:status response)))
+      (is (string/includes? body "/hyper/events"))
+      (is (string/includes? body "/hyper/navigate"))
+      (is (not (string/includes? body "//hyper")))))
+
+  (testing ":base-path prefixes /hyper/events in data-init"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          handler    (server/create-handler routes app-state*
+                                            {:base-path "/my-app"})
+          response   (handler {:uri "/" :request-method :get})
+          body       (:body response)]
+      (is (= 200 (:status response)))
+      (is (string/includes? body "/my-app/hyper/events"))
+      (is (not (string/includes? body "@get('/hyper/events")))))
+
+  (testing ":base-path prefixes /hyper/navigate in popstate JS"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          handler    (server/create-handler routes app-state*
+                                            {:base-path "/my-app"})
+          response   (handler {:uri "/" :request-method :get})
+          body       (:body response)]
+      (is (string/includes? body "/my-app/hyper/navigate"))
+      (is (not (string/includes? body "fetch('/hyper/navigate")))))
+
+  (testing ":base-path mounts system routes under the prefix"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          handler    (server/create-handler routes app-state*
+                                            {:base-path "/my-app"})
+          ;; System routes should be accessible under /my-app/hyper/*
+          events-res (handler {:uri "/my-app/hyper/events" :request-method :get})
+          ;; And the old paths should not match (404)
+          old-res    (handler {:uri "/hyper/events" :request-method :get})]
+      (is (not= 404 (:status events-res)))
+      (is (= 404 (:status old-res)))))
+
+  (testing ":base-path is stored in app-state"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          _handler   (server/create-handler routes app-state*
+                                            {:base-path "/sub"})]
+      (is (= "/sub" (:base-path @app-state*)))))
+
+  (testing "default (no :base-path) stores empty string in app-state"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          _handler   (server/create-handler routes app-state*)]
+      (is (= "" (:base-path @app-state*)))))
+
+  (testing ":base-path works alongside other options"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          handler    (server/create-handler routes app-state*
+                                            {:base-path         "/app"
+                                             :open-when-hidden? false
+                                             :head              [[:link {:rel "stylesheet" :href "/app.css"}]]})
+          response   (handler {:uri "/" :request-method :get})
+          body       (:body response)]
+      (is (= 200 (:status response)))
+      (is (string/includes? body "/app/hyper/events"))
+      (is (string/includes? body "/app/hyper/navigate"))
+      (is (string/includes? body "rel=\"stylesheet\""))
+      (is (not (string/includes? body "openWhenHidden"))))))

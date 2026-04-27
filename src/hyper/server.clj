@@ -351,7 +351,7 @@
 
    Uses c/raw to prevent Chassis from HTML-escaping the JavaScript content
    (e.g., && would become &amp;&amp; which breaks JS syntax)."
-  [tab-id]
+  [tab-id base-path]
   [:script
    (c/raw
      (str "
@@ -393,7 +393,7 @@
     if (e.state && e.state.title) {
       document.title = e.state.title;
     }
-    fetch('/hyper/navigate?tab-id=" tab-id "&path=' + encodeURIComponent(window.location.pathname + window.location.search), {
+    fetch('" base-path "/hyper/navigate?tab-id=" tab-id "&path=' + encodeURIComponent(window.location.pathname + window.location.search), {
       method: 'POST',
       headers: {'Content-Type': 'application/json'}
     });
@@ -409,7 +409,8 @@
 
    Options:
    - :datastar-script - Hiccup content for Datastar script added to document head, or nil."
-  [app-state* {:keys [datastar-script open-when-hidden?] :or {open-when-hidden? true}}]
+  [app-state* {:keys [datastar-script open-when-hidden? base-path] :or {open-when-hidden? true
+                                                                        base-path         ""}}]
   (fn [render-fn]
     (fn [req]
       (let [tab-id     (:hyper/tab-id req)
@@ -438,11 +439,11 @@
                                                                             datastar-script
                                                                             (when head-html (c/raw head-html))]
                                                                            [:body
-                                                                            {:data-init (str "@get('/hyper/events?tab-id=" tab-id "'"
+                                                                            {:data-init (str "@get('" base-path "/hyper/events?tab-id=" tab-id "'"
                                                                                              (when open-when-hidden? ", {openWhenHidden: true}")
                                                                                              ")")}
                                                                             [:div div-attrs (c/raw body-html)]
-                                                                            (hyper-scripts tab-id)]]])]
+                                                                            (hyper-scripts tab-id base-path)]]])]
               {:status  200
                :headers {"Content-Type" "text/html; charset=utf-8"}
                :body    html})))))))
@@ -570,6 +571,11 @@
    - :open-when-hidden? Keep the SSE connection open when the browser tab is hidden
                         (default true). When false, Datastar closes the connection
                         on tab hide and reopens it when the tab becomes visible.
+   - :base-path         URL path prefix for reverse-proxy deployments where the app
+                        is served under a subfolder (e.g. \"/my-app\"). When set,
+                        all internal hyper endpoints (/hyper/events, /hyper/actions,
+                        /hyper/navigate) are mounted and referenced under this prefix.
+                        Must start with \"/\" and have no trailing slash.
    - :static-resources  Classpath resource root(s) to serve as static assets
    - :static-dir        Filesystem directory (or directories) to serve as static assets
    - :watches           Vector of Watchable sources added to every page route.
@@ -580,19 +586,22 @@
    Hyper will wrap them to provide full HTML responses and SSE connections."
   ([routes app-state*]
    (create-handler routes app-state* {:datastar-script (default-datastar-script)}))
-  ([routes app-state* {:keys [watches head] :as opts}]
-   (let [page-wrapper    (page-handler app-state* opts)
-         system-routes   [["/hyper/events" {:get (sse-events-handler app-state*)}]
-                          ["/hyper/actions" {:post (action-handler app-state*)}]
-                          ["/hyper/navigate" {:post (navigate-handler app-state*)}]]
+  ([routes app-state* {:keys [watches head base-path] :as opts}]
+   (let [base-path       (or base-path "")
+         page-wrapper    (page-handler app-state* (assoc opts :base-path base-path))
+         system-routes   [[(str base-path "/hyper/events") {:get (sse-events-handler app-state*)}]
+                          [(str base-path "/hyper/actions") {:post (action-handler app-state*)}]
+                          [(str base-path "/hyper/navigate") {:post (navigate-handler app-state*)}]]
          ;; Store the routes source (Var or value) so title resolution can
          ;; always read the latest route metadata, even between router rebuilds.
          ;; Store global :watches so find-route-watches can prepend them to
          ;; every page route's watch list. Auto-watch :head if it's a Var.
+         ;; Store base-path so actions and navigate can reference prefixed URLs.
          _               (swap! app-state* assoc
                                 :routes-source routes
                                 :global-watches (vec watches)
-                                :head head)
+                                :head head
+                                :base-path base-path)
          initial-routes  (if (var? routes) @routes routes)
          initial-handler (build-ring-handler initial-routes app-state* page-wrapper system-routes)
          handler         (if (var? routes)

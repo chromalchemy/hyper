@@ -199,18 +199,19 @@
    automatically sent in the request body.  When client params are present,
    they are URL-encoded into the query string via the hyper.encodeClientParams helper
    so the server can read them from query-params.
-   Optionally injects a custom Datastar expression to conditionally prevent the post."
-  [action-id used-params js]
+   Optionally injects a custom Datastar expression to conditionally prevent the post.
+   base-path is prepended to the /hyper/actions endpoint (empty string when not set)."
+  [action-id used-params js base-path]
   (let [js-injection (when js (str js " && "))]
     (if (empty? used-params)
-      (str js-injection "@post('/hyper/actions?action-id=" action-id "')")
+      (str js-injection "@post('" base-path "/hyper/actions?action-id=" action-id "')")
       (let [obj-entries (->> used-params
                              vals
                              (map (fn [{:keys [js key]}]
                                     (str key ":" js)))
                              (str/join ","))]
         (str js-injection
-             "@post('/hyper/actions?action-id=" action-id
+             "@post('" base-path "/hyper/actions?action-id=" action-id
              "&' + hyper.encodeClientParams({" obj-entries "}))")))))
 
 (defmacro action
@@ -291,8 +292,9 @@
            idx#                     (if context/*action-idx* (swap! context/*action-idx* inc) (hash action-fn#))
            action-id#               (str "a_" tab-id# "_" idx#)
            _#                       (actions/register-action! app-state*# session-id# tab-id# action-fn# action-id#
-                                                              ~(when as-name {:as as-name}))]
-       (build-action-expr action-id# '~used-params ~js))))
+                                                              ~(when as-name {:as as-name}))
+           base-path#               (get @app-state*# :base-path "")]
+       (build-action-expr action-id# '~used-params ~js base-path#))))
 
 (defn navigate
   "Create a navigation link using reitit named routes.
@@ -327,6 +329,7 @@
          tab-id     (:hyper/tab-id *request*)]
      (when-let [path (:path (reitit/match-by-name router route-name params))]
        (let [href          (state/build-url path query-params)
+             base-path     (get @app-state* :base-path "")
              ;; Use live-routes to always get the latest route metadata
              route-index   (routes/live-route-index app-state*)
              ;; Resolve title eagerly for the pushState call
@@ -352,7 +355,7 @@
              escaped-href  (utils/escape-js-string href)]
          {:href href
           :data-on:click__prevent
-          (str "@post('/hyper/actions?action-id=" action-id "');"
+          (str "@post('" base-path "/hyper/actions?action-id=" action-id "');"
                " window.history.pushState({title: '" escaped-title "'}, '', '" escaped-href "');"
                (when title
                  (str " document.title = '" escaped-title "'")))})))))
@@ -368,6 +371,11 @@
    - :app-state         — Atom for application state (default: fresh atom)
    - :datastar-script   - Override of the default datastar script tag (as Hiccup) or nil to suppress
    - :head              — Hiccup nodes appended to the HTML <head>, or (fn [req] ...) -> hiccup
+   - :base-path         — URL path prefix for reverse-proxy deployments where the app is served
+                          under a subfolder (e.g. \"/my-app\"). When set, all internal hyper
+                          endpoints (/hyper/events, /hyper/actions, /hyper/navigate) are mounted
+                          and referenced under this prefix. Must start with \"/\" and have no
+                          trailing slash.
    - :static-resources  — Classpath resource root(s) to serve as static assets
    - :static-dir        — Filesystem directory (or directories) to serve as static assets
    - :watches           — Vector of Watchable sources added to every page route.
@@ -399,7 +407,7 @@
      (def app (start! handler {:port 3000}))
      ;; Later...
      (stop! app)"
-  [routes & {:keys [app-state head static-resources static-dir watches datastar-script]
+  [routes & {:keys [app-state head static-resources static-dir watches datastar-script base-path]
              :or   {app-state       (atom (state/init-state))
                     datastar-script server/default-datastar-script}}]
   (server/create-handler routes app-state
@@ -407,7 +415,8 @@
                           :datastar-script  datastar-script
                           :static-resources static-resources
                           :static-dir       static-dir
-                          :watches          watches}))
+                          :watches          watches
+                          :base-path        base-path}))
 
 (defn start!
   "Start the hyper application server.
