@@ -226,6 +226,61 @@
       ;; Clean up
       (watch/remove-external-watches! app-state* tab-id))))
 
+(deftest test-navigation-clears-user-watches
+  (testing "user h/watch! watches are removed when navigating to a new route"
+    (let [app-state*      (atom (state/init-state))
+          session-id      "test-session-nav"
+          tab-id          "test_tab_nav"
+          trigger-count   (atom 0)
+          trigger-render! #(swap! trigger-count inc)
+          external-atom   (atom 0)]
+
+      (state/get-or-create-tab! app-state* session-id tab-id)
+
+      ;; Set initial route
+      (state/set-tab-route! app-state* tab-id
+                            {:name :page-a :path "/a" :path-params {} :query-params {}})
+
+      ;; Set up watchers (this is the app-state watcher that detects route changes)
+      (watch/setup-watchers! app-state* session-id tab-id trigger-render!)
+
+      ;; Register an external watch (simulating h/watch! on page A)
+      (watch/watch-source! app-state* tab-id trigger-render! external-atom)
+
+      ;; Verify external watch is active
+      (is (= 1 (count (get-in @app-state* [:tabs tab-id :watches])))
+          "should have one user watch")
+      (is (= 1 (count (.getWatches external-atom)))
+          "external atom should have a watch")
+
+      ;; Mutating the external atom should trigger render
+      (reset! trigger-count 0)
+      (swap! external-atom inc)
+      (Thread/sleep 50)
+      (is (>= @trigger-count 1) "watch should trigger before navigation")
+
+      ;; Navigate to a different route
+      (reset! trigger-count 0)
+      (state/set-tab-route! app-state* tab-id
+                            {:name :page-b :path "/b" :path-params {} :query-params {}})
+      (Thread/sleep 50)
+
+      ;; User watches should be cleaned up
+      (is (empty? (get-in @app-state* [:tabs tab-id :watches]))
+          "user watches should be removed after navigation")
+      (is (empty? (.getWatches external-atom))
+          "external atom watch should be removed after navigation")
+
+      ;; Mutating the external atom should NOT trigger render anymore
+      (reset! trigger-count 0)
+      (swap! external-atom inc)
+      (Thread/sleep 50)
+      (is (zero? @trigger-count)
+          "watch should not trigger after navigating away")
+
+      ;; Clean up
+      (watch/remove-watchers! app-state* tab-id))))
+
 (deftest test-cleanup-clears-pending-watches
   (testing "cleanup-tab! clears pending-watches along with the whole tab"
     (let [app-state*    (atom (state/init-state))

@@ -123,11 +123,15 @@
                  (let [route-changed? (let [old-route (get-in old-state route-path)
                                             new-route (get-in new-state route-path)]
                                         (and new-route (not= old-route new-route)))]
-                   ;; Swap route-level watches when navigating to a new named route
+                   ;; Swap watches when navigating to a new named route.
+                   ;; Tears down both route-level watches AND user h/watch!
+                   ;; calls — the new page's render will re-register any
+                   ;; watches it needs via fresh h/watch! calls.
                    (when route-changed?
                      (let [old-name (get-in old-state (conj route-path :name))
                            new-name (get-in new-state (conj route-path :name))]
                        (when (not= old-name new-name)
+                         (remove-external-watches! app-state* tab-id)
                          (setup-route-watches! app-state* tab-id trigger-render!))))
                    ;; Re-render if any watched path changed (including signals)
                    (when (or route-changed?
