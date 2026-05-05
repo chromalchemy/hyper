@@ -12,6 +12,26 @@
 ;; External source watching
 ;; ---------------------------------------------------------------------------
 
+(defn- retain-source!
+  "Increment the reference count for a watched source."
+  [app-state* source]
+  (swap! app-state* update-in [:source-refcounts source] (fnil inc 0))
+  nil)
+
+(defn- release-source!
+  "Decrement the reference count for a watched source.  When the count
+   reaches zero, calls -dispose and removes the refcount entry."
+  [app-state* source]
+  (let [new-state (swap! app-state* (fn [state]
+                                      (let [n (dec (get-in state [:source-refcounts source] 1))]
+                                        (if (pos? n)
+                                          (assoc-in state [:source-refcounts source] n)
+                                          (-> state
+                                              (update :source-refcounts dissoc source))))))]
+    (when-not (contains? (:source-refcounts new-state) source)
+      (proto/-dispose source)))
+  nil)
+
 (defn- add-external-watch!
   "Watch an external Watchable source for a tab, tracking it under the
    given state-key (:watches or :route-watches). When the source changes,
@@ -21,16 +41,20 @@
     (proto/-add-watch source watch-key
                       (fn [_old _new]
                         (trigger-render!)))
+    (retain-source! app-state* source)
     (swap! app-state* update-in [:tabs tab-id state-key]
            (fnil assoc {}) watch-key source)
     nil))
 
 (defn- remove-external-watches-by-key!
-  "Remove all external watches stored under state-key for a tab."
+  "Remove all external watches stored under state-key for a tab.
+   Decrements the reference count for each source and disposes it
+   only when no other tab is still watching it."
   [app-state* tab-id state-key]
   (let [watches (get-in @app-state* [:tabs tab-id state-key])]
     (doseq [[watch-key source] watches]
-      (proto/-remove-watch source watch-key))
+      (proto/-remove-watch source watch-key)
+      (release-source! app-state* source))
     (swap! app-state* update-in [:tabs tab-id] dissoc state-key))
   nil)
 

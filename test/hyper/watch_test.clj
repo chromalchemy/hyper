@@ -2,10 +2,21 @@
   (:require [clojure.test :refer [deftest is testing]]
             [hyper.context :as context]
             [hyper.core :as h]
+            [hyper.protocols :as proto]
             [hyper.render :as render]
             [hyper.server :as server]
             [hyper.state :as state]
             [hyper.watch :as watch]))
+
+;; A test source that tracks watches and disposal for assertions.
+(deftype DisposableSource [watches* disposed*]
+  proto/Watchable
+  (-add-watch [_this key callback]
+    (swap! watches* assoc key callback))
+  (-remove-watch [_this key]
+    (swap! watches* dissoc key))
+  (-dispose [_this]
+    (swap! disposed* inc)))
 
 (deftest test-watchers
   (testing "Watchers trigger callback on state change"
@@ -303,3 +314,109 @@
 
       ;; Tab should be completely gone
       (is (not (contains? (:tabs @app-state*) tab-id))))))
+
+;; ---------------------------------------------------------------------------
+;; Disposal tests
+;; ---------------------------------------------------------------------------
+
+(deftest test-dispose-called-on-watch-removal
+  (testing "dispose is called when removing watches for a tab"
+    (let [app-state*      (atom (state/init-state))
+          tab-id          "test_tab_dispose"
+          trigger-render! (fn [])
+          disposed*       (atom 0)
+          source          (->DisposableSource (atom {}) disposed*)]
+
+      (state/get-or-create-tab! app-state* "sess" tab-id)
+
+      (watch/watch-source! app-state* tab-id trigger-render! source)
+      (is (zero? @disposed*) "should not be disposed yet")
+
+      (watch/remove-external-watches! app-state* tab-id)
+      (is (= 1 @disposed*) "should be disposed after watch removal"))))
+
+(deftest test-dispose-called-on-navigation
+  (testing "dispose is called when navigating to a new route"
+    (let [app-state*      (atom (state/init-state))
+          session-id      "test-session-dispose-nav"
+          tab-id          "test_tab_dispose_nav"
+          trigger-render! (fn [])
+          disposed*       (atom 0)
+          source          (->DisposableSource (atom {}) disposed*)]
+
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (state/set-tab-route! app-state* tab-id
+                            {:name :page-a :path "/a" :path-params {} :query-params {}})
+      (watch/setup-watchers! app-state* session-id tab-id trigger-render!)
+
+      (watch/watch-source! app-state* tab-id trigger-render! source)
+      (is (zero? @disposed*))
+
+      ;; Navigate away
+      (state/set-tab-route! app-state* tab-id
+                            {:name :page-b :path "/b" :path-params {} :query-params {}})
+      (Thread/sleep 50)
+
+      (is (= 1 @disposed*) "should be disposed after navigation")
+
+      (watch/remove-watchers! app-state* tab-id))))
+
+(deftest test-dispose-called-on-tab-disconnect
+  (testing "dispose is called when tab disconnects"
+    (let [app-state*      (atom (state/init-state))
+          session-id      "test-session-dispose-dc"
+          tab-id          "test_tab_dispose_dc"
+          trigger-render! (fn [])
+          disposed*       (atom 0)
+          source          (->DisposableSource (atom {}) disposed*)]
+
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (watch/watch-source! app-state* tab-id trigger-render! source)
+      (is (zero? @disposed*))
+
+      (server/cleanup-tab! app-state* tab-id)
+      (is (= 1 @disposed*) "should be disposed on tab disconnect"))))
+
+(deftest test-dispose-refcounted-across-tabs
+  (testing "shared source is only disposed when the last tab releases it"
+    (let [app-state*       (atom (state/init-state))
+          session-id       "test-session-refcount"
+          tab-id-a         "test_tab_rc_a"
+          tab-id-b         "test_tab_rc_b"
+          trigger-render!  (fn [])
+          disposed*        (atom 0)
+          shared-source    (->DisposableSource (atom {}) disposed*)]
+
+      (state/get-or-create-tab! app-state* session-id tab-id-a)
+      (state/get-or-create-tab! app-state* session-id tab-id-b)
+
+      ;; Both tabs watch the same source
+      (watch/watch-source! app-state* tab-id-a trigger-render! shared-source)
+      (watch/watch-source! app-state* tab-id-b trigger-render! shared-source)
+      (is (zero? @disposed*))
+
+      ;; First tab removes watches — source should NOT be disposed
+      (watch/remove-external-watches! app-state* tab-id-a)
+      (is (zero? @disposed*)
+          "should not dispose while second tab still watches")
+
+      ;; Second tab removes watches — source should now be disposed
+      (watch/remove-external-watches! app-state* tab-id-b)
+      (is (= 1 @disposed*)
+          "should dispose after last tab releases"))))
+
+(deftest test-dispose-not-called-for-plain-atoms
+  (testing "plain atoms (IRef) are not affected by dispose (no-op)"
+    (let [app-state*      (atom (state/init-state))
+          tab-id          "test_tab_atom_dispose"
+          trigger-render! (fn [])
+          external-atom   (atom 0)]
+
+      (state/get-or-create-tab! app-state* "sess" tab-id)
+      (watch/watch-source! app-state* tab-id trigger-render! external-atom)
+
+      ;; Should not throw — IRef -dispose is a no-op
+      (watch/remove-external-watches! app-state* tab-id)
+
+      ;; Atom is still usable
+      (is (= 0 @external-atom)))))

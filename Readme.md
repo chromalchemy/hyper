@@ -513,8 +513,17 @@ By default, `watch!` works with anything that implements `clojure.lang.IRef`
     )
   (-remove-watch [this key]
     ;; Tear down the listener
-    ))
+    )
+  (-dispose [this]
+    ;; Release resources (close connections, stop polling, etc.)
+    ;; Called when the last tab watching this source navigates away
+    ;; or disconnects. No-op for sources that hold no external resources.
+    (.close this)))
 ```
+
+`-dispose` is reference-counted — if multiple tabs watch the same source, it's
+only called when the **last** tab releases it. For built-in `IRef` types (atoms,
+refs, vars), `-dispose` is a no-op.
 
 ### Route-level `:watches`
 
