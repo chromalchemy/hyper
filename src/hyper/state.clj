@@ -13,7 +13,8 @@
     :router <reitit-router>
     :routes <original-routes-vector>
     :routes-source <var-or-routes-vector>}"
-  (:require [clojure.string]))
+  (:require [clojure.string]
+            [hyper.context :as context]))
 
 (defn normalize-path
   "Convert keyword or vector to vector path."
@@ -25,7 +26,9 @@
 (deftype Cursor [parent-atom full-path meta-data ^:volatile-mutable validator watches]
   clojure.lang.IRef
   (deref [_]
-    (get-in @parent-atom full-path))
+    (if-let [snapshot* context/*state-snapshot*]
+      (get-in @snapshot* full-path)
+      (get-in @parent-atom full-path)))
 
   (setValidator [_ vf]
     (set! validator vf))
@@ -52,21 +55,33 @@
     _this)
 
   clojure.lang.IAtom
-  (swap [_this f]
-    (swap! parent-atom update-in full-path f)
-    (get-in @parent-atom full-path))
+  (swap [_ f]
+    (let [new-state (swap! parent-atom update-in full-path f)
+          new-val   (get-in new-state full-path)]
+      (when-let [snapshot* context/*state-snapshot*]
+        (vswap! snapshot* assoc-in full-path new-val))
+      new-val))
 
-  (swap [_this f arg]
-    (swap! parent-atom update-in full-path f arg)
-    (get-in @parent-atom full-path))
+  (swap [_ f arg]
+    (let [new-state (swap! parent-atom update-in full-path f arg)
+          new-val   (get-in new-state full-path)]
+      (when-let [snapshot* context/*state-snapshot*]
+        (vswap! snapshot* assoc-in full-path new-val))
+      new-val))
 
-  (swap [_this f arg1 arg2]
-    (swap! parent-atom update-in full-path f arg1 arg2)
-    (get-in @parent-atom full-path))
+  (swap [_ f arg1 arg2]
+    (let [new-state (swap! parent-atom update-in full-path f arg1 arg2)
+          new-val   (get-in new-state full-path)]
+      (when-let [snapshot* context/*state-snapshot*]
+        (vswap! snapshot* assoc-in full-path new-val))
+      new-val))
 
-  (swap [_this f arg1 arg2 args]
-    (apply swap! parent-atom update-in full-path f arg1 arg2 args)
-    (get-in @parent-atom full-path))
+  (swap [_ f arg1 arg2 args]
+    (let [new-state (apply swap! parent-atom update-in full-path f arg1 arg2 args)
+          new-val   (get-in new-state full-path)]
+      (when-let [snapshot* context/*state-snapshot*]
+        (vswap! snapshot* assoc-in full-path new-val))
+      new-val))
 
   (compareAndSet [_ oldv newv]
     (loop []
@@ -76,12 +91,17 @@
           (if (compare-and-set! parent-atom
                                 current-state
                                 (assoc-in current-state full-path newv))
-            true
+            (do
+              (when-let [snapshot* context/*state-snapshot*]
+                (vswap! snapshot* assoc-in full-path newv))
+              true)
             (recur))
           false))))
 
-  (reset [_this newv]
+  (reset [_ newv]
     (swap! parent-atom assoc-in full-path newv)
+    (when-let [snapshot* context/*state-snapshot*]
+      (vswap! snapshot* assoc-in full-path newv))
     newv)
 
   clojure.lang.IMeta

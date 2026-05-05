@@ -31,6 +31,16 @@
 ;; in a single atomic swap — no cleanup-before-render gap needed.
 (def ^:dynamic *registered-action-ids* nil)
 
+;; Snapshot of @app-state* taken at the start of a render cycle, wrapped
+;; in a volatile for single-thread mutation.  During render, Cursor/deref
+;; reads from this snapshot instead of the live atom, guaranteeing a
+;; consistent point-in-time view immune to concurrent action mutations.
+;; Cursor writes (reset!, swap!) update both the live atom AND this
+;; snapshot so that default-value initialization and intra-render writes
+;; are visible to subsequent reads within the same render pass.
+;; nil during action execution so that actions always see/mutate live state.
+(def ^:dynamic *state-snapshot* nil)
+
 (defn require-context!
   "Extract and validate the request context from *request*.
    Throws if called outside a request context or if required keys are missing.

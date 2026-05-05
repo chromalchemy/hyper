@@ -182,7 +182,8 @@
        (push-thread-bindings {#'context/*request*               req
                               #'context/*action-idx*            (atom 0)
                               #'context/*declared-signals*      (atom [])
-                              #'context/*registered-action-ids* (atom #{})})
+                              #'context/*registered-action-ids* (atom #{})
+                              #'context/*state-snapshot*        (volatile! @app-state*)})
        (try
          (let [body (safe-render render-fn req)]
            ;; Ring response passthrough - render-fn returned a redirect,
