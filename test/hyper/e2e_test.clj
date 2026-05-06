@@ -125,6 +125,29 @@
        "Start"]
       [:span#async-display {:data-text (str "$" name*)} ""]]]))
 
+;; Shared atom for testing reactive components — mutated from test code
+;; to verify partial re-renders via SSE.
+(def ^:private reactive-clock* (atom "00:00"))
+
+(defn- reactive-get [_]
+  (h/watch! reactive-clock*)
+  (let [count*   (h/tab-cursor :count 0)
+        static*  (h/tab-cursor :static "initial")]
+    [:div
+     [:h1 "Reactive Test"]
+     ;; Non-reactive part — only updates on full re-render
+     [:span#static-value @static*]
+     ;; Reactive component watching the shared clock atom
+     (h/reactive [reactive-clock*]
+       [:span#clock-value @reactive-clock*])
+     ;; Counter to trigger full re-renders
+     [:span#counter-value @count*]
+     [:button#inc-btn {:data-on:click (h/action (swap! (h/tab-cursor :count) inc))} "+"]
+     ;; Reactive component with user-provided ID
+     [:div#user-id-section
+      (h/reactive [count*]
+        [:span {:id "custom-reactive"} "Count: " @count*])]]))
+
 ;; Shared atom for testing watch! bootstrap — mutated from test code
 ;; to verify that server-side changes trigger SSE re-renders.
 (def ^:private watch-test-atom (atom "initial"))
@@ -158,7 +181,11 @@
    ["/watch-bootstrap"
     {:name  :watch-bootstrap
      :title "Watch Bootstrap"
-     :get   #'watch-bootstrap-get}]])
+     :get   #'watch-bootstrap-get}]
+   ["/reactive"
+    {:name  :reactive
+     :title "Reactive"
+     :get   #'reactive-get}]])
 
 (def ^:dynamic *test-routes* (default-routes))
 
@@ -301,6 +328,7 @@
      ;; that create-handler stored in the app-state atom.
     (alter-var-root #'*test-routes* (constantly (default-routes)))
     (reset! watch-test-atom "initial")
+    (reset! reactive-clock* "00:00")
     (when @test-state*
       (swap! @test-state*
              (fn [old-state]
@@ -886,3 +914,53 @@
         (finally
           (reset! watch-test-atom "initial")
           (close-browser! browser-info))))))
+
+;; ---------------------------------------------------------------------------
+;; Test: Reactive components
+;; ---------------------------------------------------------------------------
+
+(deftest ^:e2e reactive-component-test
+  (let [browser-info (launch-browser)
+        ctx          (new-context browser-info)
+        page         (new-page ctx)]
+    (try
+      (w/with-page page
+        (w/navigate (str base-url "/reactive"))
+        (wait-for-sse)
+
+        (testing "Initial render shows all values"
+          (is (= "00:00" (w/text-content "#clock-value")))
+          (is (= "initial" (w/text-content "#static-value")))
+          (is (= "0" (w/text-content "#counter-value")))
+          (is (= "Count: 0" (w/text-content "#custom-reactive"))))
+
+        (testing "Reactive component updates when dep changes"
+          (reset! reactive-clock* "12:34")
+          (wait-for-text "#clock-value" "12:34")
+          ;; Static value should still be "initial" — not re-rendered
+          (is (= "initial" (w/text-content "#static-value"))))
+
+        (testing "Reactive component with user-provided ID works"
+          (w/click "#inc-btn")
+          (wait-for-text "#counter-value" "1")
+          (wait-for-text "#custom-reactive" "Count: 1"))
+
+        (testing "No wrapper div — reactive ID is on the element itself"
+          ;; The clock span should have the reactive ID directly
+          (let [clock-el-tag (.evaluate page "document.getElementById('clock-value')?.tagName")]
+            (is (= "SPAN" clock-el-tag)
+                "clock element should be a SPAN, not wrapped in a DIV"))
+          ;; The custom-reactive element should still be a SPAN
+          (let [custom-el-tag (.evaluate page "document.getElementById('custom-reactive')?.tagName")]
+            (is (= "SPAN" custom-el-tag)
+                "custom-reactive element should be a SPAN")))
+
+        (testing "Multiple rapid updates are coalesced"
+          (reset! reactive-clock* "tick-1")
+          (reset! reactive-clock* "tick-2")
+          (reset! reactive-clock* "tick-3")
+          (wait-for-text "#clock-value" "tick-3")))
+
+      (finally
+        (reset! reactive-clock* "00:00")
+        (close-browser! browser-info)))))

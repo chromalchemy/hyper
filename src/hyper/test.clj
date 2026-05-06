@@ -27,6 +27,7 @@
          (assert (str/includes? (:body-html result2) \"Count: 1\"))))"
   (:require [dev.onionpancakes.chassis.core :as c]
             [hyper.context :as context]
+            [hyper.reactive :as reactive]
             [hyper.render :as render]
             [hyper.state :as state]))
 
@@ -133,23 +134,27 @@
                  extra-req (merge extra-req))]
 
        ;; Bind context vars and render
-       (push-thread-bindings {#'context/*request*               req
-                              #'context/*action-idx*            (atom 0)
-                              #'context/*declared-signals*      (atom [])
-                              #'context/*registered-action-ids* (atom #{})
-                              #'context/*state-snapshot*        (volatile! @app-state*)})
+       (push-thread-bindings {#'context/*request*                 req
+                              #'context/*action-idx*              (atom 0)
+                              #'context/*declared-signals*        (atom [])
+                              #'context/*registered-action-ids*   (atom #{})
+                              #'context/*registered-reactive-ids* (atom #{})
+                              #'context/*state-snapshot*          (volatile! @app-state*)})
        (try
          (let [body  (render/safe-render handler req)
                ;; Ring response passthrough
                ring? (and (map? body) (:status body))]
            (if ring?
              body
-             (let [declared  @context/*declared-signals*
-                   body-html (c/html body)
-                   signals   (reduce (fn [acc {:keys [path] :as entry}]
-                                       (assoc acc path (dissoc entry :path)))
-                                     {}
-                                     declared)]
+             (let [declared     @context/*declared-signals*
+                   body-html    (c/html body)
+                   reactive-ids @context/*registered-reactive-ids*
+                   signals      (reduce (fn [acc {:keys [path] :as entry}]
+                                          (assoc acc path (dissoc entry :path)))
+                                        {}
+                                        declared)]
+               ;; Sweep stale reactive components (same as server.clj)
+               (reactive/sweep-stale-components! app-state* tab-id reactive-ids)
                {:body        body
                 :body-html   body-html
                 :title       nil

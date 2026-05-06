@@ -11,6 +11,7 @@
             [hyper.actions :as actions]
             [hyper.client-params :as client-params]
             [hyper.context :as context :refer [*request* *action-idx*]]
+            [hyper.reactive :as reactive]
             [hyper.render :as render]
             [hyper.routes :as routes]
             [hyper.server :as server]
@@ -119,6 +120,44 @@
       (watch/watch-source! app-state* tab-id trigger-render! source)
       ;; No SSE renderer yet (initial HTTP render) — stash for later promotion
       (watch/stash-pending-watch! app-state* tab-id source))))
+
+;; ---------------------------------------------------------------------------
+;; Reactive components
+;; ---------------------------------------------------------------------------
+
+(defmacro reactive
+  "Create a reactive component that re-renders independently when its deps change.
+
+   deps is a vector of Watchable sources (atoms, cursors, or any type extending
+   hyper.protocols/Watchable).  The body is a hiccup expression that will be
+   wrapped in a div with a stable ID.
+
+   When any dep changes, only this component re-renders and a targeted Datastar
+   fragment is sent — the rest of the page is untouched.  During full page
+   re-renders, if deps haven't changed since the last render, the cached HTML
+   is returned without re-executing the body.
+
+   Supports nesting — inner reactive blocks cache independently.  If an outer
+   block re-renders but inner deps haven't changed, the inner block returns
+   its cached HTML.
+
+   Usage:
+     (let [clock* (h/global-cursor :clock)]
+       (reactive [clock*]
+         [:p \"The time is: \" @clock*]))
+
+     ;; Multiple deps
+     (let [x* (h/tab-cursor :x 0)
+           y* (h/tab-cursor :y 0)]
+       (reactive [x* y*]
+         [:p \"Position: \" @x* \", \" @y*]))"
+  [deps & body]
+  `(let [{tab-id# :tab-id app-state*# :app-state*} (context/require-context! "reactive")
+         idx#          (if context/*action-idx* (swap! context/*action-idx* inc) 0)
+         component-id# (str "r_" tab-id# "_" idx#)
+         deps#         ~deps
+         render-fn#    (fn [] ~@body)]
+     (reactive/render-component app-state*# tab-id# component-id# deps# render-fn#)))
 
 ;; ---------------------------------------------------------------------------
 ;; Signals

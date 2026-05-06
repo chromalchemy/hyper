@@ -9,6 +9,7 @@
             [hyper.actions :as actions]
             [hyper.brotli :as br]
             [hyper.context :as context]
+            [hyper.reactive :as reactive]
             [hyper.render :as render]
             [hyper.routes :as routes]
             [hyper.signal :as signal]
@@ -54,15 +55,17 @@
    latest state via render/render-tab, compresses (if enabled), and sends.
    Exits when shutdown-renderer* is delivered."
   [app-state* session-id tab-id channel compress?
-   ^Semaphore semaphore shutdown-renderer*]
-  (let [br-out      (when compress? (br/byte-array-out-stream))
-        br-stream   (when br-out (br/compress-out-stream br-out :window-size 18))
-        headers     (cond-> {"Content-Type"      "text/event-stream"
-                             "Cache-Control"     "no-cache, no-transform"
-                             "X-Accel-Buffering" "no"}
-                      compress? (assoc "Content-Encoding" "br"))
-        throttle-ms (long (or (get @app-state* :render-throttle-ms)
-                              default-render-throttle-ms))]
+   ^Semaphore semaphore shutdown-renderer*
+   pending-partials* full-render-needed*]
+  (let [br-out           (when compress? (br/byte-array-out-stream))
+        br-stream        (when br-out (br/compress-out-stream br-out :window-size 18))
+        headers          (cond-> {"Content-Type"      "text/event-stream"
+                                  "Cache-Control"     "no-cache, no-transform"
+                                  "X-Accel-Buffering" "no"}
+                           compress? (assoc "Content-Encoding" "br"))
+        throttle-ms      (long (or (get @app-state* :render-throttle-ms)
+                                   default-render-throttle-ms))
+        trigger-partial! #(.release semaphore)]
     (try
       ;; Send the connected event as the initial SSE response (headers + body).
       (let [connected-msg (render/format-connected-event tab-id)
@@ -83,27 +86,52 @@
                     sig-patches     (when (and current-signals
                                                (not= current-signals last-sent-signals))
                                       (signal/changed-signals last-sent-signals current-signals))
+                    ;; Check if we can do partial renders only (reactive blocks dirty, no full render needed)
+                    full-render?    (let [needed? @full-render-needed*]
+                                      (reset! full-render-needed* false)
+                                      needed?)
+                    dirty-ids       (let [ids @pending-partials*]
+                                      (reset! pending-partials* #{})
+                                      ids)
                     sent?           (try
-                                      (when-let [{:keys [title head-html body-html url
-                                                         declared-signals registered-action-ids]}
-                                                 (render/render-tab app-state* session-id tab-id)]
-                                        ;; Sweep stale actions *after* render has re-registered
-                                        ;; the live set — no gap where actions are missing.
-                                        (actions/sweep-stale-tab-actions! app-state* tab-id registered-action-ids)
-                                        (let [head-event   (render/format-head-update title head-html)
-                                              sig-attrs    (signal/format-signal-attrs declared-signals)
-                                              div-attrs    (cond-> {:id "hyper-app"}
-                                                             url       (assoc :data-hyper-url url)
-                                                             sig-attrs (merge sig-attrs))
-                                              wrapped-html (c/html [:div div-attrs (c/raw body-html)])
-                                              body-event   (render/format-datastar-fragment wrapped-html)
-                                              sig-event    (when (seq sig-patches)
-                                                             (signal/format-patch-signals-event sig-patches))
-                                              sse-payload  (str head-event body-event sig-event)
-                                              payload      (if br-stream
-                                                             (br/compress-stream br-out br-stream sse-payload)
-                                                             sse-payload)]
-                                          (boolean (http-kit/send! channel payload false))))
+                                      (if (and (seq dirty-ids)
+                                               (not full-render?)
+                                               (not (seq sig-patches)))
+                                        ;; Partial render — only reactive blocks changed
+                                        (let [fragments (keep (fn [component-id]
+                                                                (reactive/partial-render app-state* tab-id component-id))
+                                                              dirty-ids)]
+                                          (when (seq fragments)
+                                            (let [sse-payload (render/format-datastar-fragments fragments)
+                                                  payload     (if br-stream
+                                                                (br/compress-stream br-out br-stream sse-payload)
+                                                                sse-payload)]
+                                              (boolean (http-kit/send! channel payload false)))))
+                                        ;; Full render
+                                        (when-let [{:keys [title head-html body-html url
+                                                           declared-signals registered-action-ids
+                                                           registered-reactive-ids]}
+                                                   (render/render-tab app-state* session-id tab-id)]
+                                          ;; Sweep stale actions + reactive components
+                                          (actions/sweep-stale-tab-actions! app-state* tab-id registered-action-ids)
+                                          (reactive/sweep-stale-components! app-state* tab-id registered-reactive-ids)
+                                          ;; Set up watches for new/changed reactive components
+                                          (reactive/setup-new-component-watches! app-state* tab-id
+                                                                                  trigger-partial! pending-partials*)
+                                          (let [head-event   (render/format-head-update title head-html)
+                                                sig-attrs    (signal/format-signal-attrs declared-signals)
+                                                div-attrs    (cond-> {:id "hyper-app"}
+                                                               url       (assoc :data-hyper-url url)
+                                                               sig-attrs (merge sig-attrs))
+                                                wrapped-html (c/html [:div div-attrs (c/raw body-html)])
+                                                body-event   (render/format-datastar-fragment wrapped-html)
+                                                sig-event    (when (seq sig-patches)
+                                                               (signal/format-patch-signals-event sig-patches))
+                                                sse-payload  (str head-event body-event sig-event)
+                                                payload      (if br-stream
+                                                               (br/compress-stream br-out br-stream sse-payload)
+                                                               sse-payload)]
+                                            (boolean (http-kit/send! channel payload false)))))
                                       (catch Throwable e
                                         (t/error! e {:id   :hyper.error/renderer
                                                      :data {:hyper/tab-id tab-id}})
@@ -133,12 +161,17 @@
   "Start a per-tab renderer on a virtual thread.
 
    Returns a map with:
-   - :trigger-render! — zero-arg fn; call to signal a re-render
-   - :stop!           — zero-arg fn; call to shut down the renderer"
+   - :trigger-render! — zero-arg fn; call to signal a re-render (full)
+   - :stop!           — zero-arg fn; call to shut down the renderer
+   - :pending-partials* — atom #{} of reactive block IDs needing partial render"
   [app-state* session-id tab-id channel compress?]
   (let [semaphore          (Semaphore. 0)
         shutdown-renderer* (promise)
-        trigger-render!    #(.release semaphore)
+        pending-partials*  (atom #{})
+        full-render-needed* (atom true)  ;; start with full render
+        trigger-render!    (fn []
+                             (reset! full-render-needed* true)
+                             (.release semaphore))
         stop!              #(do (deliver shutdown-renderer* true)
                                 (.release semaphore))
         thread             (-> (Thread/ofVirtual)
@@ -146,10 +179,13 @@
                                (.start ^Runnable
                                  #(-renderer-loop! app-state* session-id tab-id
                                                    channel compress?
-                                                   semaphore shutdown-renderer*)))]
-    {:trigger-render! trigger-render!
-     :stop!           stop!
-     :thread          thread}))
+                                                   semaphore shutdown-renderer*
+                                                   pending-partials* full-render-needed*)))]
+    {:trigger-render!    trigger-render!
+     :trigger-partial!   #(.release semaphore)
+     :stop!             stop!
+     :thread            thread
+     :pending-partials* pending-partials*}))
 
 (defn wrap-hyper-context
   "Middleware that adds session-id and tab-id to the request."
@@ -187,11 +223,12 @@
             :src  "https://cdn.jsdelivr.net/gh/starfederation/datastar@1.0.0-RC.7/bundles/datastar.js"}])
 
 (defn cleanup-tab!
-  "Clean up all resources for a tab: watchers, renderer thread, actions, and state."
+  "Clean up all resources for a tab: watchers, reactive components, renderer thread, actions, and state."
   [app-state* tab-id]
   (watch/remove-watchers! app-state* tab-id)
   (watch/remove-external-watches! app-state* tab-id)
   (watch/teardown-route-watches! app-state* tab-id)
+  (reactive/teardown-all-components! app-state* tab-id)
   (when-let [stop! (get-in @app-state* [:tabs tab-id :renderer :stop!])]
     (stop!))
   (actions/cleanup-tab-actions! app-state* tab-id)

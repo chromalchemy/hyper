@@ -39,6 +39,12 @@
               (apply str))
          "\n")))
 
+(defn format-datastar-fragments
+  "Format multiple HTML strings as separate Datastar patch-elements SSE events.
+   Used for partial reactive renders where each fragment targets a different element."
+  [html-strings]
+  (apply str (map format-datastar-fragment html-strings)))
+
 (defn mark-head-elements
   "Add `{:data-hyper-head true}` to each top-level hiccup element in a
    resolved :head value.  The marker lets the SSE head-update JS identify
@@ -179,11 +185,12 @@
                          router (assoc :hyper/router router)
                          route  (assoc :hyper/route route)
                          true   (dissoc :reitit.core/match))]
-       (push-thread-bindings {#'context/*request*               req
-                              #'context/*action-idx*            (atom 0)
-                              #'context/*declared-signals*      (atom [])
-                              #'context/*registered-action-ids* (atom #{})
-                              #'context/*state-snapshot*        (volatile! @app-state*)})
+       (push-thread-bindings {#'context/*request*                 req
+                              #'context/*action-idx*              (atom 0)
+                              #'context/*declared-signals*        (atom [])
+                              #'context/*registered-action-ids*   (atom #{})
+                              #'context/*registered-reactive-ids* (atom #{})
+                              #'context/*state-snapshot*          (volatile! @app-state*)})
        (try
          (let [body (safe-render render-fn req)]
            ;; Ring response passthrough - render-fn returned a redirect,
@@ -195,20 +202,22 @@
              ;; register actions during realization.  We must read
              ;; *registered-action-ids* AFTER serialization so the
              ;; accumulator captures every action the render produced.
-             (let [body-html  (c/html body)
-                   title-spec (when (and (seq route-index) route)
-                                (routes/find-route-title route-index (:name route)))
-                   title      (routes/resolve-title title-spec req)
-                   head       (some-> (routes/resolve-head (get @app-state* :head) req)
-                                      mark-head-elements)
-                   declared   @context/*declared-signals*
-                   action-ids @context/*registered-action-ids*]
-               {:title                 title
-                :head-html             (some-> head c/html)
-                :body-html             body-html
-                :url                   url
-                :declared-signals      declared
-                :registered-action-ids action-ids})))
+             (let [body-html     (c/html body)
+                   title-spec    (when (and (seq route-index) route)
+                                   (routes/find-route-title route-index (:name route)))
+                   title         (routes/resolve-title title-spec req)
+                   head          (some-> (routes/resolve-head (get @app-state* :head) req)
+                                         mark-head-elements)
+                   declared      @context/*declared-signals*
+                   action-ids    @context/*registered-action-ids*
+                   reactive-ids  @context/*registered-reactive-ids*]
+               {:title                    title
+                :head-html                (some-> head c/html)
+                :body-html                body-html
+                :url                      url
+                :declared-signals         declared
+                :registered-action-ids    action-ids
+                :registered-reactive-ids  reactive-ids})))
          (finally
            (pop-thread-bindings)))))))
 

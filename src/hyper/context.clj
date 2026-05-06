@@ -41,6 +41,13 @@
 ;; nil during action execution so that actions always see/mutate live state.
 (def ^:dynamic *state-snapshot* nil)
 
+;; Accumulator for reactive component IDs registered during a render pass.
+;; Bound to (atom #{}) before each full render so that the reactive macro
+;; can track which components are live.  After render, stale components
+;; (present in the previous cycle but absent from this one) are swept —
+;; their watches are removed and deps released.
+(def ^:dynamic *registered-reactive-ids* nil)
+
 (defn require-context!
   "Extract and validate the request context from *request*.
    Throws if called outside a request context or if required keys are missing.

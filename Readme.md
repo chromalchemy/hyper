@@ -563,6 +563,96 @@ for things like a top-level config atom or feature-flags that affect every view:
 Global watches are combined with any per-route `:watches` — global sources come
 first, then route-specific ones.
 
+## Reactive components
+
+By default, any state change triggers a full page re-render. For pages with
+expensive render functions or frequently-changing data, `reactive` lets you
+mark a sub-region of the page for independent re-rendering — when its deps
+change, only that component re-renders and a targeted Datastar fragment is sent.
+The rest of the page is untouched.
+
+```clojure
+(defn dashboard [req]
+  (let [clock*  (h/global-cursor :clock)
+        stats*  (h/tab-cursor :stats)]
+    [:div
+     [:h1 "Dashboard"]
+     [:div.stats (render-expensive-stats @stats*)]
+     (h/reactive [clock*]
+       [:p "Last updated: " @clock*])]))
+```
+
+In this example, when `clock*` changes, only the `[:p ...]` re-renders. The
+expensive stats section is not re-executed.
+
+### How it works
+
+`reactive` takes a vector of deps (any `Watchable` source — atoms, cursors,
+etc.) and a body. It:
+
+1. Injects a stable ID onto the returned element (or uses an existing `:id` if
+   present)
+2. Registers watches on the deps
+3. **On dep change**: re-renders only this component and sends a targeted
+   Datastar fragment — no full page re-render
+4. **On full page re-render**: checks if deps changed since last render. If
+   unchanged, returns cached HTML without re-executing the body
+
+```clojure
+;; The <p> IS the reactive element — no extra div
+(h/reactive [clock*]
+  [:p.timestamp "Time: " @clock*])
+
+;; Use your own ID — reactive will use it for fragment targeting
+(h/reactive [clock*]
+  [:p {:id "my-clock"} "Time: " @clock*])
+```
+
+### Nesting
+
+Reactive blocks can be nested. Each block caches independently:
+
+```clojure
+(h/reactive [data*]
+  [:div
+   [:h2 "Data: " @data*]
+   (h/reactive [clock*]
+     [:span "Updated: " @clock*])])
+```
+
+When only `clock*` changes, just the inner `[:span ...]` re-renders. When
+`data*` changes, the outer block re-renders — but if `clock*` hasn't changed,
+the inner block returns its cached HTML without re-executing.
+
+### Cleanup
+
+Reactive components are automatically cleaned up:
+
+- **On navigation**: stale components are swept (watches removed, deps released)
+- **On tab disconnect**: all components are torn down
+- **On conditional change**: if a re-render produces different reactive blocks
+  (e.g. an `if` branch changes), the old blocks are swept and new ones registered
+
+Deps are reference-counted — if multiple components or tabs watch the same
+source, it's only disposed when the last consumer releases it.
+
+### Extracting components
+
+Since `reactive` captures lexical scope, you can extract reactive components
+into functions:
+
+```clojure
+(defn live-clock [clock*]
+  (h/reactive [clock*]
+    [:p "Time: " @clock*]))
+
+(defn dashboard [req]
+  (let [clock* (h/global-cursor :clock)]
+    [:div
+     [:h1 "Dashboard"]
+     (live-clock clock*)]))
+```
+
 ## Assets and `<head>` injection
 
 Hyper doesn’t ship with an asset pipeline (Tailwind, Vite, etc.), but it *does*

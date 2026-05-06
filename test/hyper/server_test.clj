@@ -104,7 +104,9 @@
                                     ::channel
                                     compress?
                                     (java.util.concurrent.Semaphore. 0)
-                                    (promise))
+                                    (promise)
+                                    (atom #{})
+                                    (atom true))
           (is (= expected-headers
                  (:headers @captured-response))))))))
 
