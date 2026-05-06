@@ -42,9 +42,9 @@
    Returns [html-id hiccup]."
   [hiccup component-id]
   (let [[tag & rest] hiccup
-        has-attrs? (map? (first rest))
-        attrs      (if has-attrs? (first rest) {})
-        children   (if has-attrs? (next rest) rest)]
+        has-attrs?   (map? (first rest))
+        attrs        (if has-attrs? (first rest) {})
+        children     (if has-attrs? (next rest) rest)]
     (if-let [existing-id (:id attrs)]
       [(str existing-id) hiccup]
       [component-id (into [tag (assoc attrs :id component-id)] children)])))
@@ -71,14 +71,14 @@
       ;; Cache hit — return cached HTML without re-executing
       (c/raw cached-html)
       ;; Cache miss — render fresh
-      (let [body              (render-fn)
-            [html-id hiccup]  (inject-id body component-id)
-            html              (c/html hiccup)
-            new-vals          (mapv deref deps)]
+      (let [body             (render-fn)
+            [html-id hiccup] (inject-id body component-id)
+            html             (c/html hiccup)
+            new-vals         (mapv deref deps)]
         (swap! app-state* assoc-in [:tabs tab-id :reactive-components component-id]
-               {:render-fn  render-fn
-                :deps       deps
-                :dep-vals   new-vals
+               {:render-fn   render-fn
+                :deps        deps
+                :dep-vals    new-vals
                 :cached-html html
                 :html-id     html-id})
         hiccup))))
@@ -100,23 +100,23 @@
                       :hyper/tab-id     tab-id
                       :hyper/app-state  app-state*
                       :hyper/router     (:router @app-state*)}]
-      (push-thread-bindings {#'context/*request*               req
-                             #'context/*action-idx*            (atom 0)
-                             #'context/*declared-signals*      (atom [])
-                             #'context/*registered-action-ids* (atom #{})
+      (push-thread-bindings {#'context/*request*                 req
+                             #'context/*action-idx*              (atom 0)
+                             #'context/*declared-signals*        (atom [])
+                             #'context/*registered-action-ids*   (atom #{})
                              #'context/*registered-reactive-ids* (atom #{})
-                             #'context/*state-overlay*        nil})
+                             #'context/*state-overlay*           nil})
       (try
-        (let [body              (render-fn)
-              [html-id hiccup]  (inject-id body component-id)
-              html              (c/html hiccup)
-              new-vals          (mapv deref deps)]
+        (let [body             (render-fn)
+              [html-id hiccup] (inject-id body component-id)
+              html             (c/html hiccup)
+              new-vals         (mapv deref deps)]
           (swap! app-state* assoc-in [:tabs tab-id :reactive-components component-id]
-                 {:render-fn    render-fn
-                  :deps         deps
-                  :dep-vals     new-vals
-                  :cached-html  html
-                  :html-id      html-id})
+                 {:render-fn   render-fn
+                  :deps        deps
+                  :dep-vals    new-vals
+                  :cached-html html
+                  :html-id     html-id})
           html)
         (finally
           (pop-thread-bindings))))))
@@ -192,9 +192,9 @@
    trigger-partial! fires the renderer semaphore without setting
    full-render-needed — so the renderer knows it can attempt a partial."
   [app-state* tab-id trigger-partial! pending-partials*]
-  (let [components    (get-in @app-state* [:tabs tab-id :reactive-components])
-        watched-ids   (set (keys (get-in @app-state* [:tabs tab-id :reactive-watches])))]
+  (let [components  (get-in @app-state* [:tabs tab-id :reactive-components])
+        watched-ids (set (keys (get-in @app-state* [:tabs tab-id :reactive-watches])))]
     (doseq [[component-id {:keys [deps]}] components
-            :when (not (contains? watched-ids component-id))]
+            :when                         (not (contains? watched-ids component-id))]
       (setup-component-watches! app-state* tab-id component-id deps
                                 trigger-partial! pending-partials*))))

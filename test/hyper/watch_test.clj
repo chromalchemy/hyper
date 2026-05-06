@@ -379,13 +379,13 @@
 
 (deftest test-dispose-refcounted-across-tabs
   (testing "shared source is only disposed when the last tab releases it"
-    (let [app-state*       (atom (state/init-state))
-          session-id       "test-session-refcount"
-          tab-id-a         "test_tab_rc_a"
-          tab-id-b         "test_tab_rc_b"
-          trigger-render!  (fn [])
-          disposed*        (atom 0)
-          shared-source    (->DisposableSource (atom {}) disposed*)]
+    (let [app-state*      (atom (state/init-state))
+          session-id      "test-session-refcount"
+          tab-id-a        "test_tab_rc_a"
+          tab-id-b        "test_tab_rc_b"
+          trigger-render! (fn [])
+          disposed*       (atom 0)
+          shared-source   (->DisposableSource (atom {}) disposed*)]
 
       (state/get-or-create-tab! app-state* session-id tab-id-a)
       (state/get-or-create-tab! app-state* session-id tab-id-b)

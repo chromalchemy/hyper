@@ -162,8 +162,8 @@
      (do ~@body)
      ;; Fresh overlay — snapshot current state, execute, flush.
      (let [{app-state*# :app-state*} (context/require-context! "batch")
-           overlay# {:state* (atom @app-state*#)
-                     :paths* (atom #{})}]
+           overlay#                  {:state* (atom @app-state*#)
+                                      :paths* (atom #{})}]
        (binding [context/*state-overlay* overlay#]
          (let [result# (do ~@body)]
            (context/flush-overlay! app-state*#)
@@ -201,10 +201,10 @@
          [:p \"Position: \" @x* \", \" @y*]))"
   [deps & body]
   `(let [{tab-id# :tab-id app-state*# :app-state*} (context/require-context! "reactive")
-         idx#          (if context/*action-idx* (swap! context/*action-idx* inc) 0)
-         component-id# (str "r_" tab-id# "_" idx#)
-         deps#         ~deps
-         render-fn#    (fn [] ~@body)]
+         idx#                                      (if context/*action-idx* (swap! context/*action-idx* inc) 0)
+         component-id#                             (str "r_" tab-id# "_" idx#)
+         deps#                                     ~deps
+         render-fn#                                (fn [] ~@body)]
      (reactive/render-component app-state*# tab-id# component-id# deps# render-fn#)))
 
 ;; ---------------------------------------------------------------------------

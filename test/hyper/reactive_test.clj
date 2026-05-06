@@ -1,9 +1,8 @@
 (ns hyper.reactive-test
-  (:require [clojure.test :refer [deftest is testing]]
-            [clojure.string :as str]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
             [hyper.core :as h]
             [hyper.protocols :as proto]
-            [hyper.reactive :as reactive]
             [hyper.test :as ht]))
 
 ;; A test source that tracks disposal.
@@ -47,7 +46,7 @@
                      (let [count* (h/tab-cursor :count 0)]
                        [:div
                         (h/reactive [count*]
-                          [:p "Count: " @count*])])))]
+                                    [:p "Count: " @count*])])))]
       (is (str/includes? (:body-html result) "Count: 0"))
       ;; ID should be on the <p>, not a wrapper div
       (is (re-find #"<p id=\"r_" (:body-html result))
@@ -59,7 +58,7 @@
                      (let [count* (h/tab-cursor :count 0)]
                        [:div
                         (h/reactive [count*]
-                          [:p {:id "my-counter"} "Count: " @count*])])))]
+                                    [:p {:id "my-counter"} "Count: " @count*])])))]
       (is (str/includes? (:body-html result) "id=\"my-counter\""))
       ;; Should NOT have a generated reactive ID
       (is (not (re-find #"r_" (:body-html result)))
@@ -74,9 +73,9 @@
                             dynamic* (h/tab-cursor :dynamic 0)]
                         [:div
                          (h/reactive [static*]
-                           [:p "Static: " @static*])
+                                     [:p "Static: " @static*])
                          (h/reactive [dynamic*]
-                           [:p "Dynamic: " @dynamic*])]))
+                                     [:p "Dynamic: " @dynamic*])]))
           r1        (ht/test-page render-fn)]
 
       ;; Both blocks rendered on first pass
@@ -99,10 +98,10 @@
                            inner* (h/tab-cursor :inner "B")]
                        [:div
                         (h/reactive [outer*]
-                          [:div
-                           [:span "Outer: " @outer*]
-                           (h/reactive [inner*]
-                             [:span "Inner: " @inner*])])])))]
+                                    [:div
+                                     [:span "Outer: " @outer*]
+                                     (h/reactive [inner*]
+                                                 [:span "Inner: " @inner*])])])))]
       (is (str/includes? (:body-html result) "Outer: A"))
       (is (str/includes? (:body-html result) "Inner: B")))))
 
@@ -113,9 +112,9 @@
                         [:div
                          (if (= @mode* :a)
                            (h/reactive [(h/tab-cursor :x 0)]
-                             [:p "Mode A"])
+                                       [:p "Mode A"])
                            (h/reactive [(h/tab-cursor :y 0)]
-                             [:p "Mode B"]))]))
+                                       [:p "Mode B"]))]))
           r1        (ht/test-page render-fn)]
 
       (is (str/includes? (:body-html r1) "Mode A"))
@@ -141,7 +140,7 @@
                         [:div
                          (when @show?*
                            (h/reactive [source]
-                             [:p "Source: " @source]))]))
+                                       [:p "Source: " @source]))]))
           r1        (ht/test-page render-fn)]
 
       (is (str/includes? (:body-html r1) "Source: val"))
@@ -154,5 +153,5 @@
         ;; But disposal only happens if watches were set up (which requires a renderer)
         ;; In test-page context, component watches are not set up since there's no
         ;; renderer thread. The sweep still removes the component registration.
-        (let [components (get-in @(:app-state r1) [:tabs "test-tab" :reactive-components])]
-          (is (empty? components) "swept component should be removed"))))))
+        (is (empty? (get-in @(:app-state r1) [:tabs "test-tab" :reactive-components]))
+            "swept component should be removed")))))

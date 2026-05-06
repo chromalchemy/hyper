@@ -131,22 +131,22 @@
 
 (defn- reactive-get [_]
   (h/watch! reactive-clock*)
-  (let [count*   (h/tab-cursor :count 0)
-        static*  (h/tab-cursor :static "initial")]
+  (let [count*  (h/tab-cursor :count 0)
+        static* (h/tab-cursor :static "initial")]
     [:div
      [:h1 "Reactive Test"]
      ;; Non-reactive part — only updates on full re-render
      [:span#static-value @static*]
      ;; Reactive component watching the shared clock atom
      (h/reactive [reactive-clock*]
-       [:span#clock-value @reactive-clock*])
+                 [:span#clock-value @reactive-clock*])
      ;; Counter to trigger full re-renders
      [:span#counter-value @count*]
      [:button#inc-btn {:data-on:click (h/action (swap! (h/tab-cursor :count) inc))} "+"]
      ;; Reactive component with user-provided ID
      [:div#user-id-section
       (h/reactive [count*]
-        [:span {:id "custom-reactive"} "Count: " @count*])]]))
+                  [:span {:id "custom-reactive"} "Count: " @count*])]]))
 
 ;; Shared atom for testing watch! bootstrap — mutated from test code
 ;; to verify that server-side changes trigger SSE re-renders.

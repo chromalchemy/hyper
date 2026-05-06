@@ -531,9 +531,9 @@
 
 (deftest batch-atomic-update-test
   (testing "batch flushes all cursor writes in a single swap"
-    (let [swap-count*  (atom 0)
-          app-state*   (atom (state/init-state))
-          _            (state/get-or-create-tab! app-state* "s1" "t1")]
+    (let [swap-count* (atom 0)
+          app-state*  (atom (state/init-state))
+          _           (state/get-or-create-tab! app-state* "s1" "t1")]
       ;; Watch the atom to count how many times it's swapped AFTER batch
       (add-watch app-state* :counter (fn [_ _ _ _] (swap! swap-count* inc)))
       (binding [context/*request* {:hyper/session-id "s1"
@@ -686,12 +686,12 @@
                        [:p (str @a* " " @b*)]
                        [:button {:data-on:click
                                  (hy/action {:as "update-both"}
-                                   (hy/batch
-                                     (reset! (hy/tab-cursor :a) 10)
-                                     (reset! (hy/tab-cursor :b) 20)))}
+                                            (hy/batch
+                                              (reset! (hy/tab-cursor :a) 10)
+                                              (reset! (hy/tab-cursor :b) 20)))}
                         "Update"]]))
-          result (ht/test-page page-fn)
-          after  (ht/test-action result "update-both")]
+          result  (ht/test-page page-fn)
+          after   (ht/test-action result "update-both")]
       (is (= 10 (get-in after [:cursors :tab :a])))
       (is (= 20 (get-in after [:cursors :tab :b]))))))
 
@@ -717,7 +717,7 @@
                          (reset! captured @x*)
                          [:div (str @x*)]))]
       (ht/test-page page-fn {:app-state  app-state*
-                              :tab-id     "t1"
-                              :session-id "s1"})
+                             :tab-id     "t1"
+                             :session-id "s1"})
       ;; Should see the snapshot value
       (is (= 100 @captured)))))

@@ -117,7 +117,7 @@
                                           (reactive/sweep-stale-components! app-state* tab-id registered-reactive-ids)
                                           ;; Set up watches for new/changed reactive components
                                           (reactive/setup-new-component-watches! app-state* tab-id
-                                                                                  trigger-partial! pending-partials*)
+                                                                                 trigger-partial! pending-partials*)
                                           (let [head-event   (render/format-head-update title head-html)
                                                 sig-attrs    (signal/format-signal-attrs declared-signals)
                                                 div-attrs    (cond-> {:id "hyper-app"}
@@ -165,24 +165,24 @@
    - :stop!           — zero-arg fn; call to shut down the renderer
    - :pending-partials* — atom #{} of reactive block IDs needing partial render"
   [app-state* session-id tab-id channel compress?]
-  (let [semaphore          (Semaphore. 0)
-        shutdown-renderer* (promise)
-        pending-partials*  (atom #{})
+  (let [semaphore           (Semaphore. 0)
+        shutdown-renderer*  (promise)
+        pending-partials*   (atom #{})
         full-render-needed* (atom true)  ;; start with full render
-        trigger-render!    (fn []
-                             (reset! full-render-needed* true)
-                             (.release semaphore))
-        stop!              #(do (deliver shutdown-renderer* true)
-                                (.release semaphore))
-        thread             (-> (Thread/ofVirtual)
-                               (.name (str "hyper-renderer-" tab-id))
-                               (.start ^Runnable
-                                 #(-renderer-loop! app-state* session-id tab-id
-                                                   channel compress?
-                                                   semaphore shutdown-renderer*
-                                                   pending-partials* full-render-needed*)))]
-    {:trigger-render!    trigger-render!
-     :trigger-partial!   #(.release semaphore)
+        trigger-render!     (fn []
+                              (reset! full-render-needed* true)
+                              (.release semaphore))
+        stop!               #(do (deliver shutdown-renderer* true)
+                                 (.release semaphore))
+        thread              (-> (Thread/ofVirtual)
+                                (.name (str "hyper-renderer-" tab-id))
+                                (.start ^Runnable
+                                  #(-renderer-loop! app-state* session-id tab-id
+                                                    channel compress?
+                                                    semaphore shutdown-renderer*
+                                                    pending-partials* full-render-needed*)))]
+    {:trigger-render!   trigger-render!
+     :trigger-partial!  #(.release semaphore)
      :stop!             stop!
      :thread            thread
      :pending-partials* pending-partials*}))

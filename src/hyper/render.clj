@@ -203,25 +203,25 @@
              ;; register actions during realization.  We must read
              ;; *registered-action-ids* AFTER serialization so the
              ;; accumulator captures every action the render produced.
-             (let [body-html     (c/html body)
-                   title-spec    (when (and (seq route-index) route)
-                                   (routes/find-route-title route-index (:name route)))
-                   title         (routes/resolve-title title-spec req)
-                   head          (some-> (routes/resolve-head (get @app-state* :head) req)
-                                         mark-head-elements)
-                   declared      @context/*declared-signals*
-                   action-ids    @context/*registered-action-ids*
-                   reactive-ids  @context/*registered-reactive-ids*]
+             (let [body-html    (c/html body)
+                   title-spec   (when (and (seq route-index) route)
+                                  (routes/find-route-title route-index (:name route)))
+                   title        (routes/resolve-title title-spec req)
+                   head         (some-> (routes/resolve-head (get @app-state* :head) req)
+                                        mark-head-elements)
+                   declared     @context/*declared-signals*
+                   action-ids   @context/*registered-action-ids*
+                   reactive-ids @context/*registered-reactive-ids*]
                ;; Flush default-value inits and any other cursor writes
                ;; from the overlay to the live atom in a single swap.
                (context/flush-overlay! app-state*)
-               {:title                    title
-                :head-html                (some-> head c/html)
-                :body-html                body-html
-                :url                      url
-                :declared-signals         declared
-                :registered-action-ids    action-ids
-                :registered-reactive-ids  reactive-ids})))
+               {:title                   title
+                :head-html               (some-> head c/html)
+                :body-html               body-html
+                :url                     url
+                :declared-signals        declared
+                :registered-action-ids   action-ids
+                :registered-reactive-ids reactive-ids})))
          (finally
            (pop-thread-bindings)))))))
 
