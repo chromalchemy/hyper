@@ -653,6 +653,42 @@ into functions:
      (live-clock clock*)]))
 ```
 
+## Batched cursor updates
+
+When an action updates multiple cursors, the renderer could snapshot between
+writes and show an intermediate state the developer never intended to expose.
+`batch` groups cursor writes so they land in a single atomic `swap!` — the
+renderer only ever sees the final result.
+
+```clojure
+(h/action
+  (h/batch
+    (reset! (h/tab-cursor :data) (fetch-data!))
+    (reset! (h/tab-cursor :loading?) false)))
+```
+
+Without `batch`, the renderer might snapshot after `:data` is set but before
+`:loading?` is cleared — producing a frame with both the data *and* a spinner.
+
+**Progress bar pattern** — leave the intermediate write *outside* `batch` so the
+renderer picks it up, and batch only the final pair:
+
+```clojure
+(h/action
+  (reset! (h/tab-cursor :loading?) true)     ;; immediate — shows spinner
+  (let [data (fetch-data!)]
+    (h/batch                                  ;; atomic — one render
+      (reset! (h/tab-cursor :data) data)
+      (reset! (h/tab-cursor :loading?) false))))
+```
+
+Inside a batch, cursor reads see all accumulated writes (read-your-writes), so
+intermediate logic that depends on earlier mutations works naturally. Side
+effects (I/O, HTTP, DB) are fine — only cursor writes are deferred.
+
+Nested `batch` calls are transparent: the inner batch executes within the
+outer overlay and the outermost boundary handles the flush.
+
 ## Assets and `<head>` injection
 
 Hyper doesn’t ship with an asset pipeline (Tailwind, Vite, etc.), but it *does*

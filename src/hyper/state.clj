@@ -26,8 +26,8 @@
 (deftype Cursor [parent-atom full-path meta-data ^:volatile-mutable validator watches]
   clojure.lang.IRef
   (deref [_]
-    (if-let [snapshot* context/*state-snapshot*]
-      (get-in @snapshot* full-path)
+    (if-let [{state* :state*} context/*state-overlay*]
+      (get-in @state* full-path)
       (get-in @parent-atom full-path)))
 
   (setValidator [_ vf]
@@ -56,53 +56,59 @@
 
   clojure.lang.IAtom
   (swap [_ f]
-    (let [new-state (swap! parent-atom update-in full-path f)
-          new-val   (get-in new-state full-path)]
-      (when-let [snapshot* context/*state-snapshot*]
-        (vswap! snapshot* assoc-in full-path new-val))
-      new-val))
+    (if-let [{state* :state* paths* :paths*} context/*state-overlay*]
+      (let [new-val (get-in (swap! state* update-in full-path f) full-path)]
+        (swap! paths* conj full-path)
+        new-val)
+      (get-in (swap! parent-atom update-in full-path f) full-path)))
 
   (swap [_ f arg]
-    (let [new-state (swap! parent-atom update-in full-path f arg)
-          new-val   (get-in new-state full-path)]
-      (when-let [snapshot* context/*state-snapshot*]
-        (vswap! snapshot* assoc-in full-path new-val))
-      new-val))
+    (if-let [{state* :state* paths* :paths*} context/*state-overlay*]
+      (let [new-val (get-in (swap! state* update-in full-path f arg) full-path)]
+        (swap! paths* conj full-path)
+        new-val)
+      (get-in (swap! parent-atom update-in full-path f arg) full-path)))
 
   (swap [_ f arg1 arg2]
-    (let [new-state (swap! parent-atom update-in full-path f arg1 arg2)
-          new-val   (get-in new-state full-path)]
-      (when-let [snapshot* context/*state-snapshot*]
-        (vswap! snapshot* assoc-in full-path new-val))
-      new-val))
+    (if-let [{state* :state* paths* :paths*} context/*state-overlay*]
+      (let [new-val (get-in (swap! state* update-in full-path f arg1 arg2) full-path)]
+        (swap! paths* conj full-path)
+        new-val)
+      (get-in (swap! parent-atom update-in full-path f arg1 arg2) full-path)))
 
   (swap [_ f arg1 arg2 args]
-    (let [new-state (apply swap! parent-atom update-in full-path f arg1 arg2 args)
-          new-val   (get-in new-state full-path)]
-      (when-let [snapshot* context/*state-snapshot*]
-        (vswap! snapshot* assoc-in full-path new-val))
-      new-val))
+    (if-let [{state* :state* paths* :paths*} context/*state-overlay*]
+      (let [new-val (get-in (apply swap! state* update-in full-path f arg1 arg2 args) full-path)]
+        (swap! paths* conj full-path)
+        new-val)
+      (get-in (apply swap! parent-atom update-in full-path f arg1 arg2 args) full-path)))
 
   (compareAndSet [_ oldv newv]
-    (loop []
-      (let [current-state @parent-atom
-            current-val   (get-in current-state full-path)]
+    (if-let [{state* :state* paths* :paths*} context/*state-overlay*]
+      (let [current-val (get-in @state* full-path)]
         (if (= current-val oldv)
-          (if (compare-and-set! parent-atom
-                                current-state
-                                (assoc-in current-state full-path newv))
-            (do
-              (when-let [snapshot* context/*state-snapshot*]
-                (vswap! snapshot* assoc-in full-path newv))
+          (do (swap! state* assoc-in full-path newv)
+              (swap! paths* conj full-path)
               true)
-            (recur))
-          false))))
+          false))
+      (loop []
+        (let [current-state @parent-atom
+              current-val   (get-in current-state full-path)]
+          (if (= current-val oldv)
+            (if (compare-and-set! parent-atom
+                                  current-state
+                                  (assoc-in current-state full-path newv))
+              true
+              (recur))
+            false)))))
 
   (reset [_ newv]
-    (swap! parent-atom assoc-in full-path newv)
-    (when-let [snapshot* context/*state-snapshot*]
-      (vswap! snapshot* assoc-in full-path newv))
-    newv)
+    (if-let [{state* :state* paths* :paths*} context/*state-overlay*]
+      (do (swap! state* assoc-in full-path newv)
+          (swap! paths* conj full-path)
+          newv)
+      (do (swap! parent-atom assoc-in full-path newv)
+          newv)))
 
   clojure.lang.IMeta
   (meta [_] @meta-data)

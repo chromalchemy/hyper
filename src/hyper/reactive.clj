@@ -105,7 +105,7 @@
                              #'context/*declared-signals*      (atom [])
                              #'context/*registered-action-ids* (atom #{})
                              #'context/*registered-reactive-ids* (atom #{})
-                             #'context/*state-snapshot*        nil})
+                             #'context/*state-overlay*        nil})
       (try
         (let [body              (render-fn)
               [html-id hiccup]  (inject-id body component-id)

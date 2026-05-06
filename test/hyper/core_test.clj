@@ -4,6 +4,7 @@
             [hyper.context :as context]
             [hyper.core :as hy]
             [hyper.state :as state]
+            [hyper.test :as ht]
             [reitit.ring :as ring]))
 
 (deftest test-global-cursor
@@ -523,3 +524,200 @@
                                 "@post('/my-app/hyper/actions?"))
           (is (not (string/includes? (str (:data-on:click__prevent nav-attrs))
                                      "@post('/hyper/actions?"))))))))
+
+;; ---------------------------------------------------------------------------
+;; Batch
+;; ---------------------------------------------------------------------------
+
+(deftest batch-atomic-update-test
+  (testing "batch flushes all cursor writes in a single swap"
+    (let [swap-count*  (atom 0)
+          app-state*   (atom (state/init-state))
+          _            (state/get-or-create-tab! app-state* "s1" "t1")]
+      ;; Watch the atom to count how many times it's swapped AFTER batch
+      (add-watch app-state* :counter (fn [_ _ _ _] (swap! swap-count* inc)))
+      (binding [context/*request* {:hyper/session-id "s1"
+                                   :hyper/tab-id     "t1"
+                                   :hyper/app-state  app-state*}]
+        ;; Reset counter after setup swaps
+        (reset! swap-count* 0)
+        (hy/batch
+          (reset! (hy/tab-cursor :a) 1)
+          (reset! (hy/tab-cursor :b) 2)
+          (reset! (hy/tab-cursor :c) 3))
+        ;; All three writes should have been flushed in a single swap
+        (is (= 1 @swap-count*) "batch should flush all writes in a single swap!")
+        ;; All values should be present in the live atom
+        (is (= 1 (get-in @app-state* [:tabs "t1" :data :a])))
+        (is (= 2 (get-in @app-state* [:tabs "t1" :data :b])))
+        (is (= 3 (get-in @app-state* [:tabs "t1" :data :c]))))
+      (remove-watch app-state* :counter))))
+
+(deftest batch-read-your-writes-test
+  (testing "cursor reads inside batch see accumulated writes"
+    (let [app-state* (atom (state/init-state))
+          _          (state/get-or-create-tab! app-state* "s1" "t1")]
+      (binding [context/*request* {:hyper/session-id "s1"
+                                   :hyper/tab-id     "t1"
+                                   :hyper/app-state  app-state*}]
+        (hy/batch
+          (reset! (hy/tab-cursor :x) 10)
+          ;; Should read the value we just set, even though it hasn't been flushed
+          (is (= 10 @(hy/tab-cursor :x)))
+          (swap! (hy/tab-cursor :x) + 5)
+          (is (= 15 @(hy/tab-cursor :x))))
+        ;; After flush, live atom should have the final value
+        (is (= 15 (get-in @app-state* [:tabs "t1" :data :x])))))))
+
+(deftest batch-nested-transparency-test
+  (testing "nested batch executes within outer overlay — no double flush"
+    (let [swap-count* (atom 0)
+          app-state*  (atom (state/init-state))
+          _           (state/get-or-create-tab! app-state* "s1" "t1")]
+      (add-watch app-state* :counter (fn [_ _ _ _] (swap! swap-count* inc)))
+      (binding [context/*request* {:hyper/session-id "s1"
+                                   :hyper/tab-id     "t1"
+                                   :hyper/app-state  app-state*}]
+        (reset! swap-count* 0)
+        (hy/batch
+          (reset! (hy/tab-cursor :a) 1)
+          ;; Nested batch — should NOT create a separate overlay
+          (hy/batch
+            (reset! (hy/tab-cursor :b) 2))
+          (reset! (hy/tab-cursor :c) 3)
+          ;; Nested batch's write should be visible
+          (is (= 2 @(hy/tab-cursor :b))))
+        ;; Still a single flush
+        (is (= 1 @swap-count*))
+        (is (= 1 (get-in @app-state* [:tabs "t1" :data :a])))
+        (is (= 2 (get-in @app-state* [:tabs "t1" :data :b])))
+        (is (= 3 (get-in @app-state* [:tabs "t1" :data :c]))))
+      (remove-watch app-state* :counter))))
+
+(deftest batch-return-value-test
+  (testing "batch returns the value of the last expression"
+    (let [app-state* (atom (state/init-state))
+          _          (state/get-or-create-tab! app-state* "s1" "t1")]
+      (binding [context/*request* {:hyper/session-id "s1"
+                                   :hyper/tab-id     "t1"
+                                   :hyper/app-state  app-state*}]
+        (let [result (hy/batch
+                       (reset! (hy/tab-cursor :x) 42)
+                       :done)]
+          (is (= :done result)))))))
+
+(deftest batch-no-writes-no-flush-test
+  (testing "batch with no cursor writes does not swap app-state"
+    (let [swap-count* (atom 0)
+          app-state*  (atom (state/init-state))
+          _           (state/get-or-create-tab! app-state* "s1" "t1")]
+      (add-watch app-state* :counter (fn [_ _ _ _] (swap! swap-count* inc)))
+      (binding [context/*request* {:hyper/session-id "s1"
+                                   :hyper/tab-id     "t1"
+                                   :hyper/app-state  app-state*}]
+        (reset! swap-count* 0)
+        (hy/batch
+          (+ 1 2 3))
+        (is (= 0 @swap-count*)))
+      (remove-watch app-state* :counter))))
+
+(deftest batch-without-batch-writes-directly-test
+  (testing "without batch, each cursor write goes to live atom immediately"
+    (let [swap-count* (atom 0)
+          app-state*  (atom (state/init-state))
+          _           (state/get-or-create-tab! app-state* "s1" "t1")]
+      (add-watch app-state* :counter (fn [_ _ _ _] (swap! swap-count* inc)))
+      (binding [context/*request* {:hyper/session-id "s1"
+                                   :hyper/tab-id     "t1"
+                                   :hyper/app-state  app-state*}]
+        (reset! swap-count* 0)
+        (reset! (hy/tab-cursor :a) 1)
+        (reset! (hy/tab-cursor :b) 2)
+        ;; Each write should have hit the live atom separately
+        (is (< 1 @swap-count*) "without batch, writes should hit live atom individually"))
+      (remove-watch app-state* :counter))))
+
+(deftest batch-preserves-concurrent-writes-test
+  (testing "batch flush only overwrites paths it wrote — other paths preserved"
+    (let [app-state* (atom (state/init-state))
+          _          (state/get-or-create-tab! app-state* "s1" "t1")]
+      ;; Pre-seed a value
+      (swap! app-state* assoc-in [:tabs "t1" :data :existing] "untouched")
+      (binding [context/*request* {:hyper/session-id "s1"
+                                   :hyper/tab-id     "t1"
+                                   :hyper/app-state  app-state*}]
+        (hy/batch
+          (reset! (hy/tab-cursor :new-key) "hello")
+          ;; Simulate a concurrent write to a different path
+          ;; (another action handler on a different tab)
+          (swap! app-state* assoc-in [:tabs "t1" :data :concurrent] "written-during-batch")))
+      ;; Batch's write should be present
+      (is (= "hello" (get-in @app-state* [:tabs "t1" :data :new-key])))
+      ;; Pre-existing value should be preserved
+      (is (= "untouched" (get-in @app-state* [:tabs "t1" :data :existing])))
+      ;; Concurrent write should be preserved (not overwritten by flush)
+      (is (= "written-during-batch" (get-in @app-state* [:tabs "t1" :data :concurrent]))))))
+
+(deftest batch-compare-and-set-test
+  (testing "compareAndSet works inside batch"
+    (let [app-state* (atom (state/init-state))
+          _          (state/get-or-create-tab! app-state* "s1" "t1")]
+      (swap! app-state* assoc-in [:tabs "t1" :data :x] 10)
+      (binding [context/*request* {:hyper/session-id "s1"
+                                   :hyper/tab-id     "t1"
+                                   :hyper/app-state  app-state*}]
+        (hy/batch
+          (let [c (hy/tab-cursor :x)]
+            ;; CAS with correct old value should succeed
+            (is (true? (compare-and-set! c 10 20)))
+            (is (= 20 @c))
+            ;; CAS with wrong old value should fail
+            (is (false? (compare-and-set! c 10 30)))
+            (is (= 20 @c))))
+        ;; Flushed value should be 20
+        (is (= 20 (get-in @app-state* [:tabs "t1" :data :x])))))))
+
+(deftest batch-inside-test-action-test
+  (testing "batch works end-to-end inside a test-page/test-action workflow"
+    (let [page-fn (fn [_req]
+                    (let [a* (hy/tab-cursor :a 0)
+                          b* (hy/tab-cursor :b 0)]
+                      [:div
+                       [:p (str @a* " " @b*)]
+                       [:button {:data-on:click
+                                 (hy/action {:as "update-both"}
+                                   (hy/batch
+                                     (reset! (hy/tab-cursor :a) 10)
+                                     (reset! (hy/tab-cursor :b) 20)))}
+                        "Update"]]))
+          result (ht/test-page page-fn)
+          after  (ht/test-action result "update-both")]
+      (is (= 10 (get-in after [:cursors :tab :a])))
+      (is (= 20 (get-in after [:cursors :tab :b]))))))
+
+(deftest render-overlay-flush-test
+  (testing "render overlay flushes default-value inits to live atom"
+    (let [page-fn (fn [_req]
+                    (let [c* (hy/tab-cursor :auto-init 42)]
+                      [:div [:p (str @c*)]]))
+          result  (ht/test-page page-fn)]
+      ;; Default value should be flushed to the live atom after render
+      (is (= 42 (get-in @(:app-state result) [:tabs "test-tab" :data :auto-init]))))))
+
+(deftest render-overlay-read-consistency-test
+  (testing "cursor reads during render see a consistent snapshot"
+    (let [app-state* (atom (state/init-state))
+          _          (state/get-or-create-tab! app-state* "s1" "t1")
+          ;; Pre-seed state
+          _          (swap! app-state* assoc-in [:tabs "t1" :data :x] 100)
+          captured   (atom nil)
+          page-fn    (fn [_req]
+                       (let [x* (hy/tab-cursor :x)]
+                         ;; Capture the value seen during render
+                         (reset! captured @x*)
+                         [:div (str @x*)]))]
+      (ht/test-page page-fn {:app-state  app-state*
+                              :tab-id     "t1"
+                              :session-id "s1"})
+      ;; Should see the snapshot value
+      (is (= 100 @captured)))))

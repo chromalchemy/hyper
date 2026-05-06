@@ -139,7 +139,8 @@
                               #'context/*declared-signals*        (atom [])
                               #'context/*registered-action-ids*   (atom #{})
                               #'context/*registered-reactive-ids* (atom #{})
-                              #'context/*state-snapshot*          (volatile! @app-state*)})
+                              #'context/*state-overlay*           {:state* (atom @app-state*)
+                                                                   :paths* (atom #{})}})
        (try
          (let [body  (render/safe-render handler req)
                ;; Ring response passthrough
@@ -153,6 +154,8 @@
                                           (assoc acc path (dissoc entry :path)))
                                         {}
                                         declared)]
+               ;; Flush default-value inits from overlay to live atom
+               (context/flush-overlay! app-state*)
                ;; Sweep stale reactive components (same as server.clj)
                (reactive/sweep-stale-components! app-state* tab-id reactive-ids)
                {:body        body

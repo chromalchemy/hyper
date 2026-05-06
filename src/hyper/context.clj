@@ -31,15 +31,38 @@
 ;; in a single atomic swap — no cleanup-before-render gap needed.
 (def ^:dynamic *registered-action-ids* nil)
 
-;; Snapshot of @app-state* taken at the start of a render cycle, wrapped
-;; in a volatile for single-thread mutation.  During render, Cursor/deref
-;; reads from this snapshot instead of the live atom, guaranteeing a
-;; consistent point-in-time view immune to concurrent action mutations.
-;; Cursor writes (reset!, swap!) update both the live atom AND this
-;; snapshot so that default-value initialization and intra-render writes
-;; are visible to subsequent reads within the same render pass.
-;; nil during action execution so that actions always see/mutate live state.
-(def ^:dynamic *state-snapshot* nil)
+;; State overlay for cursor read/write indirection.
+;;
+;; When non-nil, a map with:
+;;   :state*  — atom holding the shadow state (cursor reads/writes go here)
+;;   :paths*  — atom #{} of full-paths that were written (for selective flush)
+;;
+;; Bound during render (snapshot for read consistency) and inside the
+;; `batch` macro (deferred writes for atomicity).  Cursors check this var
+;; first: if bound, reads/writes go through the overlay; otherwise they
+;; hit app-state* directly.
+;;
+;; At the boundary end (render complete / batch body returns), written
+;; paths are flushed to app-state* in a single swap! via `flush-overlay!`.
+;; nil during action execution (without batch) so that actions see/mutate
+;; live state and each cursor write fires the watcher immediately.
+(def ^:dynamic *state-overlay* nil)
+
+(defn flush-overlay!
+  "Flush written paths from the current overlay to the live atom.
+   Only touches paths that were actually written during the overlay's
+   lifetime, preserving concurrent changes to other paths.
+   No-op when no paths were written."
+  [app-state*]
+  (when-let [{:keys [state* paths*]} *state-overlay*]
+    (let [shadow @state*
+          paths  @paths*]
+      (when (seq paths)
+        (swap! app-state* (fn [live]
+                            (reduce (fn [s p]
+                                      (assoc-in s p (get-in shadow p)))
+                                    live
+                                    paths)))))))
 
 ;; Accumulator for reactive component IDs registered during a render pass.
 ;; Bound to (atom #{}) before each full render so that the reactive macro

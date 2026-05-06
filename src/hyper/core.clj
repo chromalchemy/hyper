@@ -122,6 +122,54 @@
       (watch/stash-pending-watch! app-state* tab-id source))))
 
 ;; ---------------------------------------------------------------------------
+;; Batched cursor updates
+;; ---------------------------------------------------------------------------
+
+(defmacro batch
+  "Execute body with all cursor writes batched into a single atomic update.
+
+   During the body, cursor reads see the accumulated writes (read-your-writes).
+   After the body completes, all mutations are flushed to app-state* in a
+   single swap!, so the renderer only sees the final state — never an
+   intermediate one.
+
+   Side effects (I/O, HTTP calls, DB queries) inside batch work normally —
+   only cursor writes are deferred.
+
+   Nested batches are transparent — the inner batch executes within the
+   existing overlay and the outermost boundary handles the flush.
+
+   Example:
+     ;; Without batch, the renderer might snapshot between cursor updates
+     ;; and show a partial state (e.g. new data with loading still true).
+     (h/action
+       (h/batch
+         (reset! (h/tab-cursor :data) (fetch-data!))
+         (reset! (h/tab-cursor :loading?) false)))
+
+     ;; Progress bar: use batch only for the atomic pair, leave the
+     ;; intermediate :loading state unbatched so the renderer picks it up.
+     (h/action
+       (reset! (h/tab-cursor :loading?) true)     ;; immediate — shows spinner
+       (let [data (fetch-data!)]
+         (h/batch                                  ;; atomic — one render
+           (reset! (h/tab-cursor :data) data)
+           (reset! (h/tab-cursor :loading?) false))))"
+  [& body]
+  `(if context/*state-overlay*
+     ;; Already inside an overlay (render or outer batch) — just execute.
+     ;; Writes accumulate in the existing overlay; outer boundary flushes.
+     (do ~@body)
+     ;; Fresh overlay — snapshot current state, execute, flush.
+     (let [{app-state*# :app-state*} (context/require-context! "batch")
+           overlay# {:state* (atom @app-state*#)
+                     :paths* (atom #{})}]
+       (binding [context/*state-overlay* overlay#]
+         (let [result# (do ~@body)]
+           (context/flush-overlay! app-state*#)
+           result#)))))
+
+;; ---------------------------------------------------------------------------
 ;; Reactive components
 ;; ---------------------------------------------------------------------------
 

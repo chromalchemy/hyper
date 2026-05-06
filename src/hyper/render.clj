@@ -190,7 +190,8 @@
                               #'context/*declared-signals*        (atom [])
                               #'context/*registered-action-ids*   (atom #{})
                               #'context/*registered-reactive-ids* (atom #{})
-                              #'context/*state-snapshot*          (volatile! @app-state*)})
+                              #'context/*state-overlay*           {:state* (atom @app-state*)
+                                                                   :paths* (atom #{})}})
        (try
          (let [body (safe-render render-fn req)]
            ;; Ring response passthrough - render-fn returned a redirect,
@@ -211,6 +212,9 @@
                    declared      @context/*declared-signals*
                    action-ids    @context/*registered-action-ids*
                    reactive-ids  @context/*registered-reactive-ids*]
+               ;; Flush default-value inits and any other cursor writes
+               ;; from the overlay to the live atom in a single swap.
+               (context/flush-overlay! app-state*)
                {:title                    title
                 :head-html                (some-> head c/html)
                 :body-html                body-html
