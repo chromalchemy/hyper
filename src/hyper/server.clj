@@ -9,6 +9,7 @@
             [hyper.actions :as actions]
             [hyper.brotli :as br]
             [hyper.context :as context]
+            [hyper.effects :as effects]
             [hyper.reactive :as reactive]
             [hyper.render :as render]
             [hyper.routes :as routes]
@@ -56,7 +57,7 @@
    Exits when shutdown-renderer* is delivered."
   [app-state* session-id tab-id channel compress?
    ^Semaphore semaphore shutdown-renderer*
-   pending-partials* full-render-needed*]
+   pending-partials* full-render-needed* pending-scripts*]
   (let [br-out           (when compress? (br/byte-array-out-stream))
         br-stream        (when br-out (br/compress-out-stream br-out :window-size 18))
         headers          (cond-> {"Content-Type"      "text/event-stream"
@@ -135,9 +136,25 @@
                                       (catch Throwable e
                                         (t/error! e {:id   :hyper.error/renderer
                                                      :data {:hyper/tab-id tab-id}})
+                                        nil))
+                    ;; Drain pending execute-script effects queued by actions
+                    scripts         (let [ss @pending-scripts*]
+                                      (reset! pending-scripts* [])
+                                      ss)
+                    script-sent?    (try
+                                      (when (seq scripts)
+                                        (let [sse-payload (apply str (map effects/format-execute-script-event scripts))
+                                              payload     (if br-stream
+                                                            (br/compress-stream br-out br-stream sse-payload)
+                                                            sse-payload)]
+                                          (boolean (http-kit/send! channel payload false))))
+                                      (catch Throwable e
+                                        (t/error! e {:id   :hyper.error/renderer-scripts
+                                                     :data {:hyper/tab-id tab-id}})
                                         nil))]
                 ;; sent? is true (ok), nil (no render-fn or error), false (channel closed)
-                (when-not (false? sent?)
+                ;; script-sent? follows the same convention
+                (when-not (or (false? sent?) (false? script-sent?))
                   ;; Throttle: sleep so triggers during this window accumulate
                   ;; as semaphore permits, which drainPermits collapses into
                   ;; a single render on the next iteration.
@@ -163,11 +180,13 @@
    Returns a map with:
    - :trigger-render! — zero-arg fn; call to signal a re-render (full)
    - :stop!           — zero-arg fn; call to shut down the renderer
-   - :pending-partials* — atom #{} of reactive block IDs needing partial render"
+   - :pending-partials* — atom #{} of reactive block IDs needing partial render
+   - :pending-scripts* — atom [] of JS strings to execute on the client"
   [app-state* session-id tab-id channel compress?]
   (let [semaphore           (Semaphore. 0)
         shutdown-renderer*  (promise)
         pending-partials*   (atom #{})
+        pending-scripts*    (atom [])
         full-render-needed* (atom true)  ;; start with full render
         trigger-render!     (fn []
                               (reset! full-render-needed* true)
@@ -180,12 +199,14 @@
                                   #(-renderer-loop! app-state* session-id tab-id
                                                     channel compress?
                                                     semaphore shutdown-renderer*
-                                                    pending-partials* full-render-needed*)))]
+                                                    pending-partials* full-render-needed*
+                                                    pending-scripts*)))]
     {:trigger-render!   trigger-render!
      :trigger-partial!  #(.release semaphore)
      :stop!             stop!
      :thread            thread
-     :pending-partials* pending-partials*}))
+     :pending-partials* pending-partials*
+     :pending-scripts*  pending-scripts*}))
 
 (defn wrap-hyper-context
   "Middleware that adds session-id and tab-id to the request."
@@ -305,7 +326,10 @@
 
    - Parses the body as signal values and binds them to `context/*signals*`
    - Extracts client params from URL query parameters (JSON-decoded)
-   - Returns 204 to prevent Datastar from merging the response into signals"
+   - Binds `effects/*pending*` to collect side-effects (cookies, scripts)
+   - Returns 204 (with any Set-Cookie headers) to prevent Datastar from
+     merging the response into signals
+   - Queues any pending scripts to the renderer for SSE delivery"
   [app-state*]
   (fn [req]
     (let [action-id (get-in req [:query-params "action-id"])]
@@ -336,12 +360,22 @@
                    (fn [server-sigs]
                      (merge server-sigs signals))))
           (push-thread-bindings {#'context/*request* req-with-state
-                                 #'context/*signals* signals})
+                                 #'context/*signals* signals
+                                 #'effects/*pending* (effects/init-pending)})
           (try
             (actions/execute-action! app-state* action-id client-params)
 
-            ;; 204 prevents Datastar from merging the response into signals
-            {:status 204}
+            ;; Collect accumulated effects
+            (let [pending (effects/collect-pending!)
+                  ;; Queue pending scripts for SSE delivery via the renderer thread
+                  _       (when-let [scripts (seq (:scripts pending))]
+                            (when-let [renderer (get-in @app-state* [:tabs tab-id :renderer])]
+                              (swap! (:pending-scripts* renderer) into scripts)
+                              ;; Wake the renderer to drain and send the scripts
+                              ((:trigger-partial! renderer))))
+                  ;; Build response — 204 with any cookies from effects
+                  response {:status 204}]
+              (effects/apply-cookies-to-response response pending))
 
             (catch Exception e
               (t/error! e

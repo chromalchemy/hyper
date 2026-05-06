@@ -106,7 +106,8 @@
                                     (java.util.concurrent.Semaphore. 0)
                                     (promise)
                                     (atom #{})
-                                    (atom true))
+                                    (atom true)
+                                    (atom []))
           (is (= expected-headers
                  (:headers @captured-response))))))))
 

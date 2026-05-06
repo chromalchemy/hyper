@@ -27,6 +27,7 @@
          (assert (str/includes? (:body-html result2) \"Count: 1\"))))"
   (:require [dev.onionpancakes.chassis.core :as c]
             [hyper.context :as context]
+            [hyper.effects :as effects]
             [hyper.reactive :as reactive]
             [hyper.render :as render]
             [hyper.state :as state]))
@@ -188,6 +189,12 @@
    Returns a map:
    - :cursors    — Cursor values after the action executed:
                       :global, :session, :tab, :route
+   - :effects    — Effects accumulated during execution. A map with:
+                      :cookies — map of cookie-name to cookie opts
+                      :scripts — vector of JS strings to execute
+                   Effects are collected but NOT applied — this lets tests
+                   assert on what effects *would* happen without actually
+                   setting cookies or sending SSE events.
    - :app-state  — The app-state atom, for threading into test-page.
 
    Throws if the action name is not found in the result.
@@ -201,6 +208,11 @@
      (let [result (ht/test-page search-page)
            after  (ht/test-action result \"search\" {:value \"clojure\"})]
        (is (= \"clojure\" (get-in after [:cursors :tab :query]))))
+
+     ;; Assert on effects
+     (let [result (ht/test-page my-page)
+           after  (ht/test-action result \"publish\")]
+       (is (seq (get-in after [:effects :scripts]))))
 
      ;; Chain into another render
      (let [r1 (ht/test-page my-page)
@@ -219,11 +231,15 @@
                        {:action-name       action-name
                         :available-actions (keys (:actions result))})))
      (let [session-id (::session-id result)
-           tab-id     (::tab-id result)
-           route      (get-in @app-state* [:tabs tab-id :route])]
+           tab-id     (::tab-id result)]
        (binding [context/*request* {:hyper/session-id session-id
                                     :hyper/tab-id     tab-id
-                                    :hyper/app-state  app-state*}]
-         ((:fn action) client-params))
-       {:cursors   (cursors-snapshot app-state* session-id tab-id route)
-        :app-state app-state*}))))
+                                    :hyper/app-state  app-state*
+                                    :hyper/router     (get @app-state* :router)}
+                 effects/*pending* (effects/init-pending)]
+         ((:fn action) client-params)
+         ;; Read route AFTER execution so navigate! changes are reflected
+         (let [route (get-in @app-state* [:tabs tab-id :route])]
+           {:cursors   (cursors-snapshot app-state* session-id tab-id route)
+            :effects   (effects/collect-pending!)
+            :app-state app-state*}))))))

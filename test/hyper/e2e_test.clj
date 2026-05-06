@@ -8,6 +8,7 @@
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing use-fixtures]]
             [hyper.core :as h]
+            [hyper.effects :as effects]
             [hyper.state :as state]
             [wally.main :as w])
   (:import (com.microsoft.playwright Playwright BrowserType$LaunchOptions)))
@@ -158,6 +159,51 @@
    [:h1 "Watch Bootstrap"]
    [:span#watch-value @watch-test-atom]])
 
+(defn- effects-get [req]
+  (let [cookie-val (get-in req [:cookies "test-effect-cookie" :value])
+        status*    (h/tab-cursor :effect-status "none")]
+    [:div
+     [:h1 "Effects Test"]
+
+     ;; navigate! test — button that navigates to home
+     [:button#nav-btn {:data-on:click (h/action (effects/navigate! :home))} "Navigate Home"]
+
+     ;; set-cookie! test — button that sets a cookie
+     [:button#set-cookie-btn
+      {:data-on:click (h/action
+                        (effects/set-cookie! "test-effect-cookie" "hyper-test-value"
+                                             {:max-age 3600})
+                        (reset! (h/tab-cursor :effect-status) "cookie-set"))}
+      "Set Cookie"]
+
+     ;; delete-cookie! test — button that deletes the cookie
+     [:button#delete-cookie-btn
+      {:data-on:click (h/action
+                        (effects/delete-cookie! "test-effect-cookie")
+                        (reset! (h/tab-cursor :effect-status) "cookie-deleted"))}
+      "Delete Cookie"]
+
+     ;; execute-script! test — button that runs JS
+     [:button#script-btn
+      {:data-on:click (h/action
+                        (effects/execute-script!
+                          "document.getElementById('script-result').textContent = 'executed'"))}
+      "Run Script"]
+
+     ;; Display areas
+     [:span#effect-status @status*]
+     [:span#cookie-display (or cookie-val "no-cookie")]
+     [:span#script-result "pending"]
+
+     ;; Combined: set cookie + execute-script
+     [:button#combo-btn
+      {:data-on:click (h/action
+                        (effects/set-cookie! "test-effect-cookie" "combo-value" {:max-age 3600})
+                        (effects/execute-script!
+                          "document.getElementById('script-result').textContent = 'combo-executed'")
+                        (reset! (h/tab-cursor :effect-status) "combo-done"))}
+      "Cookie + Script"]]))
+
 (defn default-routes []
   [["/" {:name  :home
          :title "Home"
@@ -185,7 +231,11 @@
    ["/reactive"
     {:name  :reactive
      :title "Reactive"
-     :get   #'reactive-get}]])
+     :get   #'reactive-get}]
+   ["/effects"
+    {:name  :effects
+     :title "Effects"
+     :get   #'effects-get}]])
 
 (def ^:dynamic *test-routes* (default-routes))
 
@@ -964,3 +1014,114 @@
       (finally
         (reset! reactive-clock* "00:00")
         (close-browser! browser-info)))))
+
+;; ---------------------------------------------------------------------------
+;; Test: Effects — navigate!, set-cookie!, delete-cookie!, execute-script!
+;; ---------------------------------------------------------------------------
+
+(deftest ^:e2e effects-navigate-test
+  (testing "navigate! from an action changes URL and renders the target page"
+    (let [browser-info (launch-browser)
+          ctx          (new-context browser-info)
+          page         (new-page ctx)]
+      (try
+        (w/with-page page
+          (w/navigate (str base-url "/effects"))
+          (wait-for-sse)
+
+          (is (= "Effects Test" (w/text-content "h1")))
+
+          ;; Click the navigate button — should navigate to home
+          (w/click "#nav-btn")
+
+          ;; Wait for the home page content to appear via SSE re-render
+          (wait-for-text "h1" "Test Home")
+
+          ;; URL should have changed via pushState
+          (let [url (current-url)]
+            (is (str/ends-with? url "/")
+                (str "Expected URL to end with /, got: " url))))
+
+        (finally
+          (close-browser! browser-info))))))
+
+(deftest ^:e2e effects-cookie-test
+  (testing "set-cookie! and delete-cookie! manage HTTP cookies"
+    (let [browser-info (launch-browser)
+          ctx          (new-context browser-info)
+          page         (new-page ctx)]
+      (try
+        (w/with-page page
+          (w/navigate (str base-url "/effects"))
+          (wait-for-sse)
+
+          (testing "initial state shows no cookie"
+            (is (= "no-cookie" (w/text-content "#cookie-display"))))
+
+          (testing "set-cookie! sets an HTTP cookie"
+            (w/click "#set-cookie-btn")
+            (wait-for-text "#effect-status" "cookie-set")
+
+            ;; Reload the page to read the cookie from the request
+            (w/navigate (str base-url "/effects"))
+            (wait-for-sse)
+            (wait-for-text "#cookie-display" "hyper-test-value"))
+
+          (testing "delete-cookie! removes the cookie"
+            (w/click "#delete-cookie-btn")
+            (wait-for-text "#effect-status" "cookie-deleted")
+
+            ;; Reload to verify cookie is gone
+            (w/navigate (str base-url "/effects"))
+            (wait-for-sse)
+            (wait-for-text "#cookie-display" "no-cookie")))
+
+        (finally
+          (close-browser! browser-info))))))
+
+(deftest ^:e2e effects-execute-script-test
+  (testing "execute-script! runs JavaScript on the client"
+    (let [browser-info (launch-browser)
+          ctx          (new-context browser-info)
+          page         (new-page ctx)]
+      (try
+        (w/with-page page
+          (w/navigate (str base-url "/effects"))
+          (wait-for-sse)
+
+          (testing "initial script-result is pending"
+            (is (= "pending" (w/text-content "#script-result"))))
+
+          (testing "execute-script! runs JS that modifies the DOM"
+            (w/click "#script-btn")
+            (wait-for-text "#script-result" "executed")))
+
+        (finally
+          (close-browser! browser-info))))))
+
+(deftest ^:e2e effects-combined-test
+  (testing "multiple effects in one action all apply"
+    (let [browser-info (launch-browser)
+          ctx          (new-context browser-info)
+          page         (new-page ctx)]
+      (try
+        (w/with-page page
+          (w/navigate (str base-url "/effects"))
+          (wait-for-sse)
+
+          (testing "combo button sets cookie and runs script"
+            (w/click "#combo-btn")
+            ;; Script should execute
+            (wait-for-text "#script-result" "combo-executed")
+            ;; Cursor mutation should have happened
+            (wait-for-text "#effect-status" "combo-done")
+            (is (= "combo-done" (w/text-content "#effect-status")))
+
+            ;; Reload to verify cookie was set
+            (w/navigate (str base-url "/effects"))
+            (wait-for-sse)
+            (wait-for-text "#cookie-display" "combo-value")
+            (is (= "combo-value" (w/text-content "#cookie-display")))))
+
+        (finally
+          (close-browser! browser-info))))))

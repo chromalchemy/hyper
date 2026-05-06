@@ -365,6 +365,123 @@ All actions use Datastar's `@post()` under the hood, so signal values are
 always available — even in actions that also use client params like `$value`,
 `$key`, etc.
 
+## Effects
+
+Effects are escape hatches for actions that need to do more than mutate cursors
+or signals. Most action logic should use cursors — the UI is a pure function of
+state — but some operations genuinely require side-effects that can't be
+expressed as state: navigating to a different route, setting a cookie, or running
+a snippet of JavaScript on the client.
+
+```clojure
+(require '[hyper.effects :as effects])
+```
+
+Hyper provides four effect functions, all of which may only be called inside an
+action body:
+
+| Effect | What it does |
+|---|---|
+| `navigate!` | Client-side route change (pushState) + server-side state transition |
+| `set-cookie!` | Set an HTTP cookie on the action response |
+| `delete-cookie!` | Remove an HTTP cookie |
+| `execute-script!` | Run arbitrary JS on the client via SSE |
+
+Effects are accumulated during action execution and processed after the action
+completes. Cookies are applied to the HTTP response; scripts are delivered to the
+client via SSE.
+
+### `navigate!`
+
+`navigate!` performs a server-side route transition and pushes a `pushState` call
+to update the browser URL — all from within an action body. The target page
+re-renders over SSE without a page reload.
+
+```clojure
+(h/action
+  (let [post (save-post! data)]
+    (effects/navigate! :post-detail {:id (:id post)})))
+
+;; With query params
+(h/action
+  (effects/navigate! :search {} {:q "clojure"}))
+```
+
+The signature mirrors `h/navigate`: `(navigate! route-name)`,
+`(navigate! route-name params)`, or
+`(navigate! route-name params query-params)`.
+
+### `set-cookie!` / `delete-cookie!`
+
+Set or remove HTTP cookies from within an action. Cookies are added to the
+action's HTTP response via `Set-Cookie` headers — this is the only way to set
+cookies from Hyper, since the SSE channel cannot carry `Set-Cookie` headers.
+
+```clojure
+;; Set a cookie
+(h/action
+  (when-let [token (authenticate! user pass)]
+    (effects/set-cookie! "auth" token {:http-only true
+                                       :secure    true
+                                       :max-age   (* 60 60 24 7)})))
+
+;; Delete a cookie
+(h/action
+  (effects/delete-cookie! "auth")
+  (effects/navigate! :login))
+```
+
+`set-cookie!` accepts a name, value, and optional opts map:
+
+| Option | Description | Default |
+|---|---|---|
+| `:path` | Cookie path | `"/"` |
+| `:max-age` | Max age in seconds | — |
+| `:http-only` | Prevent JS access | `false` |
+| `:secure` | HTTPS only | `false` |
+| `:same-site` | `:strict`, `:lax`, or `:none` | — |
+
+`delete-cookie!` sets the cookie with an empty value and `max-age 0`. Pass
+`:path` if the original cookie was set on a non-default path.
+
+### `execute-script!`
+
+Run arbitrary JavaScript on the client. The script is sent via SSE as a Datastar
+fragment that appends a self-removing `<script>` tag to the body.
+
+```clojure
+(h/action
+  (effects/execute-script! "document.getElementById('search').focus()"))
+
+(h/action
+  (effects/execute-script! "window.scrollTo({top: 0, behavior: 'smooth'})"))
+```
+
+Use sparingly — most UI updates are better expressed as cursor mutations that
+the render function responds to. Legitimate uses include focusing an element,
+scrolling to a position, triggering a file download, or clipboard operations.
+
+### Composing multiple effects
+
+A single action can emit any combination of effects. They all accumulate and are
+applied together after the action completes:
+
+```clojure
+(h/action
+  (effects/set-cookie! "token" "abc" {:http-only true})
+  (effects/execute-script! "showNotification('Saved!')")
+  (reset! (h/tab-cursor :status) "saved"))
+```
+
+Cursor mutations and effects coexist naturally — cursors trigger re-renders as
+usual while effects are processed separately.
+
+### Calling effects outside an action
+
+All effect functions throw if called outside an action context. This is
+intentional — effects are tied to the HTTP request/response cycle and have no
+meaning outside of it.
+
 ## Navigation
 
 Hyper uses [Reitit](https://github.com/metosin/reitit) for routing. Routes are
@@ -903,13 +1020,26 @@ be combined with `:when`:
 ### `test-action`
 
 `test-action` executes an action from a `test-page` result and returns a
-snapshot of cursor state after execution:
+snapshot of cursor state and any effects accumulated during execution:
 
 ```clojure
 (let [result (ht/test-page counter-page)]
   (ht/test-action result "increment"))
 ;; => {:cursors   {:global {}, :session {}, :tab {:count 1}, :route {...}}
+;;     :effects   {:cookies {}, :scripts []}
 ;;     :app-state #<Atom@...>}
+```
+
+The `:effects` map contains `:cookies` (a map of cookie-name → cookie opts) and
+`:scripts` (a vector of JS strings). Effects are collected but **not applied** —
+this lets tests assert on what effects *would* happen without actually setting
+cookies or sending SSE events:
+
+```clojure
+(let [result (ht/test-page my-page)
+      after  (ht/test-action result "login")]
+  (is (= "jwt-token" (get-in after [:effects :cookies "auth" :value])))
+  (is (seq (get-in after [:effects :scripts]))))
 ```
 
 Pass client params to simulate `$value`, `$checked`, `$key`, or `$form-data`:
@@ -987,6 +1117,9 @@ The E2E suite covers:
   via SSE
 - **Content live reload** — redefining the routes Var with new inline handler
   functions hot-swaps the page content via SSE
+- **Effects** — `navigate!`, `set-cookie!`, `delete-cookie!`, and
+  `execute-script!` are exercised end-to-end, including combined effects in a
+  single action
 
 ## Contributing
 
