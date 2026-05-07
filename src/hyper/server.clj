@@ -100,7 +100,7 @@
       ;; Normal render — assemble and send SSE payload
       (let [{:keys [title head-html body-html url
                     declared-signals registered-action-ids
-                    registered-reactive-ids]} render-result]
+                    registered-reactive-ids]}              render-result]
         ;; Sweep stale actions + reactive components
         (actions/sweep-stale-tab-actions! app-state* tab-id registered-action-ids)
         (reactive/sweep-stale-components! app-state* tab-id registered-reactive-ids)
@@ -403,6 +403,9 @@
             (swap! app-state* update-in [:tabs tab-id :signals]
                    (fn [server-sigs]
                      (merge server-sigs signals))))
+          (when-let [env (:hyper/env req)]
+            (when tab-id
+              (swap! app-state* assoc-in [:tabs tab-id :env] env)))
           (push-thread-bindings {#'context/*request*     req-with-state
                                  #'context/*signals*     signals
                                  #'context/*action-name* (:as action-data)
@@ -535,6 +538,8 @@
 
         (render/register-render-fn! app-state* tab-id render-fn)
         (state/set-tab-route! app-state* tab-id route-info)
+        (when-let [env (:hyper/env req)]
+          (swap! app-state* assoc-in [:tabs tab-id :env] env))
 
         (let [result (render/render-tab app-state* session-id tab-id req)]
           ;; Ring response passthrough (e.g. a 302 redirect)
@@ -574,6 +579,9 @@
           _session-id (:hyper/session-id req)
           router      (get @app-state* :router)
           route-index (routes/live-route-index app-state*)]
+      (when-let [env (:hyper/env req)]
+        (when tab-id
+          (swap! app-state* assoc-in [:tabs tab-id :env] env)))
       (if-not (and path tab-id router)
         {:status  400
          :headers {"Content-Type" "application/json"}
@@ -697,6 +705,14 @@
    - :watches           Vector of Watchable sources added to every page route.
                         Useful for top-level atoms that should trigger a re-render
                         on any page (e.g. a global config or feature-flags atom).
+   - :middleware        Vector of Ring middleware fns applied inside the HTTP stack.
+                        Each is (fn [handler] (fn [req] ...)).  Runs after Hyper's
+                        built-in cookie, params, and session middleware, so your
+                        middleware sees parsed :cookies, :params, :hyper/session-id,
+                        and :hyper/tab-id.  Use this for auth, :hyper/env setup, and
+                        other request-level concerns.  Middleware can also be applied
+                        outside create-handler, but will not have access to parsed
+                        cookies/params.
    - :render-middleware Vector of middleware fns applied to every page render.
                         Each is (fn [handler] (fn [req] ...)), identical to Ring
                         middleware.  Runs outermost (before per-route middleware).
@@ -706,7 +722,7 @@
    Hyper will wrap them to provide full HTML responses and SSE connections."
   ([routes app-state*]
    (create-handler routes app-state* {:datastar-script (default-datastar-script)}))
-  ([routes app-state* {:keys [watches head base-path render-middleware] :as opts}]
+  ([routes app-state* {:keys [watches head base-path middleware render-middleware] :as opts}]
    (let [base-path       (or base-path "")
          page-wrapper    (page-handler app-state* (assoc opts :base-path base-path))
          system-routes   [[(str base-path "/hyper/events") {:get (sse-events-handler app-state*)}]
@@ -745,12 +761,15 @@
                            ;; Static: use the compiled handler directly
                            initial-handler)
          handler-with-mw
-         (-> handler
-             ((wrap-hyper-context app-state*))
-             (br/wrap-brotli)
-             (keyword-params/wrap-keyword-params)
-             (params/wrap-params)
-             (cookies/wrap-cookies))]
+         (as-> handler h
+           ;; User :middleware runs innermost — after cookies/params/hyper-context
+           ;; are parsed, before routing.  Earlier entries wrap outermost (execute first).
+           (reduce (fn [h mw] (mw h)) h (reverse (vec middleware)))
+           ((wrap-hyper-context app-state*) h)
+           (br/wrap-brotli h)
+           (keyword-params/wrap-keyword-params h)
+           (params/wrap-params h)
+           (cookies/wrap-cookies h))]
      ;; Static middleware should be outermost so static requests avoid params/cookies.
      ;; Attach app-state* as metadata so start! can build a stop fn that cleans up.
      (with-meta (wrap-static handler-with-mw opts)

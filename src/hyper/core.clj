@@ -121,6 +121,42 @@
       ;; No SSE renderer yet (initial HTTP render) — stash for later promotion
       (watch/stash-pending-watch! app-state* tab-id source))))
 
+(defn env
+  "Get the request environment, or a specific key from it.
+
+   Ring middleware can set `:hyper/env` on the request to provide context
+   that persists across SSE re-renders and action handlers.  Hyper
+   automatically stashes the env per-tab on each HTTP request (page load,
+   action POST, navigation) and propagates it to every subsequent render
+   and action execution.
+
+   Use Ring middleware for I/O and request-dependent context (database
+   connections, authenticated user, feature flags read from headers/cookies).
+   Use render middleware to guard renders based on env (e.g. permission checks).
+
+   Example:
+     ;; Ring middleware sets :hyper/env
+     (defn wrap-app-env [handler db]
+       (fn [req]
+         (handler (assoc req :hyper/env {:db db}))))
+
+     ;; Read in a render function
+     (defn my-page [req]
+       (let [db (h/env :db)]
+         [:div \"Connected to: \" (str db)]))
+
+     ;; Read in an action
+     [:button {:data-on:click (h/action
+                                (let [db (h/env :db)]
+                                  (db/insert! db ...)))}
+      \"Save\"]"
+  ([]
+   (:hyper/env context/*request*))
+  ([key]
+   (get (:hyper/env context/*request*) key))
+  ([key default]
+   (get (:hyper/env context/*request*) key default)))
+
 ;; ---------------------------------------------------------------------------
 ;; Batched cursor updates
 ;; ---------------------------------------------------------------------------
@@ -374,7 +410,8 @@
                                         (binding [context/*request* {:hyper/session-id session-id#
                                                                      :hyper/tab-id     tab-id#
                                                                      :hyper/app-state  app-state*#
-                                                                     :hyper/router     router#}]
+                                                                     :hyper/router     router#
+                                                                     :hyper/env        (get-in @app-state*# [:tabs tab-id# :env])}]
                                           ~@body)))
            idx#                     (if context/*action-idx* (swap! context/*action-idx* inc) (hash action-fn#))
            action-id#               (str "a_" tab-id# "_" idx#)
@@ -468,10 +505,23 @@
    - :watches           — Vector of Watchable sources added to every page route.
                           Useful for top-level atoms that should trigger a re-render
                           on any page (e.g. a global config or feature-flags atom).
+   - :middleware        — Vector of Ring middleware fns applied inside the HTTP stack.
+                          Each is (fn [handler] (fn [req] ...)).  Runs after Hyper's
+                          built-in cookie, params, and session middleware, so your
+                          middleware sees parsed :cookies, :params, :hyper/session-id,
+                          and :hyper/tab-id.  Use this for auth, :hyper/env setup, and
+                          other request-level concerns.  Middleware can also be applied
+                          outside create-handler, but will not have access to parsed
+                          cookies/params.
    - :render-middleware — Vector of middleware fns applied to every page render.
                           Each is (fn [handler] (fn [req] ...)), identical to Ring
                           middleware.  Applied on both initial page loads and SSE
                           re-renders.  Per-route :render-middleware wraps inside these.
+
+   The request key :hyper/env is reserved for application-provided context.
+   Ring middleware that sets :hyper/env on the request will have it automatically
+   stashed per-tab and propagated to every SSE re-render and action handler.
+   See `env` for details.
 
    Example:
      (def routes
@@ -499,7 +549,7 @@
      ;; Later...
      (stop! app)"
   [routes & {:keys [app-state head static-resources static-dir watches
-                    datastar-script base-path render-middleware]
+                    datastar-script base-path middleware render-middleware]
              :or   {app-state       (atom (state/init-state))
                     datastar-script server/default-datastar-script}}]
   (server/create-handler routes app-state
@@ -509,6 +559,7 @@
                           :static-dir        static-dir
                           :watches           watches
                           :base-path         base-path
+                          :middleware        middleware
                           :render-middleware render-middleware}))
 
 (defn start!

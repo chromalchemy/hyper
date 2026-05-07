@@ -233,7 +233,8 @@
        (binding [context/*request*     {:hyper/session-id session-id
                                         :hyper/tab-id     tab-id
                                         :hyper/app-state  app-state*
-                                        :hyper/router     (get @app-state* :router)}
+                                        :hyper/router     (get @app-state* :router)
+                                        :hyper/env        (get-in @app-state* [:tabs tab-id :env])}
                  context/*action-name* (:as action)
                  effects/*pending*     (effects/init-pending)]
          ((:fn action) client-params)

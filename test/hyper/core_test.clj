@@ -3,6 +3,7 @@
             [clojure.test :refer [deftest is testing]]
             [hyper.context :as context]
             [hyper.core :as hy]
+            [hyper.render :as render]
             [hyper.state :as state]
             [hyper.test :as ht]
             [reitit.ring :as ring]))
@@ -721,3 +722,130 @@
                              :session-id "s1"})
       ;; Should see the snapshot value
       (is (= 100 @captured)))))
+
+;; ---------------------------------------------------------------------------
+;; Env
+;; ---------------------------------------------------------------------------
+
+(deftest env-helper-test
+  (testing "env returns nil outside request context"
+    (binding [context/*request* nil]
+      (is (nil? (hy/env)))))
+
+  (testing "env returns the full env map"
+    (binding [context/*request* {:hyper/env {:db :test-db :user {:name "Alice"}}}]
+      (is (= {:db :test-db :user {:name "Alice"}} (hy/env)))))
+
+  (testing "env with key returns a specific value"
+    (binding [context/*request* {:hyper/env {:db :test-db}}]
+      (is (= :test-db (hy/env :db)))
+      (is (nil? (hy/env :missing)))))
+
+  (testing "env with key and default"
+    (binding [context/*request* {:hyper/env {:db :test-db}}]
+      (is (= :test-db (hy/env :db :fallback)))
+      (is (= :fallback (hy/env :missing :fallback))))))
+
+(deftest env-in-render-test
+  (testing "env is available in render functions via test-page :req"
+    (let [captured (atom nil)
+          page-fn  (fn [_req]
+                     (reset! captured (hy/env))
+                     [:div "db: " (str (hy/env :db))])]
+      (ht/test-page page-fn {:req {:hyper/env {:db :test-db}}})
+      (is (= {:db :test-db} @captured)))))
+
+(deftest env-stashed-for-sse-renders-test
+  (testing "env stashed in tab state is available on SSE re-renders (no base-req)"
+    (let [app-state* (atom (state/init-state))
+          session-id "test-session-env"
+          tab-id     "test_tab_env"
+          captured   (atom nil)
+          render-fn  (fn [_req]
+                       (reset! captured (hy/env))
+                       [:div "env"])]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (render/register-render-fn! app-state* tab-id render-fn)
+
+      ;; Simulate stashing env (as page-handler would do)
+      (swap! app-state* assoc-in [:tabs tab-id :env] {:db :prod-db :user {:id 1}})
+
+      ;; SSE re-render — no base-req, env comes from stashed tab state
+      (let [result (render/render-tab app-state* session-id tab-id)]
+        (is (some? result))
+        (is (= {:db :prod-db :user {:id 1}} @captured))))))
+
+(deftest env-base-req-takes-precedence-test
+  (testing "env from base-req (initial page load) takes precedence over stashed env"
+    (let [app-state* (atom (state/init-state))
+          session-id "test-session-env2"
+          tab-id     "test_tab_env2"
+          captured   (atom nil)
+          render-fn  (fn [_req]
+                       (reset! captured (hy/env))
+                       [:div "env"])]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (render/register-render-fn! app-state* tab-id render-fn)
+
+      ;; Stash old env
+      (swap! app-state* assoc-in [:tabs tab-id :env] {:db :old-db})
+
+      ;; Initial page load with fresh env on the request
+      (let [base-req {:hyper/env {:db :fresh-db}}
+            result   (render/render-tab app-state* session-id tab-id base-req)]
+        (is (some? result))
+        (is (= {:db :fresh-db} @captured))))))
+
+(deftest env-nil-does-not-break-test
+  (testing "missing env does not break renders"
+    (let [app-state* (atom (state/init-state))
+          session-id "test-session-env3"
+          tab-id     "test_tab_env3"
+          captured   (atom :sentinel)
+          render-fn  (fn [_req]
+                       (reset! captured (hy/env))
+                       [:div "no env"])]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (render/register-render-fn! app-state* tab-id render-fn)
+      ;; No env stashed, no base-req — should be nil, not throw
+      (let [result (render/render-tab app-state* session-id tab-id)]
+        (is (some? result))
+        (is (nil? @captured))))))
+
+(deftest env-in-action-test
+  (testing "env is available inside action handlers"
+    (let [captured   (atom nil)
+          page-fn    (fn [_req]
+                       [:div
+                        [:button {:data-on:click
+                                  (hy/action {:as "check-env"}
+                                    (reset! captured (hy/env)))}
+                         "Go"]])
+          app-state* (atom (state/init-state))
+          _          (state/get-or-create-tab! app-state* "s1" "t1")
+          ;; Stash env directly (simulating what page-handler does)
+          _          (swap! app-state* assoc-in [:tabs "t1" :env]
+                            {:db :action-db :user {:role :admin}})
+          result     (ht/test-page page-fn {:app-state  app-state*
+                                            :session-id "s1"
+                                            :tab-id     "t1"
+                                            :req        {:hyper/env {:db   :action-db
+                                                                     :user {:role :admin}}}})]
+      (ht/test-action result "check-env")
+      (is (= {:db :action-db :user {:role :admin}} @captured)))))
+
+(deftest env-replaced-on-action-test
+  (testing "env is fully replaced (not merged) when action refreshes it"
+    (let [app-state* (atom (state/init-state))
+          session-id "s-env-replace"
+          tab-id     "t-env-replace"]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      ;; Initial env
+      (swap! app-state* assoc-in [:tabs tab-id :env]
+             {:db :db :user {:name "Alice"} :feature-flags #{:beta}})
+      ;; Simulate action-handler stashing a completely new env (replace semantics)
+      (swap! app-state* assoc-in [:tabs tab-id :env]
+             {:db :db :user {:name "Bob"}})
+      ;; :feature-flags should be gone — full replace, not merge
+      (is (= {:db :db :user {:name "Bob"}}
+             (get-in @app-state* [:tabs tab-id :env]))))))

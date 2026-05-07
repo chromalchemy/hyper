@@ -238,13 +238,15 @@
                          stored-render-fn)
            url         (when route
                          (state/build-url (:path route) (:query-params route)))
+           tab-env     (get-in @app-state* [:tabs tab-id :env])
            req         (cond-> (or base-req {})
-                         true   (assoc :hyper/session-id session-id
-                                       :hyper/tab-id     tab-id
-                                       :hyper/app-state  app-state*)
-                         router (assoc :hyper/router router)
-                         route  (assoc :hyper/route route)
-                         true   (dissoc :reitit.core/match))]
+                         true    (assoc :hyper/session-id session-id
+                                        :hyper/tab-id     tab-id
+                                        :hyper/app-state  app-state*)
+                         router  (assoc :hyper/router router)
+                         route   (assoc :hyper/route route)
+                         tab-env (update :hyper/env #(or % tab-env))
+                         true    (dissoc :reitit.core/match))]
        (push-thread-bindings (context/render-bindings req app-state*))
        (try
          (let [mw-chain   (resolve-render-middleware app-state* route-index route)

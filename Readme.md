@@ -616,6 +616,221 @@ its complexity because render functions have a constrained signature
 (`req → hiccup`) and you often need to intercept *before* the render runs.
 Actions have no such constraint.
 
+## Ring Middleware
+
+Hyper supports standard Ring middleware via the `:middleware` option on
+`create-handler`. This middleware runs **inside** Hyper's HTTP stack — after
+cookies, params, and session context are parsed — so your middleware sees
+`:cookies`, `:params`, `:hyper/session-id`, and `:hyper/tab-id` on the request.
+
+```clojure
+(defn wrap-request-logging [handler]
+  (fn [req]
+    (println "Request from session:" (:hyper/session-id req))
+    (handler req)))
+
+(def handler
+  (h/create-handler #'routes
+    :middleware [wrap-request-logging]))
+```
+
+Ring middleware runs on every real HTTP request — initial page loads, action
+POSTs, navigation, and SSE connections. It does **not** run on SSE re-renders
+(those have no HTTP request). For logic that must run on every render, use
+[render middleware](#render-middleware) instead.
+
+Middleware can also be applied outside `create-handler` by wrapping the returned
+handler directly, but external middleware will not have access to Hyper's parsed
+cookies, params, or session/tab IDs.
+
+The execution order for `:middleware` is:
+
+```
+Request arrives
+  → Hyper built-ins: cookies → params → keyword-params → brotli → hyper-context
+  → Your :middleware (first in vector = outermost, runs first)
+  → Router dispatch (page-handler, action-handler, etc.)
+```
+
+### When to use Ring middleware vs render middleware
+
+| | Ring middleware (`:middleware`) | Render middleware (`:render-middleware`) |
+|---|---|---|
+| **Runs on** | HTTP requests (page load, action POST, SSE connect) | Every render (initial + SSE re-renders) |
+| **Has access to** | Full Ring request (cookies, headers, body) | Synthetic request (cursors, app-state, `:hyper/env`) |
+| **Use for** | `:hyper/env` setup (DB, config), request logging | Page guards, layout wrappers, permission checks |
+| **Covers SPA navigation?** | No (no HTTP request on `h/navigate`) | Yes (re-render always fires) |
+
+In practice, the two compose naturally: Ring middleware populates `:hyper/env`
+with infrastructure (DB connections, config), and render middleware reads it
+alongside cursors to make per-render decisions. See the
+[Environment](#environment) section below.
+
+## Environment
+
+`:hyper/env` is a reserved request key for read-only application infrastructure
+that Hyper automatically propagates across SSE re-renders and action handlers.
+
+Env is for things that don't change during a session — database connections,
+config maps, feature flags, API clients. For mutable per-user state (auth,
+preferences, etc.), use [cursors](#cursors) instead.
+
+### The problem
+
+Hyper has three request contexts:
+
+1. **Initial page load** — a real Ring request with cookies, headers, etc.
+2. **SSE re-renders** — no HTTP request; a synthetic request is built from
+   app-state.
+3. **Action execution** — the action macro binds its own minimal request map.
+
+Ring middleware can enrich the request on initial page load, but that context is
+lost on SSE re-renders and inside action bodies. `:hyper/env` solves this —
+Hyper captures it from every HTTP request, stashes it per-tab, and propagates it
+everywhere.
+
+### Setting up env with Ring middleware
+
+Use `:middleware` on `create-handler` so your middleware sees parsed cookies:
+
+```clojure
+(defn wrap-db [db]
+  (fn [handler]
+    (fn [req]
+      (handler (update req :hyper/env assoc :db db)))))
+
+(defn wrap-config [config]
+  (fn [handler]
+    (fn [req]
+      (handler (update req :hyper/env assoc :config config)))))
+
+(def handler
+  (h/create-handler #'routes
+    :middleware [(wrap-db my-db) (wrap-config my-config)]))
+```
+
+Each middleware layer enriches `:hyper/env` on the request. Hyper stashes the
+final value per-tab on every HTTP request (page load, action POST, navigation,
+SSE connect), fully replacing the previous value.
+
+### Reading env
+
+Use `h/env` to read the environment from anywhere — render functions, action
+bodies, render middleware:
+
+```clojure
+(h/env)            ;; → {:db #<Pool> :config {:feature-x true}}
+(h/env :db)        ;; → #<Pool>
+(h/env :config)    ;; → {:feature-x true}
+(h/env :missing :default)  ;; → :default
+```
+
+In a render function:
+
+```clojure
+(defn dashboard [req]
+  (let [db (h/env :db)]
+    [:div
+     [:h1 "Dashboard"]
+     [:p "Users: " (count (db/list-users db))]]))
+```
+
+In an action:
+
+```clojure
+[:button {:data-on:click
+          (h/action
+            (let [db (h/env :db)]
+              (db/insert! db {:event "clicked"})))}
+ "Save"]
+```
+
+### How propagation works
+
+| Entry point | What happens |
+|---|---|
+| **Page load** (GET) | Ring middleware sets `:hyper/env` → Hyper stashes per-tab → render fn sees it |
+| **SSE re-render** | Hyper merges stashed env into the synthetic request → render fn sees it |
+| **Action POST** | Ring middleware refreshes `:hyper/env` → Hyper re-stashes (full replace) → action body sees it |
+| **SPA navigation** | No HTTP request → render uses stashed env from last capture |
+
+### Env vs cursors
+
+Env and cursors serve different purposes:
+
+| | Env (`:hyper/env`) | Cursors |
+|---|---|---|
+| **Set by** | Ring middleware | Render functions, actions |
+| **Changes** | Rarely (app startup, deploy) | Frequently (user interaction) |
+| **Examples** | DB connection, config, API clients | Auth state, form data, UI state |
+| **Triggers re-render?** | No | Yes |
+
+For auth, use a `session-cursor` — it re-renders immediately when updated, works
+across all tabs in a session, and doesn't depend on HTTP request timing. Use env
+for the database connection the auth middleware *reads from*.
+
+### Effects and middleware
+
+Effects (`set-cookie!`, `delete-cookie!`, `navigate!`) compose naturally with
+middleware. A typical auth flow:
+
+**Login** — set the cookie, update the cursor, redirect:
+
+```clojure
+(h/action {:as "login"}
+  (let [token (authenticate! email password)
+        user  (find-user-by-token token)]
+    ;; Cookie — durable backing store, Ring middleware reads it on next request
+    (effects/set-cookie! "auth" token {:http-only true :max-age (* 60 60 24 7)})
+    ;; Cursor — immediate reactivity, re-render sees the user right away
+    (reset! (h/session-cursor :user) user)
+    ;; Navigate — redirect to the home page after login
+    (effects/navigate! :home)))
+```
+
+**Logout** — delete the cookie, clear the cursor, redirect:
+
+```clojure
+(h/action {:as "logout"}
+  (effects/delete-cookie! "auth")
+  (reset! (h/session-cursor :user) nil)
+  (effects/navigate! :login))
+```
+
+**Ring middleware** — hydrate the cursor from the cookie on each HTTP request.
+This keeps the cursor in sync when the user returns after a page reload or
+when a cookie is set from a different tab:
+
+```clojure
+(defn wrap-auth [handler]
+  (fn [req]
+    (let [token      (get-in req [:cookies "auth" :value])
+          user       (when token (find-user-by-token token))
+          app-state* (:hyper/app-state req)
+          session-id (:hyper/session-id req)]
+      (when (and app-state* session-id)
+        (swap! app-state* assoc-in [:sessions session-id :data :user] user))
+      (handler req))))
+```
+
+**Render middleware** — redirect unauthenticated users. Returning a Ring
+response map (`{:status 302 ...}`) from render middleware works on both initial
+page loads (normal HTTP redirect) and SSE re-renders (Hyper converts 3xx
+redirects to a client-side `window.location.href` redirect):
+
+```clojure
+(defn wrap-require-auth [handler]
+  (fn [req]
+    (if @(h/session-cursor :user)
+      (handler req)
+      {:status 302 :headers {"Location" "/login"} :body ""})))
+```
+
+The cookie and cursor serve complementary roles: the cookie is the durable
+backing store (survives page reloads, read by Ring middleware), while the cursor
+is the reactive in-memory view (triggers re-renders immediately, read by render
+functions and render middleware).
+
 ## Navigation
 
 Hyper uses [Reitit](https://github.com/metosin/reitit) for routing. Routes are
