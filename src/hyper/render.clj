@@ -134,6 +134,39 @@
          "data: selector body\n"
          "data: elements <script data-effect=\"el.remove()\">" js "</script>\n\n")))
 
+(defn unwrap-body
+  "Strip a top-level `[:body ...]` wrapper from user hiccup.
+
+   Hyper owns the `<body>` tag — it carries `data-init` (for the Datastar
+   SSE connection) and the SPA navigation scripts, with a `<div id=\"hyper-app\">`
+   inside it as the morph target for SSE re-renders.
+
+   When a render function returns `[:body ...]`, the nested `<body>` is
+   tolerated by browsers on initial load, but on SSE re-renders idiomorph
+   replaces `#hyper-app` content with HTML containing a `<body>`, which
+   corrupts the DOM and stops further updates (see issue #40).
+
+   This function detects the pattern, logs a warning, and returns only
+   the children so downstream code always receives hiccup without `<body>`.
+   Any attributes on the `[:body]` tag are discarded (the warning tells the
+   developer to remove it)."
+  [hiccup]
+  (if (and (vector? hiccup)
+           (= :body (first hiccup)))
+    (do
+      (t/log! {:level :warn
+               :id    :hyper.warn/body-in-hiccup
+               :msg   "Render function returned [:body ...] — Hyper owns the <body> tag. The [:body] wrapper has been stripped; return only the inner content."})
+      (let [[_ maybe-attrs & more] hiccup
+            children               (if (map? maybe-attrs)
+                                     (vec more)
+                                     (vec (cons maybe-attrs more)))
+            children               (vec (remove nil? children))]
+        (if (= 1 (count children))
+          (first children)
+          children)))
+    hiccup))
+
 (defn render-error-fragment
   "Render an error message as hiccup."
   [error]
@@ -216,17 +249,20 @@
        (try
          (let [mw-chain   (resolve-render-middleware app-state* route-index route)
                wrapped-fn (apply-render-middleware render-fn mw-chain)
-               body       (safe-render wrapped-fn req)]
+               raw-body   (safe-render wrapped-fn req)]
            ;; Ring response passthrough - render-fn returned a redirect,
            ;; error, or other non-hiccup response; pass it through as-is.
-           (if (and (map? body) (:status body))
-             body
+           (if (and (map? raw-body) (:status raw-body))
+             raw-body
              ;; Serialize body HTML first - this forces lazy hiccup
              ;; sequences (for, map, etc.) which may call h/action and
              ;; register actions during realization.  We must read
              ;; *registered-action-ids* AFTER serialization so the
              ;; accumulator captures every action the render produced.
-             (let [body-html    (c/html body)
+             (let [body         (unwrap-body raw-body)
+                   body-html    (if (vector? body)
+                                  (c/html body)
+                                  (apply str (map c/html body)))
                    title-spec   (when (and (seq route-index) route)
                                   (routes/find-route-title route-index (:name route)))
                    title        (routes/resolve-title title-spec req)

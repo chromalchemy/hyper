@@ -219,6 +219,48 @@
           (is (some? (get-in @app-state* [:actions action-id]))
               (str "Action " action-id " should still exist after sweep")))))))
 
+(deftest test-unwrap-body
+  (testing "Strips [:body] wrapper with single child"
+    (is (= [:div "Hello"]
+           (render/unwrap-body [:body [:div "Hello"]]))))
+
+  (testing "Strips [:body] wrapper with attrs — discards attrs, returns single child"
+    (is (= [:div "Hello"]
+           (render/unwrap-body [:body {:class "wrapper"} [:div "Hello"]]))))
+
+  (testing "Strips [:body] wrapper with multiple children — returns vector of children"
+    (is (= [[:h1 "Title"] [:p "Content"]]
+           (render/unwrap-body [:body [:h1 "Title"] [:p "Content"]]))))
+
+  (testing "Strips [:body] wrapper with attrs and multiple children — discards attrs"
+    (is (= [[:h1 "Title"] [:p "Content"]]
+           (render/unwrap-body [:body {:class "app"} [:h1 "Title"] [:p "Content"]]))))
+
+  (testing "Passes through non-body hiccup unchanged"
+    (is (= [:div "Hello"]
+           (render/unwrap-body [:div "Hello"]))))
+
+  (testing "Passes through nil unchanged"
+    (is (nil? (render/unwrap-body nil))))
+
+  (testing "Passes through non-vector unchanged"
+    (is (= "string" (render/unwrap-body "string")))))
+
+(deftest test-render-tab-strips-body-tag
+  (testing "render-tab strips [:body] wrapper from render function output (issue #40)"
+    (let [app-state* (atom (state/init-state))
+          session-id "test-session-body"
+          tab-id     "test_tab_body"
+          render-fn  (fn [_req] [:body [:div [:h1 "Count: 0"]]])]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (render/register-render-fn! app-state* tab-id render-fn)
+      (let [result (render/render-tab app-state* session-id tab-id)]
+        (is (string? (:body-html result)))
+        ;; Should NOT contain a <body> tag
+        (is (not (.contains (:body-html result) "<body")))
+        ;; Should still contain the inner content
+        (is (.contains (:body-html result) "Count: 0"))))))
+
 (deftest test-actions-cleaned-between-renders
   (testing "Stale actions from a previous render are cleaned up when the next render produces fewer"
     (let [app-state*      (atom (state/init-state))
