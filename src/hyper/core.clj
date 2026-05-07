@@ -468,6 +468,10 @@
    - :watches           — Vector of Watchable sources added to every page route.
                           Useful for top-level atoms that should trigger a re-render
                           on any page (e.g. a global config or feature-flags atom).
+   - :render-middleware — Vector of middleware fns applied to every page render.
+                          Each is (fn [handler] (fn [req] ...)), identical to Ring
+                          middleware.  Applied on both initial page loads and SSE
+                          re-renders.  Per-route :render-middleware wraps inside these.
 
    Example:
      (def routes
@@ -494,16 +498,18 @@
      (def app (start! handler {:port 3000}))
      ;; Later...
      (stop! app)"
-  [routes & {:keys [app-state head static-resources static-dir watches datastar-script base-path]
+  [routes & {:keys [app-state head static-resources static-dir watches
+                    datastar-script base-path render-middleware]
              :or   {app-state       (atom (state/init-state))
                     datastar-script server/default-datastar-script}}]
   (server/create-handler routes app-state
-                         {:head             head
-                          :datastar-script  datastar-script
-                          :static-resources static-resources
-                          :static-dir       static-dir
-                          :watches          watches
-                          :base-path        base-path}))
+                         {:head              head
+                          :datastar-script   datastar-script
+                          :static-resources  static-resources
+                          :static-dir        static-dir
+                          :watches           watches
+                          :base-path         base-path
+                          :render-middleware render-middleware}))
 
 (defn start!
   "Start the hyper application server.

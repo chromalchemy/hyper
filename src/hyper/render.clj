@@ -10,6 +10,33 @@
             [hyper.utils :as utils]
             [taoensso.telemere :as t]))
 
+(defn apply-render-middleware
+  "Wrap a render-fn with a middleware chain.
+
+   Middleware are functions of the form `(fn [handler] (fn [req] ...))`,
+   identical to Ring middleware.  The chain is a sequence of middleware
+   where earlier entries wrap outermost (execute first).
+
+   Returns the wrapped render-fn, or the original render-fn if the chain
+   is empty."
+  [render-fn middleware-chain]
+  (if (seq middleware-chain)
+    (reduce (fn [h mw] (mw h)) render-fn (reverse middleware-chain))
+    render-fn))
+
+(defn- resolve-render-middleware
+  "Build the combined render middleware chain for a tab's current route.
+
+   Handler-level middleware (from app-state :render-middleware) wraps
+   outermost, route-level middleware (from route data :render-middleware)
+   wraps innermost.  Returns a flat sequence, or nil."
+  [app-state* route-index route]
+  (let [handler-mw (get @app-state* :render-middleware)
+        route-mw   (when-let [route-name (:name route)]
+                     (:render-middleware (get route-index route-name)))
+        chain      (seq (concat handler-mw route-mw))]
+    chain))
+
 (defn register-render-fn!
   "Register a render function for a tab."
   [app-state* tab-id render-fn]
@@ -193,7 +220,9 @@
                               #'context/*state-overlay*           {:state* (atom @app-state*)
                                                                    :paths* (atom #{})}})
        (try
-         (let [body (safe-render render-fn req)]
+         (let [mw-chain   (resolve-render-middleware app-state* route-index route)
+               wrapped-fn (apply-render-middleware render-fn mw-chain)
+               body       (safe-render wrapped-fn req)]
            ;; Ring response passthrough - render-fn returned a redirect,
            ;; error, or other non-hiccup response; pass it through as-is.
            (if (and (map? body) (:status body))

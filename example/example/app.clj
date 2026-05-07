@@ -216,8 +216,8 @@
             [:div.card [:h3 title] [:p.muted desc] children])
           (result [label content]
             [:p label [:strong content]])]
-    (let [_items*  (h/tab-cursor :items [])
-          cookie*  (h/tab-cursor :last-cookie "none")]
+    (let [_items* (h/tab-cursor :items [])
+          cookie* (h/tab-cursor :last-cookie "none")]
       (layout
         "Effects"
         [:p "Effects are escape hatches for actions that need to do more "
@@ -228,10 +228,10 @@
               "Click Create to save a new item and navigate to the home page."
               [:button {:data-on:click
                         (h/action {:as "create-and-navigate"}
-                          (swap! (h/tab-cursor :items) conj
-                                 {:id (count @(h/tab-cursor :items))
-                                  :name "New Item"})
-                          (effects/navigate! :home))}
+                                  (swap! (h/tab-cursor :items) conj
+                                         {:id   (count @(h/tab-cursor :items))
+                                          :name "New Item"})
+                                  (effects/navigate! :home))}
                "Create & Navigate Home"])
 
         ;; set-cookie! / delete-cookie!
@@ -239,15 +239,15 @@
               "Set or delete a cookie. The cookie value is read from the request on each render."
               [:button {:data-on:click
                         (h/action {:as "set-cookie"}
-                          (effects/set-cookie! "example-pref" "dark-mode"
-                                               {:max-age (* 60 60 24)})
-                          (reset! (h/tab-cursor :last-cookie) "dark-mode"))}
+                                  (effects/set-cookie! "example-pref" "dark-mode"
+                                                       {:max-age (* 60 60 24)})
+                                  (reset! (h/tab-cursor :last-cookie) "dark-mode"))}
                "Set Cookie"]
               " "
               [:button {:data-on:click
                         (h/action {:as "delete-cookie"}
-                          (effects/delete-cookie! "example-pref")
-                          (reset! (h/tab-cursor :last-cookie) "deleted"))}
+                                  (effects/delete-cookie! "example-pref")
+                                  (reset! (h/tab-cursor :last-cookie) "deleted"))}
                "Delete Cookie"]
               (result "Cookie status: " @cookie*))
 
@@ -258,12 +258,12 @@
               [:br]
               [:button {:data-on:click
                         (h/action {:as "focus-input"}
-                          (effects/execute-script! "document.getElementById('focus-target').focus()"))}
+                                  (effects/execute-script! "document.getElementById('focus-target').focus()"))}
                "Focus the input"]
               " "
               [:button {:data-on:click
                         (h/action {:as "scroll-top"}
-                          (effects/execute-script! "window.scrollTo({top: 0, behavior: 'smooth'})"))}
+                                  (effects/execute-script! "window.scrollTo({top: 0, behavior: 'smooth'})"))}
                "Scroll to top"])
 
         ;; Multiple effects in one action
@@ -271,10 +271,10 @@
               "A single action can emit multiple effects."
               [:button {:data-on:click
                         (h/action {:as "multi-effect"}
-                          (effects/set-cookie! "multi-test" "combined"
-                                               {:max-age 3600})
-                          (effects/execute-script! "console.log('Effects composed!')")
-                          (reset! (h/tab-cursor :last-cookie) "combined"))}
+                                  (effects/set-cookie! "multi-test" "combined"
+                                                       {:max-age 3600})
+                                  (effects/execute-script! "console.log('Effects composed!')")
+                                  (reset! (h/tab-cursor :last-cookie) "combined"))}
                "Set cookie + run script"])))))
 
 ;; ---------------------------------------------------------------------------

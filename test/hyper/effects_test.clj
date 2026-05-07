@@ -73,7 +73,7 @@
     (let [response {:status 204}
           pending  {:cookies {"auth" {:value "token123" :http-only true}}
                     :scripts []}]
-      (is (= {:status 204
+      (is (= {:status  204
               :cookies {"auth" {:value "token123" :http-only true}}}
              (effects/apply-cookies-to-response response pending)))))
 
@@ -124,15 +124,15 @@
                    (fn [_req]
                      [:button {:data-on:click
                                (h/action {:as "login"}
-                                 (effects/set-cookie! "auth" "jwt-token-123"
-                                                      {:http-only true
-                                                       :max-age   86400}))}
+                                         (effects/set-cookie! "auth" "jwt-token-123"
+                                                              {:http-only true
+                                                               :max-age   86400}))}
                       "Login"]))
           after  (ht/test-action result "login")]
       (is (= {"auth" {:value     "jwt-token-123"
-                       :path      "/"
-                       :http-only true
-                       :max-age   86400}}
+                      :path      "/"
+                      :http-only true
+                      :max-age   86400}}
              (get-in after [:effects :cookies]))))))
 
 (deftest test-delete-cookie-from-action
@@ -141,7 +141,7 @@
                    (fn [_req]
                      [:button {:data-on:click
                                (h/action {:as "logout"}
-                                 (effects/delete-cookie! "auth"))}
+                                         (effects/delete-cookie! "auth"))}
                       "Logout"]))
           after  (ht/test-action result "logout")]
       (is (= {"auth" {:value "" :max-age 0 :path "/"}}
@@ -153,7 +153,7 @@
                    (fn [_req]
                      [:button {:data-on:click
                                (h/action {:as "focus"}
-                                 (effects/execute-script! "document.getElementById('q').focus()"))}
+                                         (effects/execute-script! "document.getElementById('q').focus()"))}
                       "Focus"]))
           after  (ht/test-action result "focus")]
       (is (= ["document.getElementById('q').focus()"]
@@ -161,24 +161,24 @@
 
 (deftest test-navigate-from-action
   (testing "navigate! in action updates route state and queues pushState script"
-    (let [home-page  (fn [_req]
-                       [:div
-                        [:button {:data-on:click
-                                  (h/action {:as "go-about"}
-                                    (effects/navigate! :about))}
-                         "Go About"]])
-          routes     [["/" {:name  :home
-                            :title "Home"
-                            :get   home-page}]
-                      ["/about" {:name  :about
-                                 :title "About"
-                                 :get   (fn [_req] [:div "About page"])}]]
+    (let [home-page (fn [_req]
+                      [:div
+                       [:button {:data-on:click
+                                 (h/action {:as "go-about"}
+                                           (effects/navigate! :about))}
+                        "Go About"]])
+          routes    [["/" {:name  :home
+                           :title "Home"
+                           :get   home-page}]
+                     ["/about" {:name  :about
+                                :title "About"
+                                :get   (fn [_req] [:div "About page"])}]]
           ;; create-handler sets up the router in app-state
-          app-state  (atom (state/init-state))
-          _handler   (h/create-handler routes :app-state app-state)
+          app-state (atom (state/init-state))
+          _handler  (h/create-handler routes :app-state app-state)
           ;; Render the home page — pass app-state so the router is available
-          result     (ht/test-page home-page {:app-state app-state})
-          after      (ht/test-action result "go-about")]
+          result    (ht/test-page home-page {:app-state app-state})
+          after     (ht/test-action result "go-about")]
       ;; Route state should be updated server-side
       (is (= :about (get-in after [:cursors :route :name])))
       (is (= "/about" (get-in after [:cursors :route :path])))
@@ -192,9 +192,9 @@
                    (fn [_req]
                      [:button {:data-on:click
                                (h/action {:as "multi"}
-                                 (effects/set-cookie! "token" "abc" {:http-only true})
-                                 (effects/execute-script! "showNotification()")
-                                 (effects/execute-script! "scrollToTop()"))}
+                                         (effects/set-cookie! "token" "abc" {:http-only true})
+                                         (effects/execute-script! "showNotification()")
+                                         (effects/execute-script! "scrollToTop()"))}
                       "Multi"]))
           after  (ht/test-action result "multi")]
       (is (= {"token" {:value "abc" :path "/" :http-only true}}
@@ -209,9 +209,9 @@
                      (let [_status* (h/tab-cursor :status "idle")]
                        [:button {:data-on:click
                                  (h/action {:as "save"}
-                                   (reset! (h/tab-cursor :status) "saved")
-                                   (effects/set-cookie! "last-save" "2024-01-01")
-                                   (effects/execute-script! "flashSuccess()"))}
+                                           (reset! (h/tab-cursor :status) "saved")
+                                           (effects/set-cookie! "last-save" "2024-01-01")
+                                           (effects/execute-script! "flashSuccess()"))}
                         "Save"])))
           after  (ht/test-action result "save")]
       ;; Cursor mutation works
@@ -229,7 +229,7 @@
                      [:div
                       [:button {:data-on:click
                                 (h/action {:as "with-effect"}
-                                  (effects/execute-script! "doSomething()"))}
+                                          (effects/execute-script! "doSomething()"))}
                        "A"]
                       [:button {:data-on:click
                                 (h/action {:as "no-effect"})}

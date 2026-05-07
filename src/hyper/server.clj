@@ -15,6 +15,7 @@
             [hyper.routes :as routes]
             [hyper.signal :as signal]
             [hyper.state :as state]
+            [hyper.utils :as utils]
             [hyper.watch :as watch]
             [org.httpkit.server :as http-kit]
             [reitit.coercion :as coercion]
@@ -109,30 +110,52 @@
                                                                 sse-payload)]
                                               (boolean (http-kit/send! channel payload false)))))
                                         ;; Full render
-                                        (when-let [{:keys [title head-html body-html url
-                                                           declared-signals registered-action-ids
-                                                           registered-reactive-ids]}
-                                                   (render/render-tab app-state* session-id tab-id)]
-                                          ;; Sweep stale actions + reactive components
-                                          (actions/sweep-stale-tab-actions! app-state* tab-id registered-action-ids)
-                                          (reactive/sweep-stale-components! app-state* tab-id registered-reactive-ids)
-                                          ;; Set up watches for new/changed reactive components
-                                          (reactive/setup-new-component-watches! app-state* tab-id
-                                                                                 trigger-partial! pending-partials*)
-                                          (let [head-event   (render/format-head-update title head-html)
-                                                sig-attrs    (signal/format-signal-attrs declared-signals)
-                                                div-attrs    (cond-> {:id "hyper-app"}
-                                                               url       (assoc :data-hyper-url url)
-                                                               sig-attrs (merge sig-attrs))
-                                                wrapped-html (c/html [:div div-attrs (c/raw body-html)])
-                                                body-event   (render/format-datastar-fragment wrapped-html)
-                                                sig-event    (when (seq sig-patches)
-                                                               (signal/format-patch-signals-event sig-patches))
-                                                sse-payload  (str head-event body-event sig-event)
-                                                payload      (if br-stream
-                                                               (br/compress-stream br-out br-stream sse-payload)
-                                                               sse-payload)]
-                                            (boolean (http-kit/send! channel payload false)))))
+                                        (when-let [render-result (render/render-tab app-state* session-id tab-id)]
+                                          ;; Render middleware may return a Ring response (e.g. redirect).
+                                          ;; On SSE we can only handle 3xx redirects with a Location header —
+                                          ;; convert to a client-side window.location redirect.  Any other Ring
+                                          ;; response shape is an error (the SSE channel can't represent it).
+                                          (if (:status render-result)
+                                            (let [status   (:status render-result)
+                                                  location (get-in render-result [:headers "Location"])]
+                                              (if (and (<= 300 status 399) location)
+                                                (let [js          (str "window.location.href='"
+                                                                       (utils/escape-js-string location) "'")
+                                                      sse-payload (effects/format-execute-script-event js)
+                                                      payload     (if br-stream
+                                                                    (br/compress-stream br-out br-stream sse-payload)
+                                                                    sse-payload)]
+                                                  (boolean (http-kit/send! channel payload false)))
+                                                (throw (ex-info
+                                                         (str "Render middleware returned a Ring response over SSE that cannot "
+                                                              "be delivered to the client. Only 3xx redirects with a Location "
+                                                              "header are supported during SSE re-renders.")
+                                                         {:status   status
+                                                          :headers  (:headers render-result)
+                                                          :tab-id   tab-id}))))
+                                            (let [{:keys [title head-html body-html url
+                                                          declared-signals registered-action-ids
+                                                          registered-reactive-ids]}              render-result]
+                                              ;; Sweep stale actions + reactive components
+                                              (actions/sweep-stale-tab-actions! app-state* tab-id registered-action-ids)
+                                              (reactive/sweep-stale-components! app-state* tab-id registered-reactive-ids)
+                                              ;; Set up watches for new/changed reactive components
+                                              (reactive/setup-new-component-watches! app-state* tab-id
+                                                                                     trigger-partial! pending-partials*)
+                                              (let [head-event   (render/format-head-update title head-html)
+                                                    sig-attrs    (signal/format-signal-attrs declared-signals)
+                                                    div-attrs    (cond-> {:id "hyper-app"}
+                                                                   url       (assoc :data-hyper-url url)
+                                                                   sig-attrs (merge sig-attrs))
+                                                    wrapped-html (c/html [:div div-attrs (c/raw body-html)])
+                                                    body-event   (render/format-datastar-fragment wrapped-html)
+                                                    sig-event    (when (seq sig-patches)
+                                                                   (signal/format-patch-signals-event sig-patches))
+                                                    sse-payload  (str head-event body-event sig-event)
+                                                    payload      (if br-stream
+                                                                   (br/compress-stream br-out br-stream sse-payload)
+                                                                   sse-payload)]
+                                                (boolean (http-kit/send! channel payload false)))))))
                                       (catch Throwable e
                                         (t/error! e {:id   :hyper.error/renderer
                                                      :data {:hyper/tab-id tab-id}})
@@ -354,25 +377,27 @@
               ;; render loop can detect changes (e.g. when a user types
               ;; into a data-bind input, the server needs to know the
               ;; latest value for changed-signals diffing).
-              tab-id         (get-in @app-state* [:actions action-id :tab-id])]
+              action-data    (get-in @app-state* [:actions action-id])
+              tab-id         (:tab-id action-data)]
           (when (and signals tab-id)
             (swap! app-state* update-in [:tabs tab-id :signals]
                    (fn [server-sigs]
                      (merge server-sigs signals))))
-          (push-thread-bindings {#'context/*request* req-with-state
-                                 #'context/*signals* signals
-                                 #'effects/*pending* (effects/init-pending)})
+          (push-thread-bindings {#'context/*request*     req-with-state
+                                 #'context/*signals*     signals
+                                 #'context/*action-name* (:as action-data)
+                                 #'effects/*pending*     (effects/init-pending)})
           (try
             (actions/execute-action! app-state* action-id client-params)
 
             ;; Collect accumulated effects
-            (let [pending (effects/collect-pending!)
+            (let [pending  (effects/collect-pending!)
                   ;; Queue pending scripts for SSE delivery via the renderer thread
-                  _       (when-let [scripts (seq (:scripts pending))]
-                            (when-let [renderer (get-in @app-state* [:tabs tab-id :renderer])]
-                              (swap! (:pending-scripts* renderer) into scripts)
+                  _        (when-let [scripts (seq (:scripts pending))]
+                             (when-let [renderer (get-in @app-state* [:tabs tab-id :renderer])]
+                               (swap! (:pending-scripts* renderer) into scripts)
                               ;; Wake the renderer to drain and send the scripts
-                              ((:trigger-partial! renderer))))
+                               ((:trigger-partial! renderer))))
                   ;; Build response — 204 with any cookies from effects
                   response {:status 204}]
               (effects/apply-cookies-to-response response pending))
@@ -652,12 +677,16 @@
    - :watches           Vector of Watchable sources added to every page route.
                         Useful for top-level atoms that should trigger a re-render
                         on any page (e.g. a global config or feature-flags atom).
+   - :render-middleware Vector of middleware fns applied to every page render.
+                        Each is (fn [handler] (fn [req] ...)), identical to Ring
+                        middleware.  Runs outermost (before per-route middleware).
+                        Applied on both initial HTTP page loads and SSE re-renders.
 
    Routes should use :get handlers that return hiccup (Chassis vectors).
    Hyper will wrap them to provide full HTML responses and SSE connections."
   ([routes app-state*]
    (create-handler routes app-state* {:datastar-script (default-datastar-script)}))
-  ([routes app-state* {:keys [watches head base-path] :as opts}]
+  ([routes app-state* {:keys [watches head base-path render-middleware] :as opts}]
    (let [base-path       (or base-path "")
          page-wrapper    (page-handler app-state* (assoc opts :base-path base-path))
          system-routes   [[(str base-path "/hyper/events") {:get (sse-events-handler app-state*)}]
@@ -672,7 +701,8 @@
                                 :routes-source routes
                                 :global-watches (vec watches)
                                 :head head
-                                :base-path base-path)
+                                :base-path base-path
+                                :render-middleware (vec render-middleware))
          initial-routes  (if (var? routes) @routes routes)
          initial-handler (build-ring-handler initial-routes app-state* page-wrapper system-routes)
          handler         (if (var? routes)

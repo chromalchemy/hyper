@@ -64,6 +64,18 @@
                                     live
                                     paths)))))))
 
+;; The :as name of the currently executing action, or nil when outside
+;; an action context or when the action was not given an :as name.
+;; Bound by the action handler in server.clj so that utility functions
+;; called from within actions can identify which action is running
+;; without the caller having to pass the name explicitly.
+;;
+;; Example:
+;;   (h/action {:as "delete-user"}
+;;     (audit! context/*action-name*)  ;; => "delete-user"
+;;     (delete-user! id))
+(def ^:dynamic *action-name* nil)
+
 ;; Accumulator for reactive component IDs registered during a render pass.
 ;; Bound to (atom #{}) before each full render so that the reactive macro
 ;; can track which components are live.  After render, stale components

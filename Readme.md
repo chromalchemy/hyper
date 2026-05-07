@@ -162,6 +162,25 @@ when the tab disconnects. The body can contain arbitrary Clojure — call
 functions, hit databases, update multiple cursors — whatever happens, the
 resulting state changes trigger re-renders for the appropriate tabs.
 
+### Action identity
+
+During action execution, `context/*action-name*` is bound to the `:as` value of
+the currently running action (or `nil` if the action was not given an `:as`
+name). This lets utility functions identify which action is running without the
+caller having to pass the name explicitly:
+
+```clojure
+(require '[hyper.context :as context])
+
+(defn audit! []
+  (log/info "Action executed" {:action context/*action-name*
+                                :user   @(h/session-cursor :user)}))
+
+(h/action {:as "delete-user"}
+  (audit!)          ;; logs {:action "delete-user", :user ...}
+  (delete-user! id))
+```
+
 ### Client params
 
 Actions can capture client-side DOM values and transmit them to the server using special `$` symbols:
@@ -481,6 +500,121 @@ usual while effects are processed separately.
 All effect functions throw if called outside an action context. This is
 intentional — effects are tied to the HTTP request/response cycle and have no
 meaning outside of it.
+
+## Render Middleware
+
+Render middleware lets you wrap every page render with cross-cutting logic —
+authentication, authorization, request-scoped bindings, or anything else that
+should run before (or around) the render function. Middleware follows the same
+`(fn [handler] (fn [req] ...))` shape as Ring middleware.
+
+```clojure
+(defn wrap-auth [handler]
+  (fn [req]
+    (if-let [user (get-in req [:cookies "auth-token" :value])]
+      (do
+        (reset! (h/session-cursor :user) (validate-token user))
+        (handler req))
+      {:status 302 :headers {"Location" "/login"} :body ""})))
+```
+
+Middleware runs inside the render context — `context/*request*` is bound, cursors
+work, and the full Ring request (cookies, headers, query-params) is available on
+initial page loads. On SSE re-renders, a minimal synthetic request is passed
+instead, but cursors and app-state are always available.
+
+Returning a Ring response map from middleware (e.g. `{:status 302 ...}`)
+short-circuits the render. On initial HTTP requests this produces a normal
+redirect. On SSE re-renders, Hyper converts 3xx redirects to a client-side
+`window.location.href` redirect automatically.
+
+### Handler-level middleware
+
+Pass `:render-middleware` to `create-handler` to apply middleware to every page:
+
+```clojure
+(def handler
+  (h/create-handler #'routes
+    :render-middleware [wrap-auth wrap-request-logging]))
+```
+
+### Per-route middleware
+
+Declare `:render-middleware` on individual routes for page-specific logic:
+
+```clojure
+(def routes
+  [["/"      {:name :home
+              :get  #'home-page}]
+   ["/admin" {:name              :admin
+              :get               #'admin-page
+              :render-middleware [wrap-require-admin]}]])
+```
+
+### Merging order
+
+When both handler-level and route-level middleware are present, handler-level
+wraps outermost (runs first) and route-level wraps innermost (closer to the
+render function):
+
+```
+wrap-auth → wrap-request-logging → wrap-require-admin → admin-page
+(handler-level)                    (route-level)
+```
+
+This matches Ring convention — earlier in the vector = outermost wrapper.
+
+### Common patterns
+
+**Auth rehydration from cookie** — read a long-lived token on every render and
+restore session state:
+
+```clojure
+(defn wrap-rehydrate-session [handler]
+  (fn [req]
+    (when-let [token (get-in req [:cookies "remember-me" :value])]
+      (when-not @(h/session-cursor :user)
+        (when-let [user (validate-jwt token)]
+          (reset! (h/session-cursor :user) user))))
+    (handler req)))
+```
+
+**Auth guard** — redirect unauthenticated users:
+
+```clojure
+(defn wrap-require-auth [handler]
+  (fn [req]
+    (if @(h/session-cursor :user)
+      (handler req)
+      {:status 302 :headers {"Location" "/login"} :body ""})))
+```
+
+**Request-scoped bindings** — bind dynamic vars for the duration of the render:
+
+```clojure
+(defn wrap-db-conn [handler]
+  (fn [req]
+    (with-open [conn (db/get-connection)]
+      (binding [*db* conn]
+        (handler req)))))
+```
+
+### Why no action middleware?
+
+Actions are arbitrary Clojure code — you can call any function inside them.
+Rather than a middleware abstraction, compose functions directly:
+
+```clojure
+(h/action {:as "delete-user"}
+  (require-admin!)
+  (audit! "delete-user")
+  (delete-user! id))
+```
+
+This is explicit, composable, and easy to reason about. Render middleware earns
+its complexity because render functions have a constrained signature
+(`req → hiccup`) and you often need to intercept *before* the render runs.
+Actions have no such constraint.
 
 ## Navigation
 
@@ -990,6 +1124,9 @@ Pass options to customize the test context:
                                :path         "/user/42"
                                :path-params  {:id "42"}
                                :query-params {}}})
+
+;; Apply render middleware (same shape as create-handler :render-middleware)
+(ht/test-page my-page {:render-middleware [wrap-auth]})
 ```
 
 Seeded `:cursors` values take precedence over defaults — if your handler calls
@@ -1096,8 +1233,9 @@ clojure -M:test
 ### Unit tests
 
 Unit tests live in `test/hyper/` and cover cursors, actions, navigation, routing,
-rendering, state management, and brotli compression. They run in-process with no
-server or browser — just bind `*request*` and exercise the API directly.
+rendering, state management, effects, render middleware, and brotli compression.
+They run in-process with no server or browser — just bind `*request*` and
+exercise the API directly.
 
 ### E2E tests
 

@@ -43,7 +43,7 @@
     (reduce (fn [acc action-id]
               (let [action-data (get-in @app-state* [:actions action-id])
                     key         (or (:as action-data) action-id)]
-                (assoc acc key (select-keys action-data [:fn]))))
+                (assoc acc key (select-keys action-data [:fn :as]))))
             {}
             action-ids)))
 
@@ -80,6 +80,9 @@
    - :route       — Route info map {:name :path :path-params :query-params}.
                      Default: {:name :test-page :path \"/\" :path-params {} :query-params {}}.
    - :req         — Extra keys to merge into the request map passed to handler.
+   - :render-middleware — Vector of middleware fns to wrap the handler.
+                     Each is (fn [handler] (fn [req] ...)), identical to Ring
+                     middleware.  Applied in order (first = outermost).
 
    Returns a map:
    - :body          — Raw hiccup returned by the handler (before HTML serialization).
@@ -143,9 +146,10 @@
                               #'context/*state-overlay*           {:state* (atom @app-state*)
                                                                    :paths* (atom #{})}})
        (try
-         (let [body  (render/safe-render handler req)
+         (let [mw-handler (render/apply-render-middleware handler (:render-middleware opts))
+               body       (render/safe-render mw-handler req)
                ;; Ring response passthrough
-               ring? (and (map? body) (:status body))]
+               ring?      (and (map? body) (:status body))]
            (if ring?
              body
              (let [declared     @context/*declared-signals*
@@ -232,11 +236,12 @@
                         :available-actions (keys (:actions result))})))
      (let [session-id (::session-id result)
            tab-id     (::tab-id result)]
-       (binding [context/*request* {:hyper/session-id session-id
-                                    :hyper/tab-id     tab-id
-                                    :hyper/app-state  app-state*
-                                    :hyper/router     (get @app-state* :router)}
-                 effects/*pending* (effects/init-pending)]
+       (binding [context/*request*     {:hyper/session-id session-id
+                                        :hyper/tab-id     tab-id
+                                        :hyper/app-state  app-state*
+                                        :hyper/router     (get @app-state* :router)}
+                 context/*action-name* (:as action)
+                 effects/*pending*     (effects/init-pending)]
          ((:fn action) client-params)
          ;; Read route AFTER execution so navigate! changes are reflected
          (let [route (get-in @app-state* [:tabs tab-id :route])]
