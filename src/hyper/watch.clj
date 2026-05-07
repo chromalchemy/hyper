@@ -12,13 +12,13 @@
 ;; External source watching
 ;; ---------------------------------------------------------------------------
 
-(defn- retain-source!
+(defn retain-source!
   "Increment the reference count for a watched source."
   [app-state* source]
   (swap! app-state* update-in [:source-refcounts source] (fnil inc 0))
   nil)
 
-(defn- release-source!
+(defn release-source!
   "Decrement the reference count for a watched source.  When the count
    reaches zero, calls -dispose and removes the refcount entry."
   [app-state* source]

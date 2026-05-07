@@ -16,7 +16,8 @@
   (:require [clojure.set]
             [dev.onionpancakes.chassis.core :as c]
             [hyper.context :as context]
-            [hyper.protocols :as proto]))
+            [hyper.protocols :as proto]
+            [hyper.watch :as watch]))
 
 ;; ---------------------------------------------------------------------------
 ;; Component registration & cache
@@ -100,12 +101,7 @@
                       :hyper/tab-id     tab-id
                       :hyper/app-state  app-state*
                       :hyper/router     (:router @app-state*)}]
-      (push-thread-bindings {#'context/*request*                 req
-                             #'context/*action-idx*              (atom 0)
-                             #'context/*declared-signals*        (atom [])
-                             #'context/*registered-action-ids*   (atom #{})
-                             #'context/*registered-reactive-ids* (atom #{})
-                             #'context/*state-overlay*           nil})
+      (push-thread-bindings (context/partial-render-bindings req))
       (try
         (let [body             (render-fn)
               [html-id hiccup] (inject-id body component-id)
@@ -136,14 +132,11 @@
   [app-state* tab-id component-id deps trigger-partial! pending-partials*]
   (doseq [dep deps]
     (let [watch-key (keyword (str "reactive-" component-id "-" (System/identityHashCode dep)))]
-      ;; Retain refcount
-      (swap! app-state* update-in [:source-refcounts dep] (fnil inc 0))
-      ;; Add the watch
+      (watch/retain-source! app-state* dep)
       (proto/-add-watch dep watch-key
                         (fn [_old _new]
                           (swap! pending-partials* conj component-id)
                           (trigger-partial!)))
-      ;; Track the watch key for cleanup
       (swap! app-state* update-in [:tabs tab-id :reactive-watches component-id]
              (fnil assoc {}) watch-key dep))))
 
@@ -153,14 +146,7 @@
   (let [watches (get-in @app-state* [:tabs tab-id :reactive-watches component-id])]
     (doseq [[watch-key dep] watches]
       (proto/-remove-watch dep watch-key)
-      ;; Release refcount — dispose if last consumer
-      (let [new-state (swap! app-state* (fn [state]
-                                          (let [n (dec (get-in state [:source-refcounts dep] 1))]
-                                            (if (pos? n)
-                                              (assoc-in state [:source-refcounts dep] n)
-                                              (update state :source-refcounts dissoc dep)))))]
-        (when-not (contains? (:source-refcounts new-state) dep)
-          (proto/-dispose dep))))
+      (watch/release-source! app-state* dep))
     (swap! app-state* update-in [:tabs tab-id :reactive-watches] dissoc component-id)))
 
 ;; ---------------------------------------------------------------------------

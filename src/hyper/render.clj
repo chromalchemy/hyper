@@ -212,13 +212,7 @@
                          router (assoc :hyper/router router)
                          route  (assoc :hyper/route route)
                          true   (dissoc :reitit.core/match))]
-       (push-thread-bindings {#'context/*request*                 req
-                              #'context/*action-idx*              (atom 0)
-                              #'context/*declared-signals*        (atom [])
-                              #'context/*registered-action-ids*   (atom #{})
-                              #'context/*registered-reactive-ids* (atom #{})
-                              #'context/*state-overlay*           {:state* (atom @app-state*)
-                                                                   :paths* (atom #{})}})
+       (push-thread-bindings (context/render-bindings req app-state*))
        (try
          (let [mw-chain   (resolve-render-middleware app-state* route-index route)
                wrapped-fn (apply-render-middleware render-fn mw-chain)

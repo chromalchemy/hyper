@@ -83,6 +83,30 @@
 ;; their watches are removed and deps released.
 (def ^:dynamic *registered-reactive-ids* nil)
 
+(defn render-bindings
+  "Build the thread-binding map for a full render context.
+   Includes a state overlay snapshot so cursor reads/writes are isolated.
+   Returns a map suitable for `push-thread-bindings`."
+  [req app-state*]
+  {#'*request*                 req
+   #'*action-idx*              (atom 0)
+   #'*declared-signals*        (atom [])
+   #'*registered-action-ids*   (atom #{})
+   #'*registered-reactive-ids* (atom #{})
+   #'*state-overlay*           {:state* (atom @app-state*)
+                                :paths* (atom #{})}})
+
+(defn partial-render-bindings
+  "Build the thread-binding map for a partial (reactive component) render.
+   No state overlay — reads/writes go directly to the live atom."
+  [req]
+  {#'*request*                 req
+   #'*action-idx*              (atom 0)
+   #'*declared-signals*        (atom [])
+   #'*registered-action-ids*   (atom #{})
+   #'*registered-reactive-ids* (atom #{})
+   #'*state-overlay*           nil})
+
 (defn require-context!
   "Extract and validate the request context from *request*.
    Throws if called outside a request context or if required keys are missing.

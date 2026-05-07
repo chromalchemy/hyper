@@ -14,7 +14,8 @@
     :routes <original-routes-vector>
     :routes-source <var-or-routes-vector>}"
   (:require [clojure.string]
-            [hyper.context :as context]))
+            [hyper.context :as context]
+            [hyper.utils :as utils]))
 
 (defn normalize-path
   "Convert keyword or vector to vector path."
@@ -225,28 +226,15 @@
 
 (defn parse-query-string
   "Parse a query string into a keyword-keyed map with URL-decoded values.
-   Returns nil if query-string is nil."
+   Returns nil if query-string is nil.
+   Delegates to hyper.utils/parse-query-string."
   [query-string]
-  (when query-string
-    (into {}
-          (map (fn [pair]
-                 (let [[k v] (clojure.string/split pair #"=" 2)]
-                   [(keyword (java.net.URLDecoder/decode k "UTF-8"))
-                    (java.net.URLDecoder/decode (or v "") "UTF-8")])))
-          (clojure.string/split query-string #"&"))))
+  (utils/parse-query-string query-string))
 
 (defn build-url
   "Build a URL string from a path and query params map.
    Omits query params with nil values.
-   Returns path if no query params remain."
+   Returns path if no query params remain.
+   Delegates to hyper.utils/build-url."
   [path query-params]
-  (let [non-nil-query-params (into {}
-                                   (remove (comp nil? val))
-                                   query-params)]
-    (if (empty? non-nil-query-params)
-      path
-      (let [query-string (->> non-nil-query-params
-                              (map (fn [[k v]]
-                                     (str (name k) "=" (java.net.URLEncoder/encode (str v) "UTF-8"))))
-                              (clojure.string/join "&"))]
-        (str path "?" query-string)))))
+  (utils/build-url path query-params))

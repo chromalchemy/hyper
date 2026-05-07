@@ -47,6 +47,94 @@
   "Minimum interval between renders for a single tab (~60fps)."
   16)
 
+(defn- send-sse!
+  "Compress (when br-stream is non-nil) and send an SSE payload over the channel.
+   Returns true when sent, false when the channel is closed."
+  [channel br-out br-stream sse-payload]
+  (let [payload (if br-stream
+                  (br/compress-stream br-out br-stream sse-payload)
+                  sse-payload)]
+    (boolean (http-kit/send! channel payload false))))
+
+(defn- handle-partial-render
+  "Render only the dirty reactive components and send targeted fragments.
+   Returns true/nil on success, false when the channel is closed."
+  [app-state* tab-id dirty-ids channel br-out br-stream]
+  (let [fragments (keep (fn [component-id]
+                          (reactive/partial-render app-state* tab-id component-id))
+                        dirty-ids)]
+    (when (seq fragments)
+      (send-sse! channel br-out br-stream
+                 (render/format-datastar-fragments fragments)))))
+
+(defn- handle-ring-redirect
+  "Convert a 3xx Ring redirect response into a client-side window.location
+   redirect over SSE.  Throws for non-redirect Ring responses."
+  [render-result tab-id channel br-out br-stream]
+  (let [status   (:status render-result)
+        location (get-in render-result [:headers "Location"])]
+    (if (and (<= 300 status 399) location)
+      (let [js (str "window.location.href='" (utils/escape-js-string location) "'")]
+        (send-sse! channel br-out br-stream
+                   (effects/format-execute-script-event js)))
+      (throw (ex-info
+               (str "Render middleware returned a Ring response over SSE that cannot "
+                    "be delivered to the client. Only 3xx redirects with a Location "
+                    "header are supported during SSE re-renders.")
+               {:status  status
+                :headers (:headers render-result)
+                :tab-id  tab-id})))))
+
+(defn- handle-full-render
+  "Perform a full page render and send the assembled SSE events (head update,
+   body fragment, signal patches).  Sweeps stale actions/reactive components
+   and wires up watches for new reactive components.
+   Returns true/nil on success, false when the channel is closed."
+  [app-state* session-id tab-id sig-patches
+   trigger-partial! pending-partials*
+   channel br-out br-stream]
+  (when-let [render-result (render/render-tab app-state* session-id tab-id)]
+    (if (:status render-result)
+      ;; Ring response passthrough (e.g. redirect from render middleware)
+      (handle-ring-redirect render-result tab-id channel br-out br-stream)
+      ;; Normal render — assemble and send SSE payload
+      (let [{:keys [title head-html body-html url
+                    declared-signals registered-action-ids
+                    registered-reactive-ids]} render-result]
+        ;; Sweep stale actions + reactive components
+        (actions/sweep-stale-tab-actions! app-state* tab-id registered-action-ids)
+        (reactive/sweep-stale-components! app-state* tab-id registered-reactive-ids)
+        ;; Set up watches for new/changed reactive components
+        (reactive/setup-new-component-watches! app-state* tab-id
+                                               trigger-partial! pending-partials*)
+        (let [head-event   (render/format-head-update title head-html)
+              sig-attrs    (signal/format-signal-attrs declared-signals)
+              div-attrs    (cond-> {:id "hyper-app"}
+                             url       (assoc :data-hyper-url url)
+                             sig-attrs (merge sig-attrs))
+              wrapped-html (c/html [:div div-attrs (c/raw body-html)])
+              body-event   (render/format-datastar-fragment wrapped-html)
+              sig-event    (when (seq sig-patches)
+                             (signal/format-patch-signals-event sig-patches))
+              sse-payload  (str head-event body-event sig-event)]
+          (send-sse! channel br-out br-stream sse-payload))))))
+
+(defn- drain-pending-scripts!
+  "Drain queued execute-script effects and send them over SSE.
+   Returns true/nil on success, false when the channel is closed."
+  [pending-scripts* tab-id channel br-out br-stream]
+  (let [scripts (let [ss @pending-scripts*]
+                  (reset! pending-scripts* [])
+                  ss)]
+    (try
+      (when (seq scripts)
+        (send-sse! channel br-out br-stream
+                   (apply str (map effects/format-execute-script-event scripts))))
+      (catch Throwable e
+        (t/error! e {:id   :hyper.error/renderer-scripts
+                     :data {:hyper/tab-id tab-id}})
+        nil))))
+
 (defn- -renderer-loop!
   "Virtual-thread render loop for a single tab.
 
@@ -71,12 +159,13 @@
     (try
       ;; Send the connected event as the initial SSE response (headers + body).
       (let [connected-msg (render/format-connected-event tab-id)
-            payload       (if br-stream
-                            (br/compress-stream br-out br-stream connected-msg)
-                            connected-msg)
-            sent?         (boolean (http-kit/send! channel {:headers headers
-                                                            :body    payload}
-                                                   false))]
+            sent?         (boolean
+                            (http-kit/send! channel
+                                            {:headers headers
+                                             :body    (if br-stream
+                                                        (br/compress-stream br-out br-stream connected-msg)
+                                                        connected-msg)}
+                                            false))]
         (when sent?
           ;; Main render loop — tracks the last-sent signal snapshot so
           ;; we only emit datastar-patch-signals for actual changes.
@@ -88,7 +177,6 @@
                     sig-patches     (when (and current-signals
                                                (not= current-signals last-sent-signals))
                                       (signal/changed-signals last-sent-signals current-signals))
-                    ;; Check if we can do partial renders only (reactive blocks dirty, no full render needed)
                     full-render?    (let [needed? @full-render-needed*]
                                       (reset! full-render-needed* false)
                                       needed?)
@@ -99,88 +187,20 @@
                                       (if (and (seq dirty-ids)
                                                (not full-render?)
                                                (not (seq sig-patches)))
-                                        ;; Partial render — only reactive blocks changed
-                                        (let [fragments (keep (fn [component-id]
-                                                                (reactive/partial-render app-state* tab-id component-id))
-                                                              dirty-ids)]
-                                          (when (seq fragments)
-                                            (let [sse-payload (render/format-datastar-fragments fragments)
-                                                  payload     (if br-stream
-                                                                (br/compress-stream br-out br-stream sse-payload)
-                                                                sse-payload)]
-                                              (boolean (http-kit/send! channel payload false)))))
-                                        ;; Full render
-                                        (when-let [render-result (render/render-tab app-state* session-id tab-id)]
-                                          ;; Render middleware may return a Ring response (e.g. redirect).
-                                          ;; On SSE we can only handle 3xx redirects with a Location header —
-                                          ;; convert to a client-side window.location redirect.  Any other Ring
-                                          ;; response shape is an error (the SSE channel can't represent it).
-                                          (if (:status render-result)
-                                            (let [status   (:status render-result)
-                                                  location (get-in render-result [:headers "Location"])]
-                                              (if (and (<= 300 status 399) location)
-                                                (let [js          (str "window.location.href='"
-                                                                       (utils/escape-js-string location) "'")
-                                                      sse-payload (effects/format-execute-script-event js)
-                                                      payload     (if br-stream
-                                                                    (br/compress-stream br-out br-stream sse-payload)
-                                                                    sse-payload)]
-                                                  (boolean (http-kit/send! channel payload false)))
-                                                (throw (ex-info
-                                                         (str "Render middleware returned a Ring response over SSE that cannot "
-                                                              "be delivered to the client. Only 3xx redirects with a Location "
-                                                              "header are supported during SSE re-renders.")
-                                                         {:status   status
-                                                          :headers  (:headers render-result)
-                                                          :tab-id   tab-id}))))
-                                            (let [{:keys [title head-html body-html url
-                                                          declared-signals registered-action-ids
-                                                          registered-reactive-ids]}              render-result]
-                                              ;; Sweep stale actions + reactive components
-                                              (actions/sweep-stale-tab-actions! app-state* tab-id registered-action-ids)
-                                              (reactive/sweep-stale-components! app-state* tab-id registered-reactive-ids)
-                                              ;; Set up watches for new/changed reactive components
-                                              (reactive/setup-new-component-watches! app-state* tab-id
-                                                                                     trigger-partial! pending-partials*)
-                                              (let [head-event   (render/format-head-update title head-html)
-                                                    sig-attrs    (signal/format-signal-attrs declared-signals)
-                                                    div-attrs    (cond-> {:id "hyper-app"}
-                                                                   url       (assoc :data-hyper-url url)
-                                                                   sig-attrs (merge sig-attrs))
-                                                    wrapped-html (c/html [:div div-attrs (c/raw body-html)])
-                                                    body-event   (render/format-datastar-fragment wrapped-html)
-                                                    sig-event    (when (seq sig-patches)
-                                                                   (signal/format-patch-signals-event sig-patches))
-                                                    sse-payload  (str head-event body-event sig-event)
-                                                    payload      (if br-stream
-                                                                   (br/compress-stream br-out br-stream sse-payload)
-                                                                   sse-payload)]
-                                                (boolean (http-kit/send! channel payload false)))))))
+                                        (handle-partial-render app-state* tab-id dirty-ids
+                                                               channel br-out br-stream)
+                                        (handle-full-render app-state* session-id tab-id sig-patches
+                                                            trigger-partial! pending-partials*
+                                                            channel br-out br-stream))
                                       (catch Throwable e
                                         (t/error! e {:id   :hyper.error/renderer
                                                      :data {:hyper/tab-id tab-id}})
                                         nil))
-                    ;; Drain pending execute-script effects queued by actions
-                    scripts         (let [ss @pending-scripts*]
-                                      (reset! pending-scripts* [])
-                                      ss)
-                    script-sent?    (try
-                                      (when (seq scripts)
-                                        (let [sse-payload (apply str (map effects/format-execute-script-event scripts))
-                                              payload     (if br-stream
-                                                            (br/compress-stream br-out br-stream sse-payload)
-                                                            sse-payload)]
-                                          (boolean (http-kit/send! channel payload false))))
-                                      (catch Throwable e
-                                        (t/error! e {:id   :hyper.error/renderer-scripts
-                                                     :data {:hyper/tab-id tab-id}})
-                                        nil))]
+                    script-sent?    (drain-pending-scripts! pending-scripts* tab-id
+                                                            channel br-out br-stream)]
                 ;; sent? is true (ok), nil (no render-fn or error), false (channel closed)
                 ;; script-sent? follows the same convention
                 (when-not (or (false? sent?) (false? script-sent?))
-                  ;; Throttle: sleep so triggers during this window accumulate
-                  ;; as semaphore permits, which drainPermits collapses into
-                  ;; a single render on the next iteration.
                   (Thread/sleep throttle-ms)
                   (recur (or current-signals last-sent-signals))))))))
       (catch Throwable e

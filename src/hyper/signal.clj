@@ -18,7 +18,8 @@
             [clojure.core.memoize :as m]
             [clojure.string :as str]
             [dev.onionpancakes.chassis.core :as c]
-            [hyper.context :as context]))
+            [hyper.context :as context]
+            [hyper.utils :as utils]))
 
 ;; ---------------------------------------------------------------------------
 ;; Name conversion
@@ -63,15 +64,6 @@
 ;; Value encoding
 ;; ---------------------------------------------------------------------------
 
-(defn- escape-js-single-quote
-  "Escape single quotes and backslashes for use inside JS single-quoted strings."
-  [s]
-  (-> s
-      (str/replace "\\" "\\\\")
-      (str/replace "'" "\\'")
-      (str/replace "\n" "\\n")
-      (str/replace "\r" "\\r")))
-
 (defn clj->js-literal
   "Convert a Clojure value to a JavaScript literal string suitable for
    use in Datastar expressions and data-signals attributes."
@@ -80,7 +72,7 @@
     (nil? v)     "null"
     (boolean? v) (str v)
     (number? v)  (str v)
-    (string? v)  (str "'" (escape-js-single-quote v) "'")
+    (string? v)  (str "'" (utils/escape-js-string v) "'")
     (keyword? v) (str "'" (name v) "'")
     (map? v)     (str "{" (str/join ", "
                                     (map (fn [[k v']]
@@ -88,7 +80,7 @@
                                                 ": " (clj->js-literal v')))
                                          v)) "}")
     (coll? v)    (str "[" (str/join ", " (map clj->js-literal v)) "]")
-    :else        (str "'" (escape-js-single-quote (str v)) "'")))
+    :else        (str "'" (utils/escape-js-string (str v)) "'")))
 
 ;; ---------------------------------------------------------------------------
 ;; Signal types

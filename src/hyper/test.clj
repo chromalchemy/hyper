@@ -138,13 +138,7 @@
                  extra-req (merge extra-req))]
 
        ;; Bind context vars and render
-       (push-thread-bindings {#'context/*request*                 req
-                              #'context/*action-idx*              (atom 0)
-                              #'context/*declared-signals*        (atom [])
-                              #'context/*registered-action-ids*   (atom #{})
-                              #'context/*registered-reactive-ids* (atom #{})
-                              #'context/*state-overlay*           {:state* (atom @app-state*)
-                                                                   :paths* (atom #{})}})
+       (push-thread-bindings (context/render-bindings req app-state*))
        (try
          (let [mw-handler (render/apply-render-middleware handler (:render-middleware opts))
                body       (render/safe-render mw-handler req)
