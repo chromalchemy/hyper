@@ -819,7 +819,7 @@
                        [:div
                         [:button {:data-on:click
                                   (hy/action {:as "check-env"}
-                                    (reset! captured (hy/env)))}
+                                             (reset! captured (hy/env)))}
                          "Go"]])
           app-state* (atom (state/init-state))
           _          (state/get-or-create-tab! app-state* "s1" "t1")
