@@ -123,20 +123,18 @@
 
 (defn setup-component-watches!
   "Set up watches on a reactive component's deps.  When any dep changes,
-   adds the component ID to the pending-partials set and fires the semaphore
-   (without marking a full render as needed).
+   enqueues a partial render for the component via the provided callback.
    Uses reference counting via retain/release on each dep.
 
-   trigger-partial! is a zero-arg fn that fires the renderer semaphore
-   without setting the full-render-needed flag."
-  [app-state* tab-id component-id deps trigger-partial! pending-partials*]
+   enqueue-partial! is a single-arg fn that takes a component-id and
+   enqueues it for partial rendering on the renderer's queue."
+  [app-state* tab-id component-id deps enqueue-partial!]
   (doseq [dep deps]
     (let [watch-key (keyword (str "reactive-" component-id "-" (System/identityHashCode dep)))]
       (watch/retain-source! app-state* dep)
       (proto/-add-watch dep watch-key
                         (fn [_old _new]
-                          (swap! pending-partials* conj component-id)
-                          (trigger-partial!)))
+                          (enqueue-partial! component-id)))
       (swap! app-state* update-in [:tabs tab-id :reactive-watches component-id]
              (fnil assoc {}) watch-key dep))))
 
@@ -175,12 +173,12 @@
   "Set up watches for reactive components that don't already have them.
    Called after each full render to wire up new/changed components.
 
-   trigger-partial! fires the renderer semaphore without setting
-   full-render-needed — so the renderer knows it can attempt a partial."
-  [app-state* tab-id trigger-partial! pending-partials*]
+   enqueue-partial! is a single-arg fn that takes a component-id and
+   enqueues it for partial rendering on the renderer's queue."
+  [app-state* tab-id enqueue-partial!]
   (let [components  (get-in @app-state* [:tabs tab-id :reactive-components])
         watched-ids (set (keys (get-in @app-state* [:tabs tab-id :reactive-watches])))]
     (doseq [[component-id {:keys [deps]}] components
             :when                         (not (contains? watched-ids component-id))]
       (setup-component-watches! app-state* tab-id component-id deps
-                                trigger-partial! pending-partials*))))
+                                enqueue-partial!))))

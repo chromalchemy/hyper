@@ -12,6 +12,7 @@
             [hyper.effects :as effects]
             [hyper.reactive :as reactive]
             [hyper.render :as render]
+            [hyper.render.queue :as rq]
             [hyper.routes :as routes]
             [hyper.signal :as signal]
             [hyper.state :as state]
@@ -30,8 +31,7 @@
             [ring.middleware.not-modified :as not-modified]
             [ring.middleware.params :as params]
             [ring.middleware.resource :as resource]
-            [taoensso.telemere :as t])
-  (:import (java.util.concurrent Semaphore)))
+            [taoensso.telemere :as t]))
 
 (defn generate-session-id []
   (str "ses_" (uuid/str (java.util.UUID/randomUUID))))
@@ -91,8 +91,7 @@
    and wires up watches for new reactive components.
    Returns true/nil on success, false when the channel is closed."
   [app-state* session-id tab-id sig-patches
-   trigger-partial! pending-partials*
-   channel br-out br-stream]
+   enqueue-partial! channel br-out br-stream]
   (when-let [render-result (render/render-tab app-state* session-id tab-id)]
     (if (:status render-result)
       ;; Ring response passthrough (e.g. redirect from render middleware)
@@ -105,8 +104,7 @@
         (actions/sweep-stale-tab-actions! app-state* tab-id registered-action-ids)
         (reactive/sweep-stale-components! app-state* tab-id registered-reactive-ids)
         ;; Set up watches for new/changed reactive components
-        (reactive/setup-new-component-watches! app-state* tab-id
-                                               trigger-partial! pending-partials*)
+        (reactive/setup-new-component-watches! app-state* tab-id enqueue-partial!)
         (let [head-event   (render/format-head-update title head-html)
               sig-attrs    (signal/format-signal-attrs declared-signals)
               div-attrs    (cond-> {:id "hyper-app"}
@@ -119,21 +117,18 @@
               sse-payload  (str head-event body-event sig-event)]
           (send-sse! channel br-out br-stream sse-payload))))))
 
-(defn- drain-pending-scripts!
-  "Drain queued execute-script effects and send them over SSE.
+(defn- send-pending-scripts!
+  "Send drained scripts over SSE.
    Returns true/nil on success, false when the channel is closed."
-  [pending-scripts* tab-id channel br-out br-stream]
-  (let [scripts (let [ss @pending-scripts*]
-                  (reset! pending-scripts* [])
-                  ss)]
-    (try
-      (when (seq scripts)
-        (send-sse! channel br-out br-stream
-                   (apply str (map effects/format-execute-script-event scripts))))
-      (catch Throwable e
-        (t/error! e {:id   :hyper.error/renderer-scripts
-                     :data {:hyper/tab-id tab-id}})
-        nil))))
+  [scripts tab-id channel br-out br-stream]
+  (try
+    (when (seq scripts)
+      (send-sse! channel br-out br-stream
+                 (apply str (map effects/format-execute-script-event scripts))))
+    (catch Throwable e
+      (t/error! e {:id   :hyper.error/renderer-scripts
+                   :data {:hyper/tab-id tab-id}})
+      nil)))
 
 (defn- -renderer-loop!
   "Virtual-thread render loop for a single tab.
@@ -141,12 +136,12 @@
    Owns the http-kit AsyncChannel and (optional) streaming Brotli state,
    guaranteeing single-writer semantics by construction.
 
-   Blocks on a Semaphore until signalled by a watcher, then renders the
-   latest state via render/render-tab, compresses (if enabled), and sends.
-   Exits when shutdown-renderer* is delivered."
+   Blocks on the render queue until events are available, drains them into
+   a consistent batch, then renders and sends.  The queue replaces the
+   previous Semaphore + atoms approach, eliminating all shared mutable state.
+   Exits when a :shutdown event is received."
   [app-state* session-id tab-id channel compress?
-   ^Semaphore semaphore shutdown-renderer*
-   pending-partials* full-render-needed* pending-scripts*]
+   render-queue]
   (let [br-out           (when compress? (br/byte-array-out-stream))
         br-stream        (when br-out (br/compress-out-stream br-out :window-size 18))
         headers          (cond-> {"Content-Type"      "text/event-stream"
@@ -155,7 +150,7 @@
                            compress? (assoc "Content-Encoding" "br"))
         throttle-ms      (long (or (get @app-state* :render-throttle-ms)
                                    default-render-throttle-ms))
-        trigger-partial! #(.release semaphore)]
+        enqueue-partial! #(rq/enqueue-partial! render-queue %)]
     (try
       ;; Send the connected event as the initial SSE response (headers + body).
       (let [connected-msg (render/format-connected-event tab-id)
@@ -170,43 +165,35 @@
           ;; Main render loop — tracks the last-sent signal snapshot so
           ;; we only emit datastar-patch-signals for actual changes.
           (loop [last-sent-signals nil]
-            (.acquire semaphore)
-            (.drainPermits semaphore)
-            (when-not (realized? shutdown-renderer*)
-              (let [current-signals (get-in @app-state* [:tabs tab-id :signals])
-                    sig-patches     (when (and current-signals
-                                               (not= current-signals last-sent-signals))
-                                      (signal/changed-signals last-sent-signals current-signals))
-                    full-render?    (let [needed? @full-render-needed*]
-                                      (reset! full-render-needed* false)
-                                      needed?)
-                    dirty-ids       (let [ids @pending-partials*]
-                                      (reset! pending-partials* #{})
-                                      ids)
-                    sent?           (try
-                                      (if (and (seq dirty-ids)
-                                               (not full-render?)
-                                               (not (seq sig-patches)))
-                                        (handle-partial-render app-state* tab-id dirty-ids
-                                                               channel br-out br-stream)
-                                        (handle-full-render app-state* session-id tab-id sig-patches
-                                                            trigger-partial! pending-partials*
-                                                            channel br-out br-stream))
-                                      (catch Throwable e
-                                        (t/error! e {:id   :hyper.error/renderer
-                                                     :data {:hyper/tab-id tab-id}})
-                                        nil))
-                    script-sent?    (drain-pending-scripts! pending-scripts* tab-id
-                                                            channel br-out br-stream)]
-                ;; sent? is true (ok), nil (no render-fn or error), false (channel closed)
-                ;; script-sent? follows the same convention
-                (when-not (or (false? sent?) (false? script-sent?))
-                  (Thread/sleep throttle-ms)
-                  (recur (or current-signals last-sent-signals))))))))
+            (let [{:keys [shutdown? full-render? dirty-ids scripts]} (rq/drain! render-queue)]
+              (when-not shutdown?
+                (let [current-signals (get-in @app-state* [:tabs tab-id :signals])
+                      sig-patches     (when (and current-signals
+                                                 (not= current-signals last-sent-signals))
+                                        (signal/changed-signals last-sent-signals current-signals))
+                      sent?           (try
+                                        (if (and (seq dirty-ids)
+                                                 (not full-render?)
+                                                 (not (seq sig-patches)))
+                                          (handle-partial-render app-state* tab-id dirty-ids
+                                                                 channel br-out br-stream)
+                                          (handle-full-render app-state* session-id tab-id sig-patches
+                                                              enqueue-partial!
+                                                              channel br-out br-stream))
+                                        (catch Throwable e
+                                          (t/error! e {:id   :hyper.error/renderer
+                                                       :data {:hyper/tab-id tab-id}})
+                                          nil))
+                      script-sent?    (send-pending-scripts! scripts tab-id
+                                                             channel br-out br-stream)]
+                  ;; sent? is true (ok), nil (no render-fn or error), false (channel closed)
+                  ;; script-sent? follows the same convention
+                  (when-not (or (false? sent?) (false? script-sent?))
+                    (Thread/sleep throttle-ms)
+                    (recur (or current-signals last-sent-signals)))))))))
       (catch Throwable e
-        (when-not (realized? shutdown-renderer*)
-          (t/error! e {:id   :hyper.error/renderer
-                       :data {:hyper/tab-id tab-id}})))
+        (t/error! e {:id   :hyper.error/renderer
+                     :data {:hyper/tab-id tab-id}}))
       (finally
         (br/close-stream br-stream)
         (when (instance? org.httpkit.server.AsyncChannel channel)
@@ -221,35 +208,31 @@
   "Start a per-tab renderer on a virtual thread.
 
    Returns a map with:
-   - :trigger-render! — zero-arg fn; call to signal a re-render (full)
-   - :stop!           — zero-arg fn; call to shut down the renderer
-   - :pending-partials* — atom #{} of reactive block IDs needing partial render
-   - :pending-scripts* — atom [] of JS strings to execute on the client"
+   - :trigger-render!  — zero-arg fn; call to signal a full re-render
+   - :trigger-partial! — one-arg fn; call with component-id for partial re-render
+   - :enqueue-scripts! — one-arg fn; call with seq of JS strings to execute
+   - :stop!            — zero-arg fn; enqueues a :shutdown event to stop the renderer
+   - :render-queue     — the underlying LinkedBlockingQueue (for testing)"
   [app-state* session-id tab-id channel compress?]
-  (let [semaphore           (Semaphore. 0)
-        shutdown-renderer*  (promise)
-        pending-partials*   (atom #{})
-        pending-scripts*    (atom [])
-        full-render-needed* (atom true)  ;; start with full render
-        trigger-render!     (fn []
-                              (reset! full-render-needed* true)
-                              (.release semaphore))
-        stop!               #(do (deliver shutdown-renderer* true)
-                                 (.release semaphore))
-        thread              (-> (Thread/ofVirtual)
-                                (.name (str "hyper-renderer-" tab-id))
-                                (.start ^Runnable
-                                  #(-renderer-loop! app-state* session-id tab-id
-                                                    channel compress?
-                                                    semaphore shutdown-renderer*
-                                                    pending-partials* full-render-needed*
-                                                    pending-scripts*)))]
-    {:trigger-render!   trigger-render!
-     :trigger-partial!  #(.release semaphore)
-     :stop!             stop!
-     :thread            thread
-     :pending-partials* pending-partials*
-     :pending-scripts*  pending-scripts*}))
+  (let [render-queue     (rq/make-queue)
+        trigger-render!  #(rq/enqueue-full-render! render-queue)
+        trigger-partial! #(rq/enqueue-partial! render-queue %)
+        enqueue-scripts! #(rq/enqueue-scripts! render-queue %)
+        stop!            #(rq/enqueue-shutdown! render-queue)
+        thread           (-> (Thread/ofVirtual)
+                             (.name (str "hyper-renderer-" tab-id))
+                             (.start ^Runnable
+                               #(-renderer-loop! app-state* session-id tab-id
+                                                 channel compress?
+                                                 render-queue)))]
+    ;; Enqueue the initial full render to kick things off
+    (rq/enqueue-full-render! render-queue)
+    {:trigger-render!  trigger-render!
+     :trigger-partial! trigger-partial!
+     :enqueue-scripts! enqueue-scripts!
+     :stop!            stop!
+     :thread           thread
+     :render-queue     render-queue}))
 
 (defn wrap-hyper-context
   "Middleware that adds session-id and tab-id to the request."
@@ -418,9 +401,7 @@
                   ;; Queue pending scripts for SSE delivery via the renderer thread
                   _        (when-let [scripts (seq (:scripts pending))]
                              (when-let [renderer (get-in @app-state* [:tabs tab-id :renderer])]
-                               (swap! (:pending-scripts* renderer) into scripts)
-                              ;; Wake the renderer to drain and send the scripts
-                               ((:trigger-partial! renderer))))
+                               ((:enqueue-scripts! renderer) scripts)))
                   ;; Build response — 204 with any cookies from effects
                   response {:status 204}]
               (effects/apply-cookies-to-response response pending))

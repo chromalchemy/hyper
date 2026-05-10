@@ -1,0 +1,93 @@
+(ns hyper.render.queue
+  "Render queue — single coordination primitive for the per-tab renderer.
+
+   Replaces the previous atoms (pending-partials*, full-render-needed*,
+   pending-scripts*) and Semaphore with a single LinkedBlockingQueue.
+
+   Writers (HTTP handler threads, reactive watch callbacks) enqueue typed
+   events; the renderer fiber drains them in batches via `drain!`, which
+   blocks until at least one event is available and then atomically drains
+   all pending events into a categorized map.
+
+   This eliminates all shared mutable state between producer and consumer
+   threads — the queue IS the coordination primitive."
+  (:import [java.util ArrayList]
+           [java.util.concurrent LinkedBlockingQueue]))
+
+;; ---------------------------------------------------------------------------
+;; Construction
+;; ---------------------------------------------------------------------------
+
+(defn make-queue
+  "Create a new render queue."
+  []
+  (LinkedBlockingQueue.))
+
+;; ---------------------------------------------------------------------------
+;; Producer API (thread-safe, non-blocking)
+;; ---------------------------------------------------------------------------
+
+(defn enqueue-full-render!
+  "Signal that a full page render is needed."
+  [^LinkedBlockingQueue q]
+  (.offer q {:type :full-render})
+  nil)
+
+(defn enqueue-partial!
+  "Signal that a reactive component needs re-rendering."
+  [^LinkedBlockingQueue q component-id]
+  (.offer q {:type :partial :component-id component-id})
+  nil)
+
+(defn enqueue-scripts!
+  "Queue one or more scripts for SSE delivery to the client."
+  [^LinkedBlockingQueue q scripts]
+  (doseq [s scripts]
+    (.offer q {:type :script :js s}))
+  nil)
+
+(defn enqueue-shutdown!
+  "Signal the renderer to shut down.  Unblocks a pending `drain!` call."
+  [^LinkedBlockingQueue q]
+  (.offer q {:type :shutdown})
+  nil)
+
+;; ---------------------------------------------------------------------------
+;; Consumer API (blocking, single-consumer)
+;; ---------------------------------------------------------------------------
+
+(defn drain!
+  "Block until at least one event is available, then drain all pending events.
+
+   Returns a categorized map:
+     {:shutdown?    boolean   — true if a :shutdown event was present
+      :full-render? boolean   — true if any :full-render event was present
+      :dirty-ids   #{...}    — set of component IDs needing partial render
+      :scripts     [...]}    — vector of JS strings in FIFO order
+
+   This is the only function that removes events from the queue.
+   Designed for single-consumer use (the renderer fiber)."
+  [^LinkedBlockingQueue q]
+  (let [first-event (.take q)
+        buf         (ArrayList.)]
+    (.add buf first-event)
+    (.drainTo q buf)
+    (let [n (.size buf)]
+      (loop [i        0
+             shutdown false
+             full?    false
+             ids      (transient #{})
+             scripts  (transient [])]
+        (if (< i n)
+          (let [evt (.get buf i)]
+            (case (:type evt)
+              :shutdown    (recur (inc i) true     full? ids                              scripts)
+              :full-render (recur (inc i) shutdown true  ids                              scripts)
+              :partial     (recur (inc i) shutdown full? (conj! ids (:component-id evt))  scripts)
+              :script      (recur (inc i) shutdown full? ids                              (conj! scripts (:js evt)))
+              ;; Unknown event types are silently skipped
+              (recur (inc i) shutdown full? ids scripts)))
+          {:shutdown?    shutdown
+           :full-render? full?
+           :dirty-ids    (persistent! ids)
+           :scripts      (persistent! scripts)})))))

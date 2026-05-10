@@ -4,6 +4,7 @@
             [clojure.test :refer [deftest is testing]]
             [hyper.actions :as actions]
             [hyper.render :as render]
+            [hyper.render.queue :as rq]
             [hyper.routes :as routes]
             [hyper.server :as server]
             [hyper.state :as state]
@@ -94,7 +95,10 @@
                      "Cache-Control"     "no-cache, no-transform"
                      "X-Accel-Buffering" "no"
                      "Content-Encoding"  "br"}]]]
-      (let [captured-response (atom nil)]
+      (let [captured-response (atom nil)
+            render-queue      (rq/make-queue)]
+        ;; Pre-enqueue a full render so drain! doesn't block forever
+        (rq/enqueue-full-render! render-queue)
         (with-redefs [http-kit/send! (fn [_channel response _close-after-send?]
                                        (reset! captured-response response)
                                        false)]
@@ -103,11 +107,7 @@
                                     "tab_test"
                                     ::channel
                                     compress?
-                                    (java.util.concurrent.Semaphore. 0)
-                                    (promise)
-                                    (atom #{})
-                                    (atom true)
-                                    (atom []))
+                                    render-queue)
           (is (= expected-headers
                  (:headers @captured-response))))))))
 
