@@ -6,9 +6,14 @@
    re-render.  Each component:
    - Wraps its output in a div with a stable ID
    - Watches its deps (any Watchable source) for changes
-   - Caches its last render output; returns cached HTML during full
-     renders when deps haven't changed
+   - Caches its last render output for use by partial re-renders
    - Sends a targeted Datastar fragment on partial re-render
+
+   During full page renders, reactive components always re-execute their
+   body because they may close over parent data (cursor values, function
+   arguments, watched source snapshots) that changed but isn't tracked
+   in deps.  The real performance win is the partial render path — when
+   only a dep changes, the rest of the page is untouched.
 
    Deps are reference-counted via the watch system — shared deps across
    multiple components or tabs are only disposed when the last consumer
@@ -28,14 +33,6 @@
   [app-state* tab-id component-id]
   (get-in @app-state* [:tabs tab-id :reactive-components component-id]))
 
-(defn- cache-valid?
-  "Check if the cache is still valid: same dep sources and same values."
-  [deps cached-deps cached-dep-vals]
-  (and (some? cached-dep-vals)
-       (= (count deps) (count cached-deps))
-       (every? true? (map identical? deps cached-deps))
-       (= (mapv deref deps) cached-dep-vals)))
-
 (defn- inject-id
   "Inject a reactive component ID onto hiccup.  If the element already has
    an :id, uses it as the html-id and leaves the hiccup unchanged.
@@ -51,38 +48,35 @@
       [component-id (into [tag (assoc attrs :id component-id)] children)])))
 
 (defn render-component
-  "Render a reactive component, using cache when deps are unchanged.
+  "Render a reactive component during a full page render.
 
-   During a full page render, this is called inline from the reactive macro.
-   Injects the component ID onto the returned hiccup element (or uses an
-   existing :id if present).  No wrapper div is added.
+   Called inline from the reactive macro.  Always re-executes render-fn
+   because the component body may close over parent data (cursor values,
+   function arguments, watched source snapshots) that changed since the
+   last render — and those values are not tracked as deps.
 
-   If deps haven't changed since last render, returns the cached HTML
-   without re-executing render-fn.  If deps changed, re-executes render-fn,
-   caches the result, and returns fresh hiccup."
+   The rendered HTML is cached so that `partial-render` (triggered when
+   a dep changes between full renders) can send a targeted Datastar
+   fragment without a full page re-render.  This partial render path is
+   the real performance win of reactive components.
+
+   Injects the component ID onto the returned hiccup element (or uses
+   an existing :id if present).  No wrapper div is added."
   [app-state* tab-id component-id deps render-fn]
   ;; Track this component as live in the current render
   (when-let [acc context/*registered-reactive-ids*]
     (swap! acc conj component-id))
-  (let [existing    (get-component app-state* tab-id component-id)
-        cached-deps (:deps existing)
-        dep-vals    (:dep-vals existing)
-        cached-html (:cached-html existing)]
-    (if (and cached-html (cache-valid? deps cached-deps dep-vals))
-      ;; Cache hit — return cached HTML without re-executing
-      (c/raw cached-html)
-      ;; Cache miss — render fresh
-      (let [body             (render-fn)
-            [html-id hiccup] (inject-id body component-id)
-            html             (c/html hiccup)
-            new-vals         (mapv deref deps)]
-        (swap! app-state* assoc-in [:tabs tab-id :reactive-components component-id]
-               {:render-fn   render-fn
-                :deps        deps
-                :dep-vals    new-vals
-                :cached-html html
-                :html-id     html-id})
-        hiccup))))
+  (let [body             (render-fn)
+        [html-id hiccup] (inject-id body component-id)
+        html             (c/html hiccup)
+        new-vals         (mapv deref deps)]
+    (swap! app-state* assoc-in [:tabs tab-id :reactive-components component-id]
+           {:render-fn   render-fn
+            :deps        deps
+            :dep-vals    new-vals
+            :cached-html html
+            :html-id     html-id})
+    hiccup))
 
 ;; ---------------------------------------------------------------------------
 ;; Partial render (called from renderer thread for targeted updates)

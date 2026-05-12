@@ -218,12 +218,11 @@
 
    When any dep changes, only this component re-renders and a targeted Datastar
    fragment is sent — the rest of the page is untouched.  During full page
-   re-renders, if deps haven't changed since the last render, the cached HTML
-   is returned without re-executing the body.
+   re-renders, the body is always re-executed (since it may close over parent
+   data not tracked in deps) and the result is cached for future partial renders.
 
-   Supports nesting — inner reactive blocks cache independently.  If an outer
-   block re-renders but inner deps haven't changed, the inner block returns
-   its cached HTML.
+   Supports nesting — inner reactive blocks re-execute independently during
+   partial renders triggered by their own deps.
 
    Usage:
      (let [clock* (h/global-cursor :clock)]

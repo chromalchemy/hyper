@@ -1061,8 +1061,8 @@ etc.) and a body. It:
 2. Registers watches on the deps
 3. **On dep change**: re-renders only this component and sends a targeted
    Datastar fragment — no full page re-render
-4. **On full page re-render**: checks if deps changed since last render. If
-   unchanged, returns cached HTML without re-executing the body
+4. **On full page re-render**: always re-executes the body (since the
+   component may close over parent data that changed) and caches the result
 
 ```clojure
 ;; The <p> IS the reactive element — no extra div
@@ -1086,9 +1086,9 @@ Reactive blocks can be nested. Each block caches independently:
      [:span "Updated: " @clock*])])
 ```
 
-When only `clock*` changes, just the inner `[:span ...]` re-renders. When
-`data*` changes, the outer block re-renders — but if `clock*` hasn't changed,
-the inner block returns its cached HTML without re-executing.
+When only `clock*` changes, just the inner `[:span ...]` re-renders via a
+targeted Datastar fragment — the outer block and the rest of the page are
+untouched. When a full page re-render occurs, both blocks re-execute normally.
 
 ### Cleanup
 

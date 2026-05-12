@@ -90,6 +90,30 @@
         ;; by the reactive component, but the test-page always does a full render)
         (is (str/includes? (:body-html r2) "Static: hello"))))))
 
+(deftest test-reactive-re-executes-on-full-render
+  (testing "reactive re-executes body on full render when parent data changes"
+    ;; Simulates a component like a worker row: the reactive block declares
+    ;; [clock*] as its dep (for elapsed-time display) but also reads data
+    ;; passed from the parent via closure.  When the parent data changes
+    ;; (e.g. evaluator state update) and a full re-render occurs, the
+    ;; reactive body must re-execute — returning stale cached HTML would
+    ;; show old worker status.
+    (let [clock*    (atom 0)
+          render-fn (fn [_req]
+                      (let [worker-name (or @(h/tab-cursor :worker-name) "idle")]
+                        [:div
+                         (h/reactive [clock*]
+                           [:p "Worker: " worker-name " at " @clock*])]))
+          r1        (ht/test-page render-fn)]
+      (is (str/includes? (:body-html r1) "Worker: idle at 0"))
+
+      ;; Parent data changes (worker becomes busy), but clock* (the dep)
+      ;; has NOT changed.  A full re-render must still pick up the new name.
+      (swap! (:app-state r1) assoc-in [:tabs "test-tab" :data :worker-name] "busy:dataset_a")
+      (let [r2 (ht/test-page render-fn {:app-state (:app-state r1)})]
+        (is (str/includes? (:body-html r2) "Worker: busy:dataset_a at 0")
+            "reactive body must re-execute on full render to capture parent data changes")))))
+
 (deftest test-reactive-nested
   (testing "nested reactive blocks render correctly"
     (let [result (ht/test-page
