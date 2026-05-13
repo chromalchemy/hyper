@@ -247,8 +247,11 @@
 
    An optional base-req (Ring request map) can be provided for initial
    page loads so the render function sees the full Ring request context
-   (headers, cookies, query-params, etc.).  On SSE re-renders, omit it
-   and a minimal synthetic request is built from app-state.
+   (headers, cookies, query-params, etc.).  On SSE re-renders, base-req
+   is nil and a synthetic request is built with only Hyper context keys.
+   Accessing HTTP-only keys (e.g. :cookies, :headers) on the synthetic
+   request returns nil and logs a warning, alerting developers to use
+   middleware + cursors for data that must survive re-renders.
 
    On each render, re-resolves the render-fn from live routes so that:
    - Redefining the routes Var with new inline fns picks up the new function
@@ -279,7 +282,10 @@
            url         (when route
                          (state/build-url (:path route) (:query-params route)))
            tab-env     (get-in @app-state* [:tabs tab-id :env])
-           req         (cond-> (or base-req {})
+           base        (if base-req
+                         base-req
+                         (utils/warn-on-access-map {}))
+           req         (cond-> base
                          true    (assoc :hyper/session-id session-id
                                         :hyper/tab-id     tab-id
                                         :hyper/app-state  app-state*)

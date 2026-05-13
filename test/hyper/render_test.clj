@@ -5,7 +5,9 @@
             [hyper.core :as hy]
             [hyper.render :as render]
             [hyper.state :as state]
-            [hyper.watch :as watch]))
+            [hyper.utils :as utils]
+            [hyper.watch :as watch]
+            [taoensso.telemere :as t]))
 
 (deftest test-render-fn-registration
   (testing "Render function registration and retrieval"
@@ -354,3 +356,91 @@
         (is (= 1 (tab-actions)) "Stale actions should be cleaned up, only 1 remaining"))
 
       (watch/remove-watchers! app-state* tab-id))))
+
+(deftest test-warn-on-access-map
+  (testing "Present keys work normally"
+    (let [m (utils/warn-on-access-map {:hyper/session-id "s1" :hyper/tab-id "t1"})]
+      (is (= "s1" (:hyper/session-id m)))
+      (is (= "t1" (get m :hyper/tab-id)))
+      (is (= "s1" (m :hyper/session-id)))))
+
+  (testing "Absent keys return nil"
+    (let [m (utils/warn-on-access-map {:hyper/session-id "s1"})]
+      (is (nil? (:cookies m)))
+      (is (nil? (:anything-else m)))))
+
+  (testing "Accessing absent keys logs a warning"
+    (let [m (utils/warn-on-access-map {:hyper/session-id "s1"})]
+      (let [{:keys [signals]} (t/with-signals (:cookies m))]
+        (is (= 1 (count (filter #(= :hyper.warn/http-key-in-render (:id %)) signals)))
+            "Absent key access should log a warning"))
+      (let [{:keys [signals]} (t/with-signals (:headers m))]
+        (is (= 1 (count (filter #(= :hyper.warn/http-key-in-render (:id %)) signals)))
+            "Different absent key should also log"))))
+
+  (testing "Accessing present keys does NOT log a warning"
+    (let [m                 (utils/warn-on-access-map {:hyper/session-id "s1"})
+          {:keys [signals]} (t/with-signals (:hyper/session-id m))]
+      (is (= 0 (count (filter #(= :hyper.warn/http-key-in-render (:id %)) signals)))
+          "Present keys should not log")))
+
+  (testing "get with not-found returns not-found for absent keys"
+    (let [m (utils/warn-on-access-map {})]
+      (is (= :default (get m :cookies :default)))))
+
+  (testing "assoc produces a new WarnOnAccessMap"
+    (let [m  (utils/warn-on-access-map {:hyper/session-id "s1"})
+          m2 (assoc m :hyper/router :my-router)]
+      (is (= :my-router (:hyper/router m2)))
+      (is (= "s1" (:hyper/session-id m2)))
+      (is (instance? hyper.utils.WarnOnAccessMap m2))))
+
+  (testing "dissoc produces a new WarnOnAccessMap"
+    (let [m  (utils/warn-on-access-map {:a 1 :b 2})
+          m2 (dissoc m :a)]
+      (is (= 2 (:b m2)))
+      (is (instance? hyper.utils.WarnOnAccessMap m2))))
+
+  (testing "count and seq work"
+    (let [m (utils/warn-on-access-map {:a 1 :b 2})]
+      (is (= 2 (count m)))
+      (is (= #{[:a 1] [:b 2]} (set (seq m))))))
+
+  (testing "contains? only reflects actual keys"
+    (let [m (utils/warn-on-access-map {:hyper/session-id "s1"})]
+      (is (true? (contains? m :hyper/session-id)))
+      (is (false? (contains? m :cookies)))))
+
+  (testing "prints like a regular map"
+    (let [m (utils/warn-on-access-map {:a 1 :b 2})]
+      (is (= (pr-str {:a 1 :b 2}) (pr-str m)))))
+
+  (testing "SSE re-render uses warn-on-access map"
+    (let [app-state* (atom (state/init-state))
+          session-id "test-session-warn"
+          tab-id     "test_tab_warn"
+          captured   (atom nil)
+          render-fn  (fn [req]
+                       (reset! captured req)
+                       [:div "test"])]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (render/register-render-fn! app-state* tab-id render-fn)
+      ;; SSE re-render — no base-req
+      (render/render-tab app-state* session-id tab-id)
+      (is (instance? hyper.utils.WarnOnAccessMap @captured)
+          "SSE re-render request should be a WarnOnAccessMap")))
+
+  (testing "Initial HTTP render uses a regular map"
+    (let [app-state* (atom (state/init-state))
+          session-id "test-session-http"
+          tab-id     "test_tab_http"
+          captured   (atom nil)
+          render-fn  (fn [req]
+                       (reset! captured req)
+                       [:div "test"])]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (render/register-render-fn! app-state* tab-id render-fn)
+      ;; HTTP page load — with base-req
+      (render/render-tab app-state* session-id tab-id {:uri "/" :request-method :get})
+      (is (not (instance? hyper.utils.WarnOnAccessMap @captured))
+          "HTTP page load request should be a regular map"))))

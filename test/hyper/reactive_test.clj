@@ -103,7 +103,7 @@
                       (let [worker-name (or @(h/tab-cursor :worker-name) "idle")]
                         [:div
                          (h/reactive [clock*]
-                           [:p "Worker: " worker-name " at " @clock*])]))
+                                     [:p "Worker: " worker-name " at " @clock*])]))
           r1        (ht/test-page render-fn)]
       (is (str/includes? (:body-html r1) "Worker: idle at 0"))
 
