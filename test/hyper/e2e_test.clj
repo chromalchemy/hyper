@@ -371,12 +371,15 @@
       (finally
         (stop-test-server!)))))
 
+(defn- default-test-head-var [_] [:style "v1"])
+
 (use-fixtures :each
   (fn [f]
      ;; Reset routes and app state before each test, preserving
      ;; infrastructure keys (:routes-source, :head, etc.)
      ;; that create-handler stored in the app-state atom.
     (alter-var-root #'*test-routes* (constantly (default-routes)))
+    (alter-var-root #'test-head-var (constantly default-test-head-var))
     (reset! watch-test-atom "initial")
     (reset! reactive-clock* "00:00")
     (when @test-state*
@@ -809,6 +812,110 @@
                   (Thread/sleep 100)
                   (recur)))))
           (is (= "v2" (w/text-content "style")))))
+
+      (finally
+        (close-browser! browser-info)))))
+
+;; ---------------------------------------------------------------------------
+;; Test: Head element per-element diffing (issue #42)
+;;
+;; Verifies that static/unchanged head elements are NOT removed and
+;; re-appended on SSE re-renders, preventing FOUC and script re-execution.
+;; ---------------------------------------------------------------------------
+
+(deftest ^:e2e head-element-diffing-test
+  (let [browser-info (launch-browser)
+        ctx          (new-context browser-info)
+        page         (new-page ctx)]
+    (try
+      ;; Start with a multi-element head: a style + a link
+      (alter-var-root #'test-head-var
+                      (constantly
+                        (fn [_]
+                          [[:style {:id "test-style"} ".v1{color:red}"]
+                           [:meta {:id "test-meta" :name "test" :content "value1"}]])))
+
+      (w/with-page page
+        (w/navigate (str base-url "/"))
+        (wait-for-sse)
+
+        (testing "Initial head elements are present with fingerprint attributes"
+          (Thread/sleep 500)
+          (let [style-fp (eval-js "document.getElementById('test-style')?.getAttribute('data-hyper-head')")
+                meta-fp  (eval-js "document.getElementById('test-meta')?.getAttribute('data-hyper-head')")]
+            (is (some? style-fp) "Style element should have a data-hyper-head fingerprint")
+            (is (some? meta-fp) "Meta element should have a data-hyper-head fingerprint")
+            (is (not= style-fp meta-fp) "Different elements should have different fingerprints")))
+
+        (testing "Unchanged head elements are not re-appended on re-render"
+          ;; Stamp each head element with a marker attribute to detect re-insertion.
+          ;; If the element is removed and re-appended, the marker will be lost.
+          (eval-js "document.getElementById('test-style')?.setAttribute('data-marker', 'original')")
+          (eval-js "document.getElementById('test-meta')?.setAttribute('data-marker', 'original')")
+
+          ;; Trigger a re-render by incrementing a counter (navigate to counters and back)
+          ;; Use a simpler approach: redef the routes var to force a re-render
+          (alter-var-root #'*test-routes*
+                          (constantly
+                            [["/" {:name  :home
+                                   :title "Diffing Test"
+                                   :get   (fn [_]
+                                            [:div [:h1 "Re-rendered"]])}]]))
+
+          ;; Wait for the re-render to arrive
+          (wait-for-text "h1" "Re-rendered")
+
+          ;; The head elements should still have their marker — they were NOT removed/re-appended
+          (let [style-marker (eval-js "document.getElementById('test-style')?.getAttribute('data-marker')")
+                meta-marker  (eval-js "document.getElementById('test-meta')?.getAttribute('data-marker')")]
+            (is (= "original" style-marker)
+                "Style element should NOT have been re-appended (marker preserved)")
+            (is (= "original" meta-marker)
+                "Meta element should NOT have been re-appended (marker preserved)")))
+
+        (testing "Changed head elements are swapped, unchanged ones stay"
+          ;; Mark the meta element again
+          (eval-js "document.getElementById('test-meta')?.setAttribute('data-marker', 'original2')")
+          (eval-js "document.getElementById('test-style')?.setAttribute('data-marker', 'original2')")
+
+          ;; Change ONLY the style, keep meta the same
+          (alter-var-root #'test-head-var
+                          (constantly
+                            (fn [_]
+                              [[:style {:id "test-style"} ".v2{color:blue}"]
+                               [:meta {:id "test-meta" :name "test" :content "value1"}]])))
+
+          ;; Wait for SSE re-render
+          (Thread/sleep 1500)
+
+          ;; The meta element should still have its marker (unchanged → not touched)
+          (let [meta-marker (eval-js "document.getElementById('test-meta')?.getAttribute('data-marker')")]
+            (is (= "original2" meta-marker)
+                "Unchanged meta element should NOT have been re-appended"))
+
+          ;; The style element should have new content (was removed + re-appended)
+          (let [style-marker  (eval-js "document.getElementById('test-style')?.getAttribute('data-marker')")
+                style-content (eval-js "document.getElementById('test-style')?.textContent")]
+            (is (nil? style-marker)
+                "Changed style element should have been re-appended (marker lost)")
+            (is (= ".v2{color:blue}" style-content)
+                "Style element should have the new content")))
+
+        (testing "Removed head elements are cleaned up"
+          ;; Change head to only have the style, dropping the meta
+          (alter-var-root #'test-head-var
+                          (constantly
+                            (fn [_]
+                              [:style {:id "test-style"} ".v3{color:green}"])))
+
+          (Thread/sleep 1500)
+
+          (let [meta-el       (eval-js "document.getElementById('test-meta')")
+                style-content (eval-js "document.getElementById('test-style')?.textContent")]
+            (is (nil? meta-el)
+                "Removed meta element should no longer be in the DOM")
+            (is (= ".v3{color:green}" style-content)
+                "Style element should have updated content"))))
 
       (finally
         (close-browser! browser-info)))))

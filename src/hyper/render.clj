@@ -72,11 +72,26 @@
   [html-strings]
   (apply str (map format-datastar-fragment html-strings)))
 
+(defn fingerprint
+  "Compute a short hex fingerprint for a value using Clojure's `hash`.
+   Used to give each head element a stable, content-based identity so the
+   SSE head-update JS can diff by fingerprint rather than blindly removing
+   and re-appending every element on each render cycle."
+  [v]
+  (let [h (hash v)]
+    (Long/toHexString (bit-and h 0xFFFFFFFF))))
+
 (defn mark-head-elements
-  "Add `{:data-hyper-head true}` to each top-level hiccup element in a
-   resolved :head value.  The marker lets the SSE head-update JS identify
-   which <head> children are framework-managed (vs. static meta/title/script
-   from the initial page load) so it can remove-then-append on each cycle.
+  "Add `{:data-hyper-head \"<fingerprint>\"}` to each top-level hiccup element
+   in a resolved :head value.  The fingerprint is a content-based hash of the
+   element's hiccup (excluding the data-hyper-head attr itself), giving each
+   element a stable identity.
+
+   On SSE re-renders, the head-update JS uses these fingerprints to diff
+   against what's already in the DOM: unchanged elements are left alone,
+   stale ones are removed, and only genuinely new/changed elements are
+   appended.  This avoids FOUC and prevents third-party scripts from
+   re-executing when their content hasn't changed.
 
    Handles:
    - a single vector element  `[:style ...]`
@@ -89,8 +104,9 @@
                 (let [[tag & rest]       el
                       [attrs & children] (if (map? (first rest))
                                            rest
-                                           (cons {} rest))]
-                  (into [tag (assoc attrs :data-hyper-head true)] children))
+                                           (cons {} rest))
+                      fp                 (fingerprint (into [tag attrs] children))]
+                  (into [tag (assoc attrs :data-hyper-head fp)] children))
                 el))]
       (cond
         ;; Single element like [:style "..."]
@@ -105,17 +121,26 @@
 
 (defn format-head-update
   "Build a self-removing <script> SSE event that imperatively updates
-   the document title and swaps user-provided <head> elements.
+   the document title and diffs user-provided <head> elements.
 
    Why not morph?  Morphing <head> inner content via idiomorph can
-   disconnect <style>/<link> elements from the browser's CSSOM - the
+   disconnect <style>/<link> elements from the browser's CSSOM — the
    nodes stay in the DOM but styles stop applying.  By using JS to
-   remove-then-append we guarantee the browser re-evaluates them.
+   selectively remove/append we guarantee the browser re-evaluates only
+   the elements that actually changed.
 
-   User-managed head elements are tagged with `data-hyper-head` on the
-   initial page load.  On each SSE cycle we remove all `[data-hyper-head]`
-   nodes and insert the freshly-rendered set, supporting dynamic fns,
-   cache-busted asset URLs, etc.
+   Each user-managed head element carries a `data-hyper-head` attribute
+   whose value is a content-based fingerprint (short SHA-256 hex).  On
+   each SSE cycle the emitted JS:
+   1. Collects existing fingerprints from `[data-hyper-head]` nodes in
+      the DOM.
+   2. Removes any DOM node whose fingerprint is NOT in the new set
+      (stale element).
+   3. Appends only elements whose fingerprint is NOT already in the DOM
+      (new or changed element).
+
+   This avoids FOUC and prevents third-party scripts from re-executing
+   when their content hasn't changed (issue #42).
 
    The script tag uses Datastar's `mode append` + `selector body` pattern
    (the SDK's ExecuteScript convention) with `data-effect=\"el.remove()\"`
@@ -124,10 +149,25 @@
   (let [js (str "(function(){"
                 "document.title='" (utils/escape-js-string (or title "Hyper App")) "';"
                 (when (seq extra-head-html)
-                  (str "document.querySelectorAll('[data-hyper-head]').forEach(function(el){el.remove()});"
-                       "var f=document.createRange().createContextualFragment('"
-                       (utils/escape-js-string extra-head-html) "');"
-                       "document.head.appendChild(f);"))
+                  (str
+                    ;; Build a set of new fingerprints from the rendered elements
+                    "var tmp=document.createElement('div');"
+                    "tmp.innerHTML='" (utils/escape-js-string extra-head-html) "';"
+                    "var newFps={};"
+                    "for(var i=0;i<tmp.children.length;i++){"
+                    "var fp=tmp.children[i].getAttribute('data-hyper-head');"
+                    "if(fp)newFps[fp]=tmp.children[i];"
+                    "}"
+                    ;; Remove stale elements (fingerprint not in new set)
+                    "document.querySelectorAll('[data-hyper-head]').forEach(function(el){"
+                    "var fp=el.getAttribute('data-hyper-head');"
+                    "if(!newFps[fp])el.remove();"
+                    "else delete newFps[fp];"  ;; already in DOM, skip
+                    "});"
+                    ;; Append only genuinely new/changed elements
+                    "Object.keys(newFps).forEach(function(fp){"
+                    "document.head.appendChild(newFps[fp]);"
+                    "});"))
                 "})();")]
     (str "event: datastar-patch-elements\n"
          "data: mode append\n"

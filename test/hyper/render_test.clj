@@ -147,28 +147,67 @@
           result            (render/safe-render working-render-fn req)]
       (is (= [:div [:h1 "Success"]] result)))))
 
+(deftest test-fingerprint
+  (testing "Returns a hex string"
+    (let [fp (render/fingerprint "hello")]
+      (is (string? fp))
+      (is (re-matches #"[0-9a-f]+" fp))))
+
+  (testing "Same input produces same fingerprint"
+    (is (= (render/fingerprint "body{}")
+           (render/fingerprint "body{}"))))
+
+  (testing "Different inputs produce different fingerprints"
+    (is (not= (render/fingerprint "body{}")
+              (render/fingerprint "div{}"))))
+
+  (testing "Works with hiccup data structures"
+    (let [fp (render/fingerprint [:style {} "body{}"])]
+      (is (string? fp))
+      (is (re-matches #"[0-9a-f]+" fp)))))
+
 (deftest test-mark-head-elements
-  (testing "Single element gets marked"
-    (is (= [:style {:data-hyper-head true} "body{}"]
-           (render/mark-head-elements [:style "body{}"]))))
+  (testing "Single element gets a fingerprint string"
+    (let [result (render/mark-head-elements [:style "body{}"])]
+      (is (= :style (first result)))
+      (is (string? (:data-hyper-head (second result))))
+      (is (re-matches #"[0-9a-f]+" (:data-hyper-head (second result))))
+      (is (= "body{}" (nth result 2)))))
 
-  (testing "Single element with existing attrs gets marked"
-    (is (= [:link {:rel "stylesheet" :href "/a.css" :data-hyper-head true}]
-           (render/mark-head-elements [:link {:rel "stylesheet" :href "/a.css"}]))))
+  (testing "Single element with existing attrs gets fingerprint"
+    (let [result (render/mark-head-elements [:link {:rel "stylesheet" :href "/a.css"}])]
+      (is (= :link (first result)))
+      (is (= "stylesheet" (:rel (second result))))
+      (is (= "/a.css" (:href (second result))))
+      (is (string? (:data-hyper-head (second result))))))
 
-  (testing "Sequence of elements all get marked"
-    (is (= [[:style {:data-hyper-head true} "body{}"]
-            [:link {:rel "stylesheet" :href "/b.css" :data-hyper-head true}]]
-           (render/mark-head-elements
-             [[:style "body{}"]
-              [:link {:rel "stylesheet" :href "/b.css"}]]))))
+  (testing "Sequence of elements all get fingerprints"
+    (let [result (render/mark-head-elements
+                   [[:style "body{}"]
+                    [:link {:rel "stylesheet" :href "/b.css"}]])]
+      (is (= 2 (count result)))
+      (is (string? (:data-hyper-head (second (first result)))))
+      (is (string? (:data-hyper-head (second (second result)))))))
+
+  (testing "Fingerprints are stable — same input always same fingerprint"
+    (let [result1 (render/mark-head-elements [:style "body{}"])
+          result2 (render/mark-head-elements [:style "body{}"])]
+      (is (= (:data-hyper-head (second result1))
+             (:data-hyper-head (second result2))))))
+
+  (testing "Different elements get different fingerprints"
+    (let [result (render/mark-head-elements
+                   [[:style "body{}"]
+                    [:style "div{}"]])]
+      (is (not= (:data-hyper-head (second (first result)))
+                (:data-hyper-head (second (second result)))))))
 
   (testing "nil returns nil"
     (is (nil? (render/mark-head-elements nil)))))
 
 (deftest test-head-update-format
-  (testing "Head update sends a self-removing script event"
-    (let [event (render/format-head-update "My Page" "<style data-hyper-head>body{}</style>")]
+  (testing "Head update sends a self-removing script event with per-element diffing"
+    (let [event (render/format-head-update "My Page" "<style data-hyper-head=\"abc123\">body{}</style>")]
       ;; Should be a patch-elements event
       (is (.startsWith event "event: datastar-patch-elements\n"))
       ;; Should append to body
@@ -178,15 +217,28 @@
       (is (.contains event "data: elements <script data-effect=\"el.remove()\">"))
       ;; Should set document.title
       (is (.contains event "document.title='My Page'"))
-      ;; Should include head element swap logic
-      (is (.contains event "[data-hyper-head]"))
+      ;; Should include fingerprint-based diffing logic
+      (is (.contains event "data-hyper-head"))
+      (is (.contains event "newFps") "Should build a map of new fingerprints")
+      (is (.contains event "el.remove()") "Should remove stale elements")
+      (is (.contains event "appendChild") "Should append new elements")
       ;; Should end with double newline
       (is (.endsWith event "\n\n"))))
+
   (testing "Head update without extra head content only sets title"
     (let [event (render/format-head-update "Title Only" nil)]
       (is (.contains event "document.title='Title Only'"))
-      ;; Should NOT contain head element removal/insertion JS
-      (is (not (.contains event "[data-hyper-head]"))))))
+      ;; Should NOT contain head element diffing JS
+      (is (not (.contains event "newFps")))))
+
+  (testing "Head update JS correctly handles multiple elements"
+    (let [;; Simulate two head elements with different fingerprints
+          html  (str "<style data-hyper-head=\"aaa\">body{}</style>"
+                     "<link data-hyper-head=\"bbb\" rel=\"stylesheet\" href=\"/app.css\">")
+          event (render/format-head-update "Multi" html)]
+      ;; Should contain the HTML with both fingerprints
+      (is (.contains event "aaa"))
+      (is (.contains event "bbb")))))
 
 (deftest test-lazy-hiccup-actions-in-registered-ids
   (testing "Actions inside lazy sequences (for/map) are included in registered-action-ids"
