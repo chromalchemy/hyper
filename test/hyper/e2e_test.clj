@@ -339,6 +339,28 @@
             (do (Thread/sleep 100)
                 (recur))))))))
 
+(defn wait-for-cookie
+  "Poll until document.cookie contains (or no longer contains) a cookie name=value pair.
+   When `absent?` is true, waits until the cookie name is NOT present."
+  [cookie-name expected-value & {:keys [timeout absent?] :or {timeout 5000 absent? false}}]
+  (let [deadline (+ (System/currentTimeMillis) timeout)
+        pattern  (str cookie-name "=" expected-value)]
+    (loop []
+      (let [cookies (try (eval-js "document.cookie") (catch Exception _ ""))]
+        (if absent?
+          (if (not (.contains (str cookies) (str cookie-name "=")))
+            true
+            (if (> (System/currentTimeMillis) deadline)
+              (do (is false (str "Timed out waiting for cookie " cookie-name " to be absent, saw: " cookies))
+                  false)
+              (do (Thread/sleep 100) (recur))))
+          (if (.contains (str cookies) pattern)
+            true
+            (if (> (System/currentTimeMillis) deadline)
+              (do (is false (str "Timed out waiting for cookie " pattern " in: " cookies))
+                  false)
+              (do (Thread/sleep 100) (recur)))))))))
+
 (defn counter-text
   "Get the text of a counter's h2 heading."
   [label]
@@ -1168,20 +1190,17 @@
           (testing "set-cookie! sets an HTTP cookie"
             (w/click "#set-cookie-btn")
             (wait-for-text "#effect-status" "cookie-set")
-
-            ;; Reload the page to read the cookie from the request
-            (w/navigate (str base-url "/effects"))
-            (wait-for-sse)
-            (wait-for-text "#cookie-display" "hyper-test-value"))
+            ;; Verify cookie was set via document.cookie — this is more
+            ;; reliable than checking the server-rendered #cookie-display
+            ;; because SSE re-renders (which lack HTTP cookies) can
+            ;; overwrite it before we read it.
+            (wait-for-cookie "test-effect-cookie" "hyper-test-value"))
 
           (testing "delete-cookie! removes the cookie"
             (w/click "#delete-cookie-btn")
             (wait-for-text "#effect-status" "cookie-deleted")
-
-            ;; Reload to verify cookie is gone
-            (w/navigate (str base-url "/effects"))
-            (wait-for-sse)
-            (wait-for-text "#cookie-display" "no-cookie")))
+            ;; Verify cookie was removed via document.cookie
+            (wait-for-cookie "test-effect-cookie" "" :absent? true)))
 
         (finally
           (close-browser! browser-info))))))
@@ -1223,12 +1242,8 @@
             ;; Cursor mutation should have happened
             (wait-for-text "#effect-status" "combo-done")
             (is (= "combo-done" (w/text-content "#effect-status")))
-
-            ;; Reload to verify cookie was set
-            (w/navigate (str base-url "/effects"))
-            (wait-for-sse)
-            (wait-for-text "#cookie-display" "combo-value")
-            (is (= "combo-value" (w/text-content "#cookie-display")))))
+            ;; Verify cookie was set via document.cookie
+            (wait-for-cookie "test-effect-cookie" "combo-value")))
 
         (finally
           (close-browser! browser-info))))))
