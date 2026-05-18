@@ -126,8 +126,10 @@
       (send-sse! channel br-out br-stream
                  (apply str (map effects/format-execute-script-event scripts))))
     (catch Throwable e
-      (t/error! e {:id   :hyper.error/renderer-scripts
-                   :data {:hyper/tab-id tab-id}})
+      (t/error! {:id   :hyper.error/renderer-scripts
+                 :msg  "Error while sending pending scripts"
+                 :data {:hyper/tab-id tab-id}}
+                e)
       nil)))
 
 (defn- -renderer-loop!
@@ -181,8 +183,10 @@
                                                               enqueue-partial!
                                                               channel br-out br-stream))
                                         (catch Throwable e
-                                          (t/error! e {:id   :hyper.error/renderer
-                                                       :data {:hyper/tab-id tab-id}})
+                                          (t/error! {:id   :hyper.error/renderer
+                                                     :msg  "Error rendering page"
+                                                     :data {:hyper/tab-id tab-id}}
+                                                    e)
                                           nil))
                       script-sent?    (send-pending-scripts! scripts tab-id
                                                              channel br-out br-stream)]
@@ -192,8 +196,10 @@
                     (Thread/sleep throttle-ms)
                     (recur (or current-signals last-sent-signals)))))))))
       (catch Throwable e
-        (t/error! e {:id   :hyper.error/renderer
-                     :data {:hyper/tab-id tab-id}}))
+        (t/error! {:id   :hyper.error/renderer
+                   :msg  "Error rendering page"
+                   :data {:hyper/tab-id tab-id}}
+                  e))
       (finally
         (br/close-stream br-stream)
         (when (instance? org.httpkit.server.AsyncChannel channel)
@@ -405,11 +411,11 @@
                   ;; Build response — 204 with any cookies from effects
                   response {:status 204}]
               (effects/apply-cookies-to-response response pending))
-
             (catch Exception e
-              (t/error! e
-                        {:id   :hyper.error/action-handler
-                         :data {:hyper/action-id action-id}})
+              (t/error! {:id   :hyper.error/action-handler
+                         :msg  "Error executing action handler"
+                         :data {:hyper/action-id action-id}}
+                        e)
               {:status  500
                :headers {"Content-Type" "application/json"}
                :body    (json/generate-string {:error (.getMessage e)})})
