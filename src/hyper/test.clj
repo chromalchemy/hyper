@@ -30,6 +30,7 @@
             [hyper.effects :as effects]
             [hyper.reactive :as reactive]
             [hyper.render :as render]
+            [hyper.render.error :as render.error]
             [hyper.state :as state]))
 
 (def ^:private default-session-id "test-session")
@@ -140,10 +141,11 @@
        ;; Bind context vars and render
        (push-thread-bindings (context/render-bindings req app-state*))
        (try
-         (let [mw-handler (render/apply-render-middleware handler (:render-middleware opts))
-               body       (render/safe-render mw-handler req)
+         (let [mw-handler      (render/apply-render-middleware handler (:render-middleware opts))
+               render-error-fn (or (get @app-state* :render-error) render.error/minimal)
+               body            (render/safe-render mw-handler req render-error-fn)
                ;; Ring response passthrough
-               ring?      (and (map? body) (:status body))]
+               ring?           (and (map? body) (:status body))]
            (if ring?
              body
              (let [declared     @context/*declared-signals*

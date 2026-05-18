@@ -4,6 +4,7 @@
             [hyper.context]
             [hyper.core :as hy]
             [hyper.render :as render]
+            [hyper.render.error :as render.error]
             [hyper.state :as state]
             [hyper.utils :as utils]
             [hyper.watch :as watch]
@@ -132,21 +133,41 @@
             "All items in lazy seq should see *request* bindings")))))
 
 (deftest test-error-boundary
-  (testing "safe-render catches errors and renders error fragment"
+  (testing "safe-render delegates to the supplied render-error-fn"
     (let [failing-render-fn (fn [_req] (throw (ex-info "Test error" {})))
           req               {:hyper/session-id "test-session"
-                             :hyper/tab-id     "test_tab"}
-          result            (render/safe-render failing-render-fn req)]
-      ;; Should return hiccup, not throw
-      (is (vector? result))
-      ;; Should contain error information
-      (is (re-find #"Render Error" (str result)))))
+                             :hyper/tab-id     "test_tab"}]
+      (testing "with minimal renderer (production-safe)"
+        (let [result (render/safe-render failing-render-fn req render.error/minimal)]
+          (is (vector? result))
+          (is (re-find #"Something went wrong" (str result)))
+          ;; Minimal must NOT leak the exception message
+          (is (not (re-find #"Test error" (str result))))))
+
+      (testing "with explain renderer (dev-only)"
+        (let [result (render/safe-render failing-render-fn req render.error/explain)]
+          (is (vector? result))
+          (is (re-find #"Render Error" (str result)))
+          ;; Explain includes message and stack trace
+          (is (re-find #"Test error" (str result)))
+          (is (re-find #"at .+\(" (str result))
+              "Should contain stack-trace frames")))
+
+      (testing "with a custom renderer"
+        (let [custom-fn (fn [e _req] [:div.custom-error (ex-message e)])
+              result    (render/safe-render failing-render-fn req custom-fn)]
+          (is (= [:div.custom-error "Test error"] result))))
+
+      (testing "with a Var pointing at a renderer (REPL redefinition support)"
+        (let [result (render/safe-render failing-render-fn req #'render.error/minimal)]
+          (is (vector? result))
+          (is (re-find #"Something went wrong" (str result)))))))
 
   (testing "safe-render returns result when render succeeds"
     (let [working-render-fn (fn [_req] [:div [:h1 "Success"]])
           req               {:hyper/session-id "test-session"
                              :hyper/tab-id     "test_tab"}
-          result            (render/safe-render working-render-fn req)]
+          result            (render/safe-render working-render-fn req render.error/minimal)]
       (is (= [:div [:h1 "Success"]] result)))))
 
 (deftest test-fingerprint

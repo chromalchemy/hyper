@@ -207,23 +207,20 @@
           children)))
     hiccup))
 
-(defn render-error-fragment
-  "Render an error message as hiccup."
-  [error]
-  [:div {:style "padding: 20px; font-family: sans-serif; background: #fee; border: 1px solid #fcc; border-radius: 4px; margin: 20px;"}
-   [:h2 {:style "color: #c00; margin-top: 0;"} "Render Error"]
-   [:p "An error occurred while rendering this view:"]
-   [:pre {:style "background: #fff; padding: 10px; border-radius: 4px; overflow: auto;"}
-    (str error)]])
-
 (defn safe-render
-  "Safely render a view with error boundary."
-  [render-fn req]
+  "Safely render a view with an error boundary.
+
+   On exception, logs via telemere and delegates UI rendering to
+   `render-error-fn`, a function `(fn [error req] -> hiccup)`.  The fn is
+   invoked as an `IFn`, so a Var pointing at a renderer (e.g.
+   `#'my.app/error-page`) works transparently and picks up redefinitions
+   without restarting the server."
+  [render-fn req render-error-fn]
   (try
     (render-fn req)
     (catch Exception e
       (t/error! e {:id :hyper.error/render})
-      (render-error-fragment e))))
+      (render-error-fn e req))))
 
 (defn render-tab
   "Render the current view for a tab and return the rendered data.
@@ -295,9 +292,10 @@
                          true    (dissoc :reitit.core/match))]
        (push-thread-bindings (context/render-bindings req app-state*))
        (try
-         (let [mw-chain   (resolve-render-middleware app-state* route-index route)
-               wrapped-fn (apply-render-middleware render-fn mw-chain)
-               raw-body   (safe-render wrapped-fn req)]
+         (let [mw-chain        (resolve-render-middleware app-state* route-index route)
+               wrapped-fn      (apply-render-middleware render-fn mw-chain)
+               render-error-fn (get @app-state* :render-error)
+               raw-body        (safe-render wrapped-fn req render-error-fn)]
            ;; Ring response passthrough - render-fn returned a redirect,
            ;; error, or other non-hiccup response; pass it through as-is.
            (if (and (map? raw-body) (:status raw-body))

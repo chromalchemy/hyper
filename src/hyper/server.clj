@@ -12,6 +12,7 @@
             [hyper.effects :as effects]
             [hyper.reactive :as reactive]
             [hyper.render :as render]
+            [hyper.render.error :as render.error]
             [hyper.render.queue :as rq]
             [hyper.routes :as routes]
             [hyper.signal :as signal]
@@ -704,12 +705,21 @@
                         Each is (fn [handler] (fn [req] ...)), identical to Ring
                         middleware.  Runs outermost (before per-route middleware).
                         Applied on both initial HTTP page loads and SSE re-renders.
+   - :render-error      Function `(fn [error req] -> hiccup)` rendered in place
+                        of a view whose render-fn threw.  May be a Var (e.g.
+                        `#'my.app/error-page`) to pick up redefinitions without
+                        restarting the server.  Defaults to
+                        `hyper.render.error/minimal` (generic, production-safe).
+                        Use `hyper.render.error/explain` in development to see
+                        the message, ex-data, and full stack trace.
 
    Routes should use :get handlers that return hiccup (Chassis vectors).
    Hyper will wrap them to provide full HTML responses and SSE connections."
   ([routes app-state*]
    (create-handler routes app-state* {:datastar-script (default-datastar-script)}))
-  ([routes app-state* {:keys [watches head base-path middleware render-middleware] :as opts}]
+  ([routes app-state* {:keys [watches head base-path middleware render-middleware render-error]
+                       :or   {render-error render.error/minimal}
+                       :as   opts}]
    (let [base-path       (or base-path "")
          page-wrapper    (page-handler app-state* (assoc opts :base-path base-path))
          system-routes   [[(str base-path "/hyper/events") {:get (sse-events-handler app-state*)}]
@@ -720,12 +730,15 @@
          ;; Store global :watches so find-route-watches can prepend them to
          ;; every page route's watch list. Auto-watch :head if it's a Var.
          ;; Store base-path so actions and navigate can reference prefixed URLs.
+         ;; :render-error is stored as-is (fn or Var); render-tab invokes it
+         ;; via IFn so a Var picks up redefinitions on each call.
          _               (swap! app-state* assoc
                                 :routes-source routes
                                 :global-watches (vec watches)
                                 :head head
                                 :base-path base-path
-                                :render-middleware (vec render-middleware))
+                                :render-middleware (vec render-middleware)
+                                :render-error render-error)
          initial-routes  (if (var? routes) @routes routes)
          initial-handler (build-ring-handler initial-routes app-state* page-wrapper system-routes)
          handler         (if (var? routes)

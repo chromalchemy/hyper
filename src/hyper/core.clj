@@ -516,6 +516,12 @@
                           Each is (fn [handler] (fn [req] ...)), identical to Ring
                           middleware.  Applied on both initial page loads and SSE
                           re-renders.  Per-route :render-middleware wraps inside these.
+   - :render-error      — Function `(fn [error req] -> hiccup)` rendered when a
+                          view's render-fn throws.  May be a Var to pick up
+                          redefinitions without restarting the server.  Defaults
+                          to `hyper.render.error/minimal` (generic, production-
+                          safe).  Use `hyper.render.error/explain` in development
+                          to render the message, ex-data, and full stack trace.
 
    The request key :hyper/env is reserved for application-provided context.
    Ring middleware that sets :hyper/env on the request will have it automatically
@@ -548,18 +554,22 @@
      ;; Later...
      (stop! app)"
   [routes & {:keys [app-state head static-resources static-dir watches
-                    datastar-script base-path middleware render-middleware]
+                    datastar-script base-path middleware render-middleware
+                    render-error]
              :or   {app-state       (atom (state/init-state))
                     datastar-script server/default-datastar-script}}]
   (server/create-handler routes app-state
-                         {:head              head
-                          :datastar-script   datastar-script
-                          :static-resources  static-resources
-                          :static-dir        static-dir
-                          :watches           watches
-                          :base-path         base-path
-                          :middleware        middleware
-                          :render-middleware render-middleware}))
+                         (cond-> {:head              head
+                                  :datastar-script   datastar-script
+                                  :static-resources  static-resources
+                                  :static-dir        static-dir
+                                  :watches           watches
+                                  :base-path         base-path
+                                  :middleware        middleware
+                                  :render-middleware render-middleware}
+                           ;; Only forward when supplied so server-level
+                           ;; default (`render.error/minimal`) applies otherwise.
+                           render-error (assoc :render-error render-error))))
 
 (defn start!
   "Start the hyper application server.
