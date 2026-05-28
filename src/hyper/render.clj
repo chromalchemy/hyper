@@ -219,7 +219,7 @@
   (try
     (render-fn req)
     (catch Exception e
-      (t/error! e {:id :hyper.error/render})
+      (t/error! {:id :hyper.error/render} e)
       (render-error-fn e req))))
 
 (defn render-tab
