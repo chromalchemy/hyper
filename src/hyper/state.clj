@@ -13,7 +13,9 @@
     :router <reitit-router>
     :routes <original-routes-vector>
     :routes-source <var-or-routes-vector>}"
-  (:require [clojure.string]))
+  (:require [clojure.string]
+            [hyper.context :as context]
+            [hyper.utils :as utils]))
 
 (defn normalize-path
   "Convert keyword or vector to vector path."
@@ -25,7 +27,9 @@
 (deftype Cursor [parent-atom full-path meta-data ^:volatile-mutable validator watches]
   clojure.lang.IRef
   (deref [_]
-    (get-in @parent-atom full-path))
+    (if-let [{state* :state*} context/*state-overlay*]
+      (get-in @state* full-path)
+      (get-in @parent-atom full-path)))
 
   (setValidator [_ vf]
     (set! validator vf))
@@ -52,37 +56,60 @@
     _this)
 
   clojure.lang.IAtom
-  (swap [_this f]
-    (swap! parent-atom update-in full-path f)
-    (get-in @parent-atom full-path))
+  (swap [_ f]
+    (if-let [{state* :state* paths* :paths*} context/*state-overlay*]
+      (let [new-val (get-in (swap! state* update-in full-path f) full-path)]
+        (swap! paths* conj full-path)
+        new-val)
+      (get-in (swap! parent-atom update-in full-path f) full-path)))
 
-  (swap [_this f arg]
-    (swap! parent-atom update-in full-path f arg)
-    (get-in @parent-atom full-path))
+  (swap [_ f arg]
+    (if-let [{state* :state* paths* :paths*} context/*state-overlay*]
+      (let [new-val (get-in (swap! state* update-in full-path f arg) full-path)]
+        (swap! paths* conj full-path)
+        new-val)
+      (get-in (swap! parent-atom update-in full-path f arg) full-path)))
 
-  (swap [_this f arg1 arg2]
-    (swap! parent-atom update-in full-path f arg1 arg2)
-    (get-in @parent-atom full-path))
+  (swap [_ f arg1 arg2]
+    (if-let [{state* :state* paths* :paths*} context/*state-overlay*]
+      (let [new-val (get-in (swap! state* update-in full-path f arg1 arg2) full-path)]
+        (swap! paths* conj full-path)
+        new-val)
+      (get-in (swap! parent-atom update-in full-path f arg1 arg2) full-path)))
 
-  (swap [_this f arg1 arg2 args]
-    (apply swap! parent-atom update-in full-path f arg1 arg2 args)
-    (get-in @parent-atom full-path))
+  (swap [_ f arg1 arg2 args]
+    (if-let [{state* :state* paths* :paths*} context/*state-overlay*]
+      (let [new-val (get-in (apply swap! state* update-in full-path f arg1 arg2 args) full-path)]
+        (swap! paths* conj full-path)
+        new-val)
+      (get-in (apply swap! parent-atom update-in full-path f arg1 arg2 args) full-path)))
 
   (compareAndSet [_ oldv newv]
-    (loop []
-      (let [current-state @parent-atom
-            current-val   (get-in current-state full-path)]
+    (if-let [{state* :state* paths* :paths*} context/*state-overlay*]
+      (let [current-val (get-in @state* full-path)]
         (if (= current-val oldv)
-          (if (compare-and-set! parent-atom
-                                current-state
-                                (assoc-in current-state full-path newv))
-            true
-            (recur))
-          false))))
+          (do (swap! state* assoc-in full-path newv)
+              (swap! paths* conj full-path)
+              true)
+          false))
+      (loop []
+        (let [current-state @parent-atom
+              current-val   (get-in current-state full-path)]
+          (if (= current-val oldv)
+            (if (compare-and-set! parent-atom
+                                  current-state
+                                  (assoc-in current-state full-path newv))
+              true
+              (recur))
+            false)))))
 
-  (reset [_this newv]
-    (swap! parent-atom assoc-in full-path newv)
-    newv)
+  (reset [_ newv]
+    (if-let [{state* :state* paths* :paths*} context/*state-overlay*]
+      (do (swap! state* assoc-in full-path newv)
+          (swap! paths* conj full-path)
+          newv)
+      (do (swap! parent-atom assoc-in full-path newv)
+          newv)))
 
   clojure.lang.IMeta
   (meta [_] @meta-data)
@@ -199,24 +226,15 @@
 
 (defn parse-query-string
   "Parse a query string into a keyword-keyed map with URL-decoded values.
-   Returns nil if query-string is nil."
+   Returns nil if query-string is nil.
+   Delegates to hyper.utils/parse-query-string."
   [query-string]
-  (when query-string
-    (into {}
-          (map (fn [pair]
-                 (let [[k v] (clojure.string/split pair #"=" 2)]
-                   [(keyword (java.net.URLDecoder/decode k "UTF-8"))
-                    (java.net.URLDecoder/decode (or v "") "UTF-8")])))
-          (clojure.string/split query-string #"&"))))
+  (utils/parse-query-string query-string))
 
 (defn build-url
   "Build a URL string from a path and query params map.
-   Returns path if no query params."
+   Omits query params with nil values.
+   Returns path if no query params remain.
+   Delegates to hyper.utils/build-url."
   [path query-params]
-  (if (or (nil? query-params) (empty? query-params))
-    path
-    (let [query-string (->> query-params
-                            (map (fn [[k v]]
-                                   (str (name k) "=" (java.net.URLEncoder/encode (str v) "UTF-8"))))
-                            (clojure.string/join "&"))]
-      (str path "?" query-string))))
+  (utils/build-url path query-params))

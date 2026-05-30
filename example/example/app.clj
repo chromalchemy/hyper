@@ -1,5 +1,6 @@
 (ns example.app
   (:require [hyper.core :as h]
+            [hyper.effects :as effects]
             [hyper.state]))
 
 ;; ---------------------------------------------------------------------------
@@ -15,7 +16,11 @@
     " · "
     [:a (h/navigate :counters) "Cursors (via counters)"]
     " · "
-    [:a (h/navigate :forms) "Forms & Inputs"]]
+    [:a (h/navigate :forms) "Forms & Inputs"]
+    " · "
+    [:a (h/navigate :signals) "Signals"]
+    " · "
+    [:a (h/navigate :effects) "Effects"]]
    [:h1 title]
    children])
 
@@ -67,6 +72,7 @@
           (result [label content]
             [:p label [:strong content]])]
     (let [text*    (h/tab-cursor :text "")
+          value*   (h/tab-cursor :value "")
           checked* (h/tab-cursor :dark-mode false)
           key*     (h/tab-cursor :last-key "")
           select*  (h/tab-cursor :color "red")
@@ -112,6 +118,13 @@
                        :data-on:keydown (h/action (reset! (h/tab-cursor :last-key) $key))}]
               (result "Last key: " (if (seq @key*) @key* "none yet")))
 
+        (card "Javascript injection — client side await for Enter keystroke"
+              "Await the Enter keystroke to send the input value to the server."
+              [:input {:type            "text"
+                       :placeholder     "Type something…"
+                       :data-on:keydown (h/action {:when "evt.key === 'Enter'"} (reset! (h/tab-cursor :value) $value))}]
+              (result "Server sees: " (if (seq @value*) @value* "nothing yet")))
+
         ;; $form-data — form submission
         (card "$form-data — Form Submission"
               "Submit the form. All named fields are sent as a map via $form-data."
@@ -129,6 +142,142 @@
                  [:strong "Server received:"]
                  [:pre (pr-str @form*)]]))))))
 ;; ---------------------------------------------------------------------------
+;; Signals
+;; ---------------------------------------------------------------------------
+
+(defn signals-page [_]
+  (letfn [(card [title desc & children]
+            [:div.card [:h3 title] [:p.muted desc] children])
+          (result [label content]
+            [:p label [:strong content]])]
+    (let [name*  (h/signal :user-name "")
+          open?* (h/local-signal :open false)
+          saved* (h/tab-cursor :saved-name "")]
+      (layout
+        "Signals"
+        [:p "Signals are client-side reactive state managed by Datastar. "
+         "They sync between the browser and server seamlessly."]
+
+        ;; data-bind + data-text — pure client-side reactivity
+        (card "data-bind + data-text"
+              "Type below. The signal updates client-side instantly via data-bind."
+              [:input {:data-bind name* :placeholder "Your name…"}]
+              [:p "Hello, " [:span {:data-text @name*}]])
+
+        ;; Reading signal in action — signal + server round-trip
+        (card "Reading signals in actions"
+              "Click Save. The action reads the signal value on the server."
+              [:button {:data-on:click (h/action
+                                         (reset! (h/tab-cursor :saved-name) @name*))}
+               "Save name"]
+              (result "Server saved: " (if (seq @saved*) @saved* "nothing yet")))
+
+        ;; Reading signal in action with client params — both work together
+        (card "Signals + client params"
+              "Client params ($value) and signals work together in the same action."
+              [:input {:type        "text"
+                       :placeholder "Type and tab away…"
+                       :data-on:change
+                       (h/action
+                         (reset! (h/tab-cursor :saved-name)
+                                 (str @name* " (input: " $value ")")))}]
+              (result "Combined saved: " (if (seq @saved*) @saved* "nothing yet")))
+
+        ;; reset! signal from server — push update to client
+        (card "Server-side signal reset"
+              "Click Clear. The server resets the signal, pushing the change to the browser."
+              [:button {:data-on:click (h/action (reset! name* ""))} "Clear name"]
+              (result "Signal value: " [:span {:data-text @name*} ""]))
+
+        ;; Async signal update — works outside action handlers
+        (card "Async signal update"
+              "Click Start. The action kicks off a background thread that updates the signal after a delay, showing that signals can be updated outside of a handler."
+              [:button {:data-on:click
+                        (h/action
+                          (future
+                            (Thread/sleep 1000)
+                            (reset! name* "Updated from background thread!")))}
+               "Start"]
+              (result "Signal value: " [:span {:data-text @name*} ""]))
+
+        ;; Local signal — client-only toggle
+        (card "Local signal (client-only)"
+              "Local signals never leave the browser. Toggle without a server round-trip."
+              [:button {:data-on:click (str @open?* " = !" @open?*)} "Toggle"]
+              [:div {:data-show @open?* :style "display:none"}
+               [:p "👋 This content is toggled by a local signal."]])))))
+
+;; ---------------------------------------------------------------------------
+;; Effects
+;; ---------------------------------------------------------------------------
+
+(defn effects-page [_]
+  (letfn [(card [title desc & children]
+            [:div.card [:h3 title] [:p.muted desc] children])
+          (result [label content]
+            [:p label [:strong content]])]
+    (let [_items* (h/tab-cursor :items [])
+          cookie* (h/tab-cursor :last-cookie "none")]
+      (layout
+        "Effects"
+        [:p "Effects are escape hatches for actions that need to do more "
+         "than mutate cursors: navigation, cookies, and client-side scripts."]
+
+        ;; navigate! — create item then navigate to confirmation
+        (card "navigate! — Redirect after action"
+              "Click Create to save a new item and navigate to the home page."
+              [:button {:data-on:click
+                        (h/action {:as "create-and-navigate"}
+                                  (swap! (h/tab-cursor :items) conj
+                                         {:id   (count @(h/tab-cursor :items))
+                                          :name "New Item"})
+                                  (effects/navigate! :home))}
+               "Create & Navigate Home"])
+
+        ;; set-cookie! / delete-cookie!
+        (card "set-cookie! / delete-cookie! — HTTP cookies"
+              "Set or delete a cookie. The cookie value is read from the request on each render."
+              [:button {:data-on:click
+                        (h/action {:as "set-cookie"}
+                                  (effects/set-cookie! "example-pref" "dark-mode"
+                                                       {:max-age (* 60 60 24)})
+                                  (reset! (h/tab-cursor :last-cookie) "dark-mode"))}
+               "Set Cookie"]
+              " "
+              [:button {:data-on:click
+                        (h/action {:as "delete-cookie"}
+                                  (effects/delete-cookie! "example-pref")
+                                  (reset! (h/tab-cursor :last-cookie) "deleted"))}
+               "Delete Cookie"]
+              (result "Cookie status: " @cookie*))
+
+        ;; execute-script! — client-side JS
+        (card "execute-script! — Client-side JavaScript"
+              "Run arbitrary JS on the client. Use sparingly — most UI is better as cursors."
+              [:input {:id "focus-target" :type "text" :placeholder "I'll get focused..."}]
+              [:br]
+              [:button {:data-on:click
+                        (h/action {:as "focus-input"}
+                                  (effects/execute-script! "document.getElementById('focus-target').focus()"))}
+               "Focus the input"]
+              " "
+              [:button {:data-on:click
+                        (h/action {:as "scroll-top"}
+                                  (effects/execute-script! "window.scrollTo({top: 0, behavior: 'smooth'})"))}
+               "Scroll to top"])
+
+        ;; Multiple effects in one action
+        (card "Multiple effects — composing effects"
+              "A single action can emit multiple effects."
+              [:button {:data-on:click
+                        (h/action {:as "multi-effect"}
+                                  (effects/set-cookie! "multi-test" "combined"
+                                                       {:max-age 3600})
+                                  (effects/execute-script! "console.log('Effects composed!')")
+                                  (reset! (h/tab-cursor :last-cookie) "combined"))}
+               "Set cookie + run script"])))))
+
+;; ---------------------------------------------------------------------------
 ;; Routes
 ;; ---------------------------------------------------------------------------
 
@@ -144,7 +293,15 @@
    ["/forms"
     {:name  :forms
      :title "Forms & Inputs"
-     :get   #'forms-page}]])
+     :get   #'forms-page}]
+   ["/signals"
+    {:name  :signals
+     :title "Signals"
+     :get   #'signals-page}]
+   ["/effects"
+    {:name  :effects
+     :title "Effects"
+     :get   #'effects-page}]])
 
 ;; ---------------------------------------------------------------------------
 ;; Styles

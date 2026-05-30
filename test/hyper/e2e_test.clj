@@ -8,6 +8,7 @@
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing use-fixtures]]
             [hyper.core :as h]
+            [hyper.effects :as effects]
             [hyper.state :as state]
             [wally.main :as w])
   (:import (com.microsoft.playwright Playwright BrowserType$LaunchOptions)))
@@ -82,6 +83,127 @@
       (when @form*
         [:pre#form-result (pr-str @form*)])]]))
 
+(defn signals-get [_]
+  (let [name*  (h/signal :user-name "")
+        saved* (h/tab-cursor :saved-name "")]
+    [:div
+     [:h1 "Test Signals"]
+
+     ;; data-bind + data-text — client-side reactivity
+     [:div#bind-demo
+      [:input#name-input {:data-bind name* :placeholder "Name"}]
+      [:span#name-display {:data-text (str "$" name*)} ""]]
+
+     ;; Read signal in action
+     [:div#read-demo
+      [:button#save-btn {:data-on:click (h/action
+                                          (reset! (h/tab-cursor :saved-name) @name*))}
+       "Save"]
+      [:span#saved-result (if (seq @saved*) @saved* "empty")]]
+
+     ;; Signal + client params together
+     [:div#combined-demo
+      [:input#combined-input {:type "text"
+                              :data-on:change
+                              (h/action
+                                (reset! (h/tab-cursor :saved-name)
+                                        (str "signal=" @name* ",input=" $value)))}]
+      [:span#combined-result (if (seq @saved*) @saved* "empty")]]
+
+     ;; Reset signal from server
+     [:div#reset-demo
+      [:button#clear-btn {:data-on:click (h/action (reset! name* ""))} "Clear"]
+      [:span#reset-display {:data-text (str "$" name*)} ""]]
+
+     ;; Async signal update — works outside action handlers
+     [:div#async-demo
+      [:button#async-btn {:data-on:click
+                          (h/action
+                            (let [n name*]
+                              (future
+                                (Thread/sleep 500)
+                                (reset! n "async-update"))))}
+       "Start"]
+      [:span#async-display {:data-text (str "$" name*)} ""]]]))
+
+;; Shared atom for testing reactive components — mutated from test code
+;; to verify partial re-renders via SSE.
+(def ^:private reactive-clock* (atom "00:00"))
+
+(defn- reactive-get [_]
+  (h/watch! reactive-clock*)
+  (let [count*  (h/tab-cursor :count 0)
+        static* (h/tab-cursor :static "initial")]
+    [:div
+     [:h1 "Reactive Test"]
+     ;; Non-reactive part — only updates on full re-render
+     [:span#static-value @static*]
+     ;; Reactive component watching the shared clock atom
+     (h/reactive [reactive-clock*]
+                 [:span#clock-value @reactive-clock*])
+     ;; Counter to trigger full re-renders
+     [:span#counter-value @count*]
+     [:button#inc-btn {:data-on:click (h/action (swap! (h/tab-cursor :count) inc))} "+"]
+     ;; Reactive component with user-provided ID
+     [:div#user-id-section
+      (h/reactive [count*]
+                  [:span {:id "custom-reactive"} "Count: " @count*])]]))
+
+;; Shared atom for testing watch! bootstrap — mutated from test code
+;; to verify that server-side changes trigger SSE re-renders.
+(def ^:private watch-test-atom (atom "initial"))
+
+(defn- watch-bootstrap-get [_]
+  (h/watch! watch-test-atom)
+  [:div
+   [:h1 "Watch Bootstrap"]
+   [:span#watch-value @watch-test-atom]])
+
+(defn- effects-get [req]
+  (let [cookie-val (get-in req [:cookies "test-effect-cookie" :value])
+        status*    (h/tab-cursor :effect-status "none")]
+    [:div
+     [:h1 "Effects Test"]
+
+     ;; navigate! test — button that navigates to home
+     [:button#nav-btn {:data-on:click (h/action (effects/navigate! :home))} "Navigate Home"]
+
+     ;; set-cookie! test — button that sets a cookie
+     [:button#set-cookie-btn
+      {:data-on:click (h/action
+                        (effects/set-cookie! "test-effect-cookie" "hyper-test-value"
+                                             {:max-age 3600})
+                        (reset! (h/tab-cursor :effect-status) "cookie-set"))}
+      "Set Cookie"]
+
+     ;; delete-cookie! test — button that deletes the cookie
+     [:button#delete-cookie-btn
+      {:data-on:click (h/action
+                        (effects/delete-cookie! "test-effect-cookie")
+                        (reset! (h/tab-cursor :effect-status) "cookie-deleted"))}
+      "Delete Cookie"]
+
+     ;; execute-script! test — button that runs JS
+     [:button#script-btn
+      {:data-on:click (h/action
+                        (effects/execute-script!
+                          "document.getElementById('script-result').textContent = 'executed'"))}
+      "Run Script"]
+
+     ;; Display areas
+     [:span#effect-status @status*]
+     [:span#cookie-display (or cookie-val "no-cookie")]
+     [:span#script-result "pending"]
+
+     ;; Combined: set cookie + execute-script
+     [:button#combo-btn
+      {:data-on:click (h/action
+                        (effects/set-cookie! "test-effect-cookie" "combo-value" {:max-age 3600})
+                        (effects/execute-script!
+                          "document.getElementById('script-result').textContent = 'combo-executed'")
+                        (reset! (h/tab-cursor :effect-status) "combo-done"))}
+      "Cookie + Script"]]))
+
 (defn default-routes []
   [["/" {:name  :home
          :title "Home"
@@ -97,7 +219,23 @@
    ["/forms"
     {:name  :forms
      :title "Forms"
-     :get   #'forms-get}]])
+     :get   #'forms-get}]
+   ["/signals"
+    {:name  :signals
+     :title "Signals"
+     :get   #'signals-get}]
+   ["/watch-bootstrap"
+    {:name  :watch-bootstrap
+     :title "Watch Bootstrap"
+     :get   #'watch-bootstrap-get}]
+   ["/reactive"
+    {:name  :reactive
+     :title "Reactive"
+     :get   #'reactive-get}]
+   ["/effects"
+    {:name  :effects
+     :title "Effects"
+     :get   #'effects-get}]])
 
 (def ^:dynamic *test-routes* (default-routes))
 
@@ -201,6 +339,28 @@
             (do (Thread/sleep 100)
                 (recur))))))))
 
+(defn wait-for-cookie
+  "Poll until document.cookie contains (or no longer contains) a cookie name=value pair.
+   When `absent?` is true, waits until the cookie name is NOT present."
+  [cookie-name expected-value & {:keys [timeout absent?] :or {timeout 5000 absent? false}}]
+  (let [deadline (+ (System/currentTimeMillis) timeout)
+        pattern  (str cookie-name "=" expected-value)]
+    (loop []
+      (let [cookies (try (eval-js "document.cookie") (catch Exception _ ""))]
+        (if absent?
+          (if (not (.contains (str cookies) (str cookie-name "=")))
+            true
+            (if (> (System/currentTimeMillis) deadline)
+              (do (is false (str "Timed out waiting for cookie " cookie-name " to be absent, saw: " cookies))
+                  false)
+              (do (Thread/sleep 100) (recur))))
+          (if (.contains (str cookies) pattern)
+            true
+            (if (> (System/currentTimeMillis) deadline)
+              (do (is false (str "Timed out waiting for cookie " pattern " in: " cookies))
+                  false)
+              (do (Thread/sleep 100) (recur)))))))))
+
 (defn counter-text
   "Get the text of a counter's h2 heading."
   [label]
@@ -233,12 +393,17 @@
       (finally
         (stop-test-server!)))))
 
+(defn- default-test-head-var [_] [:style "v1"])
+
 (use-fixtures :each
   (fn [f]
      ;; Reset routes and app state before each test, preserving
      ;; infrastructure keys (:routes-source, :head, etc.)
      ;; that create-handler stored in the app-state atom.
     (alter-var-root #'*test-routes* (constantly (default-routes)))
+    (alter-var-root #'test-head-var (constantly default-test-head-var))
+    (reset! watch-test-atom "initial")
+    (reset! reactive-clock* "00:00")
     (when @test-state*
       (swap! @test-state*
              (fn [old-state]
@@ -480,10 +645,54 @@
           (w/click "#form-submit")
           (w/wait-for "#form-result" {:state :visible :timeout 5000})
           (let [result (w/text-content "#form-result")]
-            (is (.contains result ":name"))
+            (is (.contains result "name"))
             (is (.contains result "Alice"))
-            (is (.contains result ":email"))
+            (is (.contains result "email"))
             (is (.contains result "alice@example.com")))))
+
+      (finally
+        (close-browser! browser-info)))))
+
+;; ---------------------------------------------------------------------------
+;; Test 5: History restore reloads stale documents
+;; ---------------------------------------------------------------------------
+
+(deftest ^:e2e history-restore-reload-test
+  (let [browser-info (launch-browser)
+        ctx          (new-context browser-info)
+        page         (new-page ctx)]
+    (try
+      (w/with-page page
+        (w/navigate (str base-url "/counters"))
+        (wait-for-sse)
+        (wait-for-text "#counter-Session h2" "Session: 0")
+
+        (let [initial-action (eval-js "document.querySelector('#counter-Session .inc').getAttribute('data-on:click')")]
+          (click-counter-button "Session" ".inc")
+          (wait-for-text "#counter-Session h2" "Session: 1")
+
+          ;; Leave the Hyper document, then use browser history to return.
+          (.navigate page "data:text/html,<title>Away</title><h1>Away</h1>")
+          (is (= "Away" (w/text-content "h1")))
+          (.goBack page)
+
+          ;; The restored document should reload and register fresh actions.
+          (let [deadline (+ (System/currentTimeMillis) 10000)]
+            (loop []
+              (let [current-action (try (eval-js "document.querySelector('#counter-Session .inc') && document.querySelector('#counter-Session .inc').getAttribute('data-on:click')")
+                                        (catch Exception _ nil))]
+                (if (and current-action (not= initial-action current-action))
+                  (is true)
+                  (if (> (System/currentTimeMillis) deadline)
+                    (is (and current-action (not= initial-action current-action))
+                        (str "Expected Session increment action to change after history restore, but still saw " (pr-str current-action)))
+                    (do (Thread/sleep 100)
+                        (recur)))))))
+
+          (w/wait-for "#hyper-app" {:state :visible :timeout 10000})
+          (wait-for-text "#counter-Session h2" "Session: 1")
+          (click-counter-button "Session" ".inc")
+          (wait-for-text "#counter-Session h2" "Session: 2")))
 
       (finally
         (close-browser! browser-info)))))
@@ -578,8 +787,22 @@
 
           (is (= "Live Reloaded!" (w/text-content "h1")))
           (is (= "This content was hot-swapped"
-                 (w/text-content "#reloaded-marker")))))
+                 (w/text-content "#reloaded-marker"))))
 
+        ;; Test that content with newlines renders correctly
+        (testing "Content with newlines preserved in route handler"
+          (alter-var-root #'*test-routes*
+                          (constantly
+                            [["/" {:name  :home
+                                   :title "Newlines Test"
+                                   :get   (fn [_]
+                                            [:div
+                                             [:textarea#newline-content "line1\nline2"]
+                                             [:pre#pre-content "code\nwith\n\nnew\n\nlines\n\n"]])}]]))
+          (w/navigate (str base-url "/"))
+          (wait-for-sse)
+          (is (= "line1\nline2" (w/text-content "#newline-content")))
+          (is (= "code\nwith\n\nnew\n\nlines\n\n" (w/text-content "#pre-content")))))
       (finally
         (close-browser! browser-info)))))
 
@@ -614,3 +837,413 @@
 
       (finally
         (close-browser! browser-info)))))
+
+;; ---------------------------------------------------------------------------
+;; Test: Head element per-element diffing (issue #42)
+;;
+;; Verifies that static/unchanged head elements are NOT removed and
+;; re-appended on SSE re-renders, preventing FOUC and script re-execution.
+;; ---------------------------------------------------------------------------
+
+(deftest ^:e2e head-element-diffing-test
+  (let [browser-info (launch-browser)
+        ctx          (new-context browser-info)
+        page         (new-page ctx)]
+    (try
+      ;; Start with a multi-element head: a style + a link
+      (alter-var-root #'test-head-var
+                      (constantly
+                        (fn [_]
+                          [[:style {:id "test-style"} ".v1{color:red}"]
+                           [:meta {:id "test-meta" :name "test" :content "value1"}]])))
+
+      (w/with-page page
+        (w/navigate (str base-url "/"))
+        (wait-for-sse)
+
+        (testing "Initial head elements are present with fingerprint attributes"
+          (Thread/sleep 500)
+          (let [style-fp (eval-js "document.getElementById('test-style')?.getAttribute('data-hyper-head')")
+                meta-fp  (eval-js "document.getElementById('test-meta')?.getAttribute('data-hyper-head')")]
+            (is (some? style-fp) "Style element should have a data-hyper-head fingerprint")
+            (is (some? meta-fp) "Meta element should have a data-hyper-head fingerprint")
+            (is (not= style-fp meta-fp) "Different elements should have different fingerprints")))
+
+        (testing "Unchanged head elements are not re-appended on re-render"
+          ;; Stamp each head element with a marker attribute to detect re-insertion.
+          ;; If the element is removed and re-appended, the marker will be lost.
+          (eval-js "document.getElementById('test-style')?.setAttribute('data-marker', 'original')")
+          (eval-js "document.getElementById('test-meta')?.setAttribute('data-marker', 'original')")
+
+          ;; Trigger a re-render by incrementing a counter (navigate to counters and back)
+          ;; Use a simpler approach: redef the routes var to force a re-render
+          (alter-var-root #'*test-routes*
+                          (constantly
+                            [["/" {:name  :home
+                                   :title "Diffing Test"
+                                   :get   (fn [_]
+                                            [:div [:h1 "Re-rendered"]])}]]))
+
+          ;; Wait for the re-render to arrive
+          (wait-for-text "h1" "Re-rendered")
+
+          ;; The head elements should still have their marker — they were NOT removed/re-appended
+          (let [style-marker (eval-js "document.getElementById('test-style')?.getAttribute('data-marker')")
+                meta-marker  (eval-js "document.getElementById('test-meta')?.getAttribute('data-marker')")]
+            (is (= "original" style-marker)
+                "Style element should NOT have been re-appended (marker preserved)")
+            (is (= "original" meta-marker)
+                "Meta element should NOT have been re-appended (marker preserved)")))
+
+        (testing "Changed head elements are swapped, unchanged ones stay"
+          ;; Mark the meta element again
+          (eval-js "document.getElementById('test-meta')?.setAttribute('data-marker', 'original2')")
+          (eval-js "document.getElementById('test-style')?.setAttribute('data-marker', 'original2')")
+
+          ;; Change ONLY the style, keep meta the same
+          (alter-var-root #'test-head-var
+                          (constantly
+                            (fn [_]
+                              [[:style {:id "test-style"} ".v2{color:blue}"]
+                               [:meta {:id "test-meta" :name "test" :content "value1"}]])))
+
+          ;; Wait for SSE re-render
+          (Thread/sleep 1500)
+
+          ;; The meta element should still have its marker (unchanged → not touched)
+          (let [meta-marker (eval-js "document.getElementById('test-meta')?.getAttribute('data-marker')")]
+            (is (= "original2" meta-marker)
+                "Unchanged meta element should NOT have been re-appended"))
+
+          ;; The style element should have new content (was removed + re-appended)
+          (let [style-marker  (eval-js "document.getElementById('test-style')?.getAttribute('data-marker')")
+                style-content (eval-js "document.getElementById('test-style')?.textContent")]
+            (is (nil? style-marker)
+                "Changed style element should have been re-appended (marker lost)")
+            (is (= ".v2{color:blue}" style-content)
+                "Style element should have the new content")))
+
+        (testing "Removed head elements are cleaned up"
+          ;; Change head to only have the style, dropping the meta
+          (alter-var-root #'test-head-var
+                          (constantly
+                            (fn [_]
+                              [:style {:id "test-style"} ".v3{color:green}"])))
+
+          (Thread/sleep 1500)
+
+          (let [meta-el       (eval-js "document.getElementById('test-meta')")
+                style-content (eval-js "document.getElementById('test-style')?.textContent")]
+            (is (nil? meta-el)
+                "Removed meta element should no longer be in the DOM")
+            (is (= ".v3{color:green}" style-content)
+                "Style element should have updated content"))))
+
+      (finally
+        (close-browser! browser-info)))))
+
+;; ---------------------------------------------------------------------------
+;; Test 5: Signals — declaration, binding, action reads, reset, client params
+;; ---------------------------------------------------------------------------
+
+(deftest ^:e2e signals-test
+  (let [browser-info (launch-browser)
+        ctx          (new-context browser-info)
+        page         (new-page ctx)]
+    (try
+      (w/with-page page
+        (w/navigate (str base-url "/signals"))
+        (wait-for-sse)
+
+        (testing "Initial state"
+          (is (= "Test Signals" (w/text-content "h1")))
+          (is (= "" (w/text-content "#name-display")))
+          (is (= "empty" (w/text-content "#saved-result"))))
+
+        (testing "Signal declaration renders data-signals attribute"
+          (let [app-html (eval-js "document.getElementById('hyper-app').outerHTML")]
+            (is (.contains app-html "data-signals"))
+            (is (.contains app-html "ifmissing"))))
+
+        ;; ----------------------------------------------------------------
+        ;; data-bind: typing updates the signal client-side via data-text
+        ;; ----------------------------------------------------------------
+        (testing "data-bind updates signal, data-text reflects it"
+          (w/fill "#name-input" "Alice")
+          ;; data-text is pure client-side reactivity — should be instant
+          (wait-for-text "#name-display" "Alice"))
+
+        ;; ----------------------------------------------------------------
+        ;; Reading signal in action: server receives the signal value
+        ;; ----------------------------------------------------------------
+        (testing "Action reads signal value from @post body"
+          (w/click "#save-btn")
+          (wait-for-text "#saved-result" "Alice"))
+
+        ;; ----------------------------------------------------------------
+        ;; Server reset: reset! signal pushes update to client
+        ;; ----------------------------------------------------------------
+        (testing "Server reset! pushes signal update to client"
+          ;; First re-type the name after morph may have cleared it
+          (w/fill "#name-input" "Bob")
+          (wait-for-text "#name-display" "Bob")
+          (w/click "#clear-btn")
+          ;; The server resets the signal → SSE pushes datastar-patch-signals
+          ;; → client signal updates → data-text re-evaluates
+          (wait-for-text "#reset-display" "")
+          ;; The name input should also be cleared since it's data-bind'd
+          (wait-for-text "#name-display" ""))
+
+        ;; ----------------------------------------------------------------
+        ;; Signal + client params: both available in the same action
+        ;; ----------------------------------------------------------------
+        (testing "Signals and client params work together in same action"
+          ;; Type a fresh name so we know the signal value
+          (w/fill "#name-input" "Eve")
+          (wait-for-text "#name-display" "Eve")
+          ;; Type in the separate input and trigger change event
+          (w/fill "#combined-input" "typed-val")
+          (w/keyboard-press "Tab")
+          (wait-for-text "#combined-result" "signal=Eve,input=typed-val"))
+
+        ;; ----------------------------------------------------------------
+        ;; Async update: reset! from a background thread (outside action)
+        ;; ----------------------------------------------------------------
+        (testing "Signal reset! from background thread pushes update to client"
+          ;; Clear signal first so we can detect the async update
+          (w/fill "#name-input" "")
+          (wait-for-text "#async-display" "")
+          (w/click "#async-btn")
+          ;; The action kicks off a future that sleeps 500ms then resets.
+          ;; Wait up to 3s for the update to arrive via SSE.
+          (wait-for-text "#async-display" "async-update" :timeout 3000)))
+
+      (finally
+        (close-browser! browser-info)))))
+
+;; ---------------------------------------------------------------------------
+;; Test 6: watch! bootstrap — server-side atom mutation triggers SSE update
+;; ---------------------------------------------------------------------------
+
+(deftest ^:e2e watch-bootstrap-test
+  (testing "h/watch! during initial HTTP render gets promoted on SSE connect,
+            so server-side atom mutations trigger live updates"
+    (let [browser-info (launch-browser)
+          ctx          (new-context browser-info)
+          page         (new-page ctx)]
+      (try
+        ;; Reset the shared atom to a known state
+        (reset! watch-test-atom "initial")
+
+        (w/with-page page
+          (w/navigate (str base-url "/watch-bootstrap"))
+          (wait-for-sse)
+
+          ;; 1. Verify initial HTTP render shows the atom's value
+          (testing "Initial page renders the watched atom value"
+            (is (= "Watch Bootstrap" (w/text-content "h1")))
+            (is (= "initial" (w/text-content "#watch-value"))))
+
+          ;; 2. Mutate the atom from the server side (no user action involved)
+          ;;    — this is the scenario that was broken before the fix.
+          (testing "Server-side atom mutation triggers SSE re-render"
+            (reset! watch-test-atom "updated-from-server")
+            (wait-for-text "#watch-value" "updated-from-server"))
+
+          ;; 3. Verify multiple server-side mutations continue to work
+          (testing "Subsequent server-side mutations also trigger re-renders"
+            (reset! watch-test-atom "second-update")
+            (wait-for-text "#watch-value" "second-update")))
+
+        (finally
+          ;; Reset for other tests
+          (reset! watch-test-atom "initial")
+          (close-browser! browser-info)))))
+
+  (testing "Multiple tabs each get their own watch on the same atom"
+    (let [browser-info (launch-browser)
+          ctx          (new-context browser-info)
+          page1        (new-page ctx)
+          page2        (new-page ctx)]
+      (try
+        (reset! watch-test-atom "start")
+
+        (w/with-page page1
+          (w/navigate (str base-url "/watch-bootstrap"))
+          (wait-for-sse))
+
+        (w/with-page page2
+          (w/navigate (str base-url "/watch-bootstrap"))
+          (wait-for-sse))
+
+        ;; Both tabs should show initial value
+        (w/with-page page1
+          (is (= "start" (w/text-content "#watch-value"))))
+        (w/with-page page2
+          (is (= "start" (w/text-content "#watch-value"))))
+
+        ;; Mutate from server — both tabs should update
+        (reset! watch-test-atom "shared-update")
+
+        (w/with-page page1
+          (wait-for-text "#watch-value" "shared-update"))
+        (w/with-page page2
+          (wait-for-text "#watch-value" "shared-update"))
+
+        (finally
+          (reset! watch-test-atom "initial")
+          (close-browser! browser-info))))))
+
+;; ---------------------------------------------------------------------------
+;; Test: Reactive components
+;; ---------------------------------------------------------------------------
+
+(deftest ^:e2e reactive-component-test
+  (let [browser-info (launch-browser)
+        ctx          (new-context browser-info)
+        page         (new-page ctx)]
+    (try
+      (w/with-page page
+        (w/navigate (str base-url "/reactive"))
+        (wait-for-sse)
+
+        (testing "Initial render shows all values"
+          (is (= "00:00" (w/text-content "#clock-value")))
+          (is (= "initial" (w/text-content "#static-value")))
+          (is (= "0" (w/text-content "#counter-value")))
+          (is (= "Count: 0" (w/text-content "#custom-reactive"))))
+
+        (testing "Reactive component updates when dep changes"
+          (reset! reactive-clock* "12:34")
+          (wait-for-text "#clock-value" "12:34")
+          ;; Static value should still be "initial" — not re-rendered
+          (is (= "initial" (w/text-content "#static-value"))))
+
+        (testing "Reactive component with user-provided ID works"
+          (w/click "#inc-btn")
+          (wait-for-text "#counter-value" "1")
+          (wait-for-text "#custom-reactive" "Count: 1"))
+
+        (testing "No wrapper div — reactive ID is on the element itself"
+          ;; The clock span should have the reactive ID directly
+          (let [clock-el-tag (.evaluate page "document.getElementById('clock-value')?.tagName")]
+            (is (= "SPAN" clock-el-tag)
+                "clock element should be a SPAN, not wrapped in a DIV"))
+          ;; The custom-reactive element should still be a SPAN
+          (let [custom-el-tag (.evaluate page "document.getElementById('custom-reactive')?.tagName")]
+            (is (= "SPAN" custom-el-tag)
+                "custom-reactive element should be a SPAN")))
+
+        (testing "Multiple rapid updates are coalesced"
+          (reset! reactive-clock* "tick-1")
+          (reset! reactive-clock* "tick-2")
+          (reset! reactive-clock* "tick-3")
+          (wait-for-text "#clock-value" "tick-3")))
+
+      (finally
+        (reset! reactive-clock* "00:00")
+        (close-browser! browser-info)))))
+
+;; ---------------------------------------------------------------------------
+;; Test: Effects — navigate!, set-cookie!, delete-cookie!, execute-script!
+;; ---------------------------------------------------------------------------
+
+(deftest ^:e2e effects-navigate-test
+  (testing "navigate! from an action changes URL and renders the target page"
+    (let [browser-info (launch-browser)
+          ctx          (new-context browser-info)
+          page         (new-page ctx)]
+      (try
+        (w/with-page page
+          (w/navigate (str base-url "/effects"))
+          (wait-for-sse)
+
+          (is (= "Effects Test" (w/text-content "h1")))
+
+          ;; Click the navigate button — should navigate to home
+          (w/click "#nav-btn")
+
+          ;; Wait for the home page content to appear via SSE re-render
+          (wait-for-text "h1" "Test Home")
+
+          ;; URL should have changed via pushState
+          (let [url (current-url)]
+            (is (str/ends-with? url "/")
+                (str "Expected URL to end with /, got: " url))))
+
+        (finally
+          (close-browser! browser-info))))))
+
+(deftest ^:e2e effects-cookie-test
+  (testing "set-cookie! and delete-cookie! manage HTTP cookies"
+    (let [browser-info (launch-browser)
+          ctx          (new-context browser-info)
+          page         (new-page ctx)]
+      (try
+        (w/with-page page
+          (w/navigate (str base-url "/effects"))
+          (wait-for-sse)
+
+          (testing "initial state shows no cookie"
+            (is (= "no-cookie" (w/text-content "#cookie-display"))))
+
+          (testing "set-cookie! sets an HTTP cookie"
+            (w/click "#set-cookie-btn")
+            (wait-for-text "#effect-status" "cookie-set")
+            ;; Verify cookie was set via document.cookie — this is more
+            ;; reliable than checking the server-rendered #cookie-display
+            ;; because SSE re-renders (which lack HTTP cookies) can
+            ;; overwrite it before we read it.
+            (wait-for-cookie "test-effect-cookie" "hyper-test-value"))
+
+          (testing "delete-cookie! removes the cookie"
+            (w/click "#delete-cookie-btn")
+            (wait-for-text "#effect-status" "cookie-deleted")
+            ;; Verify cookie was removed via document.cookie
+            (wait-for-cookie "test-effect-cookie" "" :absent? true)))
+
+        (finally
+          (close-browser! browser-info))))))
+
+(deftest ^:e2e effects-execute-script-test
+  (testing "execute-script! runs JavaScript on the client"
+    (let [browser-info (launch-browser)
+          ctx          (new-context browser-info)
+          page         (new-page ctx)]
+      (try
+        (w/with-page page
+          (w/navigate (str base-url "/effects"))
+          (wait-for-sse)
+
+          (testing "initial script-result is pending"
+            (is (= "pending" (w/text-content "#script-result"))))
+
+          (testing "execute-script! runs JS that modifies the DOM"
+            (w/click "#script-btn")
+            (wait-for-text "#script-result" "executed")))
+
+        (finally
+          (close-browser! browser-info))))))
+
+(deftest ^:e2e effects-combined-test
+  (testing "multiple effects in one action all apply"
+    (let [browser-info (launch-browser)
+          ctx          (new-context browser-info)
+          page         (new-page ctx)]
+      (try
+        (w/with-page page
+          (w/navigate (str base-url "/effects"))
+          (wait-for-sse)
+
+          (testing "combo button sets cookie and runs script"
+            (w/click "#combo-btn")
+            ;; Script should execute
+            (wait-for-text "#script-result" "combo-executed")
+            ;; Cursor mutation should have happened
+            (wait-for-text "#effect-status" "combo-done")
+            (is (= "combo-done" (w/text-content "#effect-status")))
+            ;; Verify cookie was set via document.cookie
+            (wait-for-cookie "test-effect-cookie" "combo-value")))
+
+        (finally
+          (close-browser! browser-info))))))

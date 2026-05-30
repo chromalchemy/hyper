@@ -1,8 +1,11 @@
 (ns hyper.core-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.string :as string]
+            [clojure.test :refer [deftest is testing]]
             [hyper.context :as context]
             [hyper.core :as hy]
+            [hyper.render :as render]
             [hyper.state :as state]
+            [hyper.test :as ht]
             [reitit.ring :as ring]))
 
 (deftest test-global-cursor
@@ -67,7 +70,7 @@
   (testing "tab-cursor creates cursor to tab state"
     (let [app-state* (atom (state/init-state))
           session-id "test-session-2"
-          tab-id     "test-tab-1"]
+          tab-id     "test_tab_1"]
       (state/get-or-create-tab! app-state* session-id tab-id)
       (binding [context/*request* {:hyper/session-id session-id
                                    :hyper/tab-id     tab-id
@@ -85,7 +88,7 @@
   (testing "action registers and returns Datastar expression string"
     (let [app-state* (atom (state/init-state))
           session-id "test-session-3"
-          tab-id     "test-tab-2"
+          tab-id     "test_tab_2"
           executed   (atom false)]
       (binding [context/*request* {:hyper/session-id session-id
                                    :hyper/tab-id     tab-id
@@ -107,7 +110,7 @@
   [routes]
   (let [app-state* (atom (state/init-state))
         session-id "test-session-nav"
-        tab-id     "test-tab-nav"
+        tab-id     "test_tab_nav"
         router     (ring/router (mapv (fn [[path data]] [path data]) routes)
                                 {:conflicts nil})]
     (state/get-or-create-tab! app-state* session-id tab-id)
@@ -186,7 +189,16 @@
                             :get  (fn [_req] [:div "Home"])}]]
           handler    (hy/create-handler routes :app-state app-state*)]
       (is (fn? handler))
-      (is (= app-state* app-state*)))))
+      (is (= app-state* app-state*))))
+
+  (testing ":base-path is passed through to server and stored in app-state"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          _handler   (hy/create-handler routes
+                                        :app-state app-state*
+                                        :base-path "/sub")]
+      (is (= "/sub" (:base-path @app-state*))))))
 
 (deftest test-server-lifecycle
   (testing "start! and stop! work together"
@@ -222,7 +234,7 @@
   (testing "tab-cursor with default value initializes nil path"
     (let [app-state* (atom (state/init-state))
           session-id "test-session-6"
-          tab-id     "test-tab-3"]
+          tab-id     "test_tab_3"]
       (state/get-or-create-tab! app-state* session-id tab-id)
       (binding [context/*request* {:hyper/session-id session-id
                                    :hyper/tab-id     tab-id
@@ -234,7 +246,7 @@
   (testing "tab-cursor with default doesn't overwrite existing value"
     (let [app-state* (atom (state/init-state))
           session-id "test-session-7"
-          tab-id     "test-tab-4"]
+          tab-id     "test_tab_4"]
       (state/get-or-create-tab! app-state* session-id tab-id)
       (swap! app-state* assoc-in [:tabs tab-id :data :items] [1 2 3])
       (binding [context/*request* {:hyper/session-id session-id
@@ -246,7 +258,7 @@
   (testing "nested path with default value"
     (let [app-state* (atom (state/init-state))
           session-id "test-session-8"
-          tab-id     "test-tab-5"]
+          tab-id     "test_tab_5"]
       (state/get-or-create-tab! app-state* session-id tab-id)
       (binding [context/*request* {:hyper/session-id session-id
                                    :hyper/tab-id     tab-id
@@ -263,7 +275,7 @@
   (testing "path-cursor reads/writes to route query params"
     (let [app-state* (atom (state/init-state))
           session-id "test-session-path-1"
-          tab-id     "test-tab-path-1"]
+          tab-id     "test_tab_path_1"]
       (state/get-or-create-tab! app-state* session-id tab-id)
       ;; Seed route state
       (state/set-tab-route! app-state* tab-id
@@ -281,7 +293,7 @@
   (testing "path-cursor with default doesn't overwrite existing"
     (let [app-state* (atom (state/init-state))
           session-id "test-session-path-2"
-          tab-id     "test-tab-path-2"]
+          tab-id     "test_tab_path_2"]
       (state/get-or-create-tab! app-state* session-id tab-id)
       (state/set-tab-route! app-state* tab-id
                             {:name        :search :path         "/search"
@@ -295,7 +307,7 @@
   (testing "path-cursor swap! works"
     (let [app-state* (atom (state/init-state))
           session-id "test-session-path-3"
-          tab-id     "test-tab-path-3"]
+          tab-id     "test_tab_path_3"]
       (state/get-or-create-tab! app-state* session-id tab-id)
       (state/set-tab-route! app-state* tab-id
                             {:name :home :path "/" :path-params {} :query-params {}})
@@ -309,28 +321,28 @@
           (is (= 11 @cursor)))))))
 
 (deftest test-action-with-client-params
-  (testing "$value client param generates fetch expression"
+  (testing "$value client param generates @post expression with hyper.encodeClientParams"
     (let [app-state* (atom (state/init-state))
           session-id "test-session-cp"
-          tab-id     "test-tab-cp"]
+          tab-id     "test_tab_cp"]
       (state/get-or-create-tab! app-state* session-id tab-id)
       (binding [context/*request* {:hyper/session-id session-id
                                    :hyper/tab-id     tab-id
                                    :hyper/app-state  app-state*}]
         (let [action-expr (hy/action (reset! (hy/tab-cursor :query) $value))]
           (is (string? action-expr))
-          (is (.contains action-expr "fetch("))
+          (is (.contains action-expr "@post("))
+          (is (.contains action-expr "hyper.encodeClientParams"))
           (is (.contains action-expr "value:evt.target.value"))
-          (is (not (.contains action-expr "@post")))
           (let [action-id (second (re-find #"action-id=([^'&\"]+)" action-expr))]
             (is (some? action-id))
             ((get-in @app-state* [:actions action-id :fn]) {:value "hello"})
             (is (= "hello" (get-in @app-state* [:tabs tab-id :data :query]))))))))
 
-  (testing "$checked client param generates fetch expression"
+  (testing "$checked client param generates @post expression"
     (let [app-state* (atom (state/init-state))
           session-id "test-session-cp"
-          tab-id     "test-tab-cp"]
+          tab-id     "test_tab_cp"]
       (state/get-or-create-tab! app-state* session-id tab-id)
       (binding [context/*request* {:hyper/session-id session-id
                                    :hyper/tab-id     tab-id
@@ -342,10 +354,10 @@
             ((get-in @app-state* [:actions action-id :fn]) {:checked true})
             (is (= true (get-in @app-state* [:tabs tab-id :data :dark?]))))))))
 
-  (testing "$key client param generates fetch expression"
+  (testing "$key client param generates @post expression"
     (let [app-state* (atom (state/init-state))
           session-id "test-session-cp"
-          tab-id     "test-tab-cp"]
+          tab-id     "test_tab_cp"]
       (state/get-or-create-tab! app-state* session-id tab-id)
       (binding [context/*request* {:hyper/session-id session-id
                                    :hyper/tab-id     tab-id
@@ -357,10 +369,10 @@
             ((get-in @app-state* [:actions action-id :fn]) {:key "Enter"})
             (is (= "Enter" (get-in @app-state* [:tabs tab-id :data :last-key]))))))))
 
-  (testing "$form-data client param generates fetch expression"
+  (testing "$form-data client param generates @post expression"
     (let [app-state* (atom (state/init-state))
           session-id "test-session-cp"
-          tab-id     "test-tab-cp"]
+          tab-id     "test_tab_cp"]
       (state/get-or-create-tab! app-state* session-id tab-id)
       (binding [context/*request* {:hyper/session-id session-id
                                    :hyper/tab-id     tab-id
@@ -373,28 +385,467 @@
             (is (= {:email "a@b.com" :name "Alice"}
                    (get-in @app-state* [:tabs tab-id :data :form]))))))))
 
-  (testing "no client params uses @post expression"
+  (testing "no client params uses simple @post expression"
     (let [app-state* (atom (state/init-state))
           session-id "test-session-cp"
-          tab-id     "test-tab-cp"]
+          tab-id     "test_tab_cp"]
       (state/get-or-create-tab! app-state* session-id tab-id)
       (binding [context/*request* {:hyper/session-id session-id
                                    :hyper/tab-id     tab-id
                                    :hyper/app-state  app-state*}]
         (let [action-expr (hy/action (swap! (hy/tab-cursor :count 0) inc))]
           (is (.contains action-expr "@post("))
-          (is (not (.contains action-expr "fetch(")))))))
+          (is (not (.contains action-expr "hyper.encodeClientParams")))))))
 
   (testing "multiple client params in single action"
     (let [app-state* (atom (state/init-state))
           session-id "test-session-cp"
-          tab-id     "test-tab-cp"]
+          tab-id     "test_tab_cp"]
       (state/get-or-create-tab! app-state* session-id tab-id)
       (binding [context/*request* {:hyper/session-id session-id
                                    :hyper/tab-id     tab-id
                                    :hyper/app-state  app-state*}]
         (let [action-expr (hy/action (do (reset! (hy/tab-cursor :val) $value)
                                          (reset! (hy/tab-cursor :k) $key)))]
-          (is (.contains action-expr "fetch("))
+          (is (.contains action-expr "@post("))
+          (is (.contains action-expr "hyper.encodeClientParams"))
           (is (.contains action-expr "value:evt.target.value"))
-          (is (.contains action-expr "key:evt.key")))))))
+          (is (.contains action-expr "key:evt.key"))))))
+
+  (testing "JS string with client params injects guard before @post"
+    (let [app-state* (atom (state/init-state))
+          session-id "test-session-js"
+          tab-id     "test_tab_js"]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (binding [context/*request* {:hyper/session-id session-id
+                                   :hyper/tab-id     tab-id
+                                   :hyper/app-state  app-state*}]
+        (let [action-expr (hy/action {:when "evt.key === 'Enter'"}
+                                     (reset! (hy/tab-cursor :val) $value))]
+          (is (string? action-expr))
+          (is (.contains action-expr "evt.key === 'Enter'"))
+          (is (.contains action-expr "@post("))
+          (is (.contains action-expr "hyper.encodeClientParams"))
+          (is (.contains action-expr "value:evt.target.value"))
+          (is (.startsWith action-expr "evt.key === 'Enter' && "))
+          ;; Verify action executes correctly with client params
+          (let [action-id (second (re-find #"action-id=([^'&\"]+)" action-expr))]
+            (is (some? action-id))
+            ((get-in @app-state* [:actions action-id :fn]) {:value "hello"})
+            (is (= "hello" (get-in @app-state* [:tabs tab-id :data :val]))))))))
+
+  (testing "empty :when string treated as no JS injection"
+    (let [app-state* (atom (state/init-state))
+          session-id "test-session-js"
+          tab-id     "test_tab_js"]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (binding [context/*request* {:hyper/session-id session-id
+                                   :hyper/tab-id     tab-id
+                                   :hyper/app-state  app-state*}]
+        (let [action-expr (hy/action {:when ""} (reset! (hy/tab-cursor :val) $value))]
+          (is (.contains action-expr "@post("))
+          (is (.contains action-expr "hyper.encodeClientParams"))
+          (is (.contains action-expr "value:evt.target.value"))
+          (is (not (.contains action-expr " && "))))))))
+
+(deftest test-base-path-action
+  (testing "action macro uses /hyper/actions without :base-path"
+    (let [app-state* (atom (state/init-state))
+          session-id "test-session-bp"
+          tab-id     "test_tab_bp"]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (binding [context/*request* {:hyper/session-id session-id
+                                   :hyper/tab-id     tab-id
+                                   :hyper/app-state  app-state*}]
+        (let [action-expr (hy/action (swap! (hy/tab-cursor :n 0) inc))]
+          (is (string/includes? action-expr "@post('/hyper/actions?"))))))
+
+  (testing "action macro prefixes /hyper/actions with :base-path"
+    (let [app-state* (atom (assoc (state/init-state) :base-path "/my-app"))
+          session-id "test-session-bp"
+          tab-id     "test_tab_bp"]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (binding [context/*request* {:hyper/session-id session-id
+                                   :hyper/tab-id     tab-id
+                                   :hyper/app-state  app-state*}]
+        (let [action-expr (hy/action (swap! (hy/tab-cursor :n 0) inc))]
+          (is (string/includes? action-expr "@post('/my-app/hyper/actions?"))
+          (is (not (string/includes? action-expr "@post('/hyper/actions?")))))))
+
+  (testing "action macro with client params also prefixes the URL"
+    (let [app-state* (atom (assoc (state/init-state) :base-path "/sub"))
+          session-id "test-session-bp2"
+          tab-id     "test_tab_bp2"]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (binding [context/*request* {:hyper/session-id session-id
+                                   :hyper/tab-id     tab-id
+                                   :hyper/app-state  app-state*}]
+        (let [action-expr (hy/action (reset! (hy/tab-cursor :v) $value))]
+          (is (string/includes? action-expr "@post('/sub/hyper/actions?"))
+          (is (string/includes? action-expr "hyper.encodeClientParams"))))))
+
+  (testing "action macro with :when guard and :base-path"
+    (let [app-state* (atom (assoc (state/init-state) :base-path "/app"))
+          session-id "test-session-bp3"
+          tab-id     "test_tab_bp3"]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (binding [context/*request* {:hyper/session-id session-id
+                                   :hyper/tab-id     tab-id
+                                   :hyper/app-state  app-state*}]
+        (let [action-expr (hy/action {:when "evt.key === 'Enter'"}
+                                     (swap! (hy/tab-cursor :n 0) inc))]
+          (is (string/includes? action-expr "@post('/app/hyper/actions?"))
+          (is (string/starts-with? action-expr "evt.key === 'Enter' && ")))))))
+
+(deftest test-base-path-navigate
+  (testing "navigate uses /hyper/actions without :base-path"
+    (let [routes [["/" {:name :home :get (fn [_] [:div "Home"])}]
+                  ["/about" {:name :about :get (fn [_] [:div "About"])}]]
+          ctx    (make-test-context routes)]
+      (binding [context/*request* ctx]
+        (let [nav-attrs (hy/navigate :about)]
+          (is (string/includes? (str (:data-on:click__prevent nav-attrs))
+                                "@post('/hyper/actions?"))))))
+
+  (testing "navigate prefixes /hyper/actions with :base-path"
+    (let [routes     [["/" {:name :home :get (fn [_] [:div "Home"])}]
+                      ["/about" {:name :about :get (fn [_] [:div "About"])}]]
+          app-state* (atom (assoc (state/init-state) :base-path "/my-app"))
+          session-id "test-session-nav-bp"
+          tab-id     "test_tab_nav_bp"
+          router     (ring/router routes {:conflicts nil})]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (swap! app-state* assoc :router router :routes routes)
+      (binding [context/*request* {:hyper/session-id session-id
+                                   :hyper/tab-id     tab-id
+                                   :hyper/app-state  app-state*
+                                   :hyper/router     router}]
+        (let [nav-attrs (hy/navigate :about)]
+          (is (string/includes? (str (:data-on:click__prevent nav-attrs))
+                                "@post('/my-app/hyper/actions?"))
+          (is (not (string/includes? (str (:data-on:click__prevent nav-attrs))
+                                     "@post('/hyper/actions?"))))))))
+
+;; ---------------------------------------------------------------------------
+;; Batch
+;; ---------------------------------------------------------------------------
+
+(deftest batch-atomic-update-test
+  (testing "batch flushes all cursor writes in a single swap"
+    (let [swap-count* (atom 0)
+          app-state*  (atom (state/init-state))
+          _           (state/get-or-create-tab! app-state* "s1" "t1")]
+      ;; Watch the atom to count how many times it's swapped AFTER batch
+      (add-watch app-state* :counter (fn [_ _ _ _] (swap! swap-count* inc)))
+      (binding [context/*request* {:hyper/session-id "s1"
+                                   :hyper/tab-id     "t1"
+                                   :hyper/app-state  app-state*}]
+        ;; Reset counter after setup swaps
+        (reset! swap-count* 0)
+        (hy/batch
+          (reset! (hy/tab-cursor :a) 1)
+          (reset! (hy/tab-cursor :b) 2)
+          (reset! (hy/tab-cursor :c) 3))
+        ;; All three writes should have been flushed in a single swap
+        (is (= 1 @swap-count*) "batch should flush all writes in a single swap!")
+        ;; All values should be present in the live atom
+        (is (= 1 (get-in @app-state* [:tabs "t1" :data :a])))
+        (is (= 2 (get-in @app-state* [:tabs "t1" :data :b])))
+        (is (= 3 (get-in @app-state* [:tabs "t1" :data :c]))))
+      (remove-watch app-state* :counter))))
+
+(deftest batch-read-your-writes-test
+  (testing "cursor reads inside batch see accumulated writes"
+    (let [app-state* (atom (state/init-state))
+          _          (state/get-or-create-tab! app-state* "s1" "t1")]
+      (binding [context/*request* {:hyper/session-id "s1"
+                                   :hyper/tab-id     "t1"
+                                   :hyper/app-state  app-state*}]
+        (hy/batch
+          (reset! (hy/tab-cursor :x) 10)
+          ;; Should read the value we just set, even though it hasn't been flushed
+          (is (= 10 @(hy/tab-cursor :x)))
+          (swap! (hy/tab-cursor :x) + 5)
+          (is (= 15 @(hy/tab-cursor :x))))
+        ;; After flush, live atom should have the final value
+        (is (= 15 (get-in @app-state* [:tabs "t1" :data :x])))))))
+
+(deftest batch-nested-transparency-test
+  (testing "nested batch executes within outer overlay — no double flush"
+    (let [swap-count* (atom 0)
+          app-state*  (atom (state/init-state))
+          _           (state/get-or-create-tab! app-state* "s1" "t1")]
+      (add-watch app-state* :counter (fn [_ _ _ _] (swap! swap-count* inc)))
+      (binding [context/*request* {:hyper/session-id "s1"
+                                   :hyper/tab-id     "t1"
+                                   :hyper/app-state  app-state*}]
+        (reset! swap-count* 0)
+        (hy/batch
+          (reset! (hy/tab-cursor :a) 1)
+          ;; Nested batch — should NOT create a separate overlay
+          (hy/batch
+            (reset! (hy/tab-cursor :b) 2))
+          (reset! (hy/tab-cursor :c) 3)
+          ;; Nested batch's write should be visible
+          (is (= 2 @(hy/tab-cursor :b))))
+        ;; Still a single flush
+        (is (= 1 @swap-count*))
+        (is (= 1 (get-in @app-state* [:tabs "t1" :data :a])))
+        (is (= 2 (get-in @app-state* [:tabs "t1" :data :b])))
+        (is (= 3 (get-in @app-state* [:tabs "t1" :data :c]))))
+      (remove-watch app-state* :counter))))
+
+(deftest batch-return-value-test
+  (testing "batch returns the value of the last expression"
+    (let [app-state* (atom (state/init-state))
+          _          (state/get-or-create-tab! app-state* "s1" "t1")]
+      (binding [context/*request* {:hyper/session-id "s1"
+                                   :hyper/tab-id     "t1"
+                                   :hyper/app-state  app-state*}]
+        (let [result (hy/batch
+                       (reset! (hy/tab-cursor :x) 42)
+                       :done)]
+          (is (= :done result)))))))
+
+(deftest batch-no-writes-no-flush-test
+  (testing "batch with no cursor writes does not swap app-state"
+    (let [swap-count* (atom 0)
+          app-state*  (atom (state/init-state))
+          _           (state/get-or-create-tab! app-state* "s1" "t1")]
+      (add-watch app-state* :counter (fn [_ _ _ _] (swap! swap-count* inc)))
+      (binding [context/*request* {:hyper/session-id "s1"
+                                   :hyper/tab-id     "t1"
+                                   :hyper/app-state  app-state*}]
+        (reset! swap-count* 0)
+        (hy/batch
+          (+ 1 2 3))
+        (is (= 0 @swap-count*)))
+      (remove-watch app-state* :counter))))
+
+(deftest batch-without-batch-writes-directly-test
+  (testing "without batch, each cursor write goes to live atom immediately"
+    (let [swap-count* (atom 0)
+          app-state*  (atom (state/init-state))
+          _           (state/get-or-create-tab! app-state* "s1" "t1")]
+      (add-watch app-state* :counter (fn [_ _ _ _] (swap! swap-count* inc)))
+      (binding [context/*request* {:hyper/session-id "s1"
+                                   :hyper/tab-id     "t1"
+                                   :hyper/app-state  app-state*}]
+        (reset! swap-count* 0)
+        (reset! (hy/tab-cursor :a) 1)
+        (reset! (hy/tab-cursor :b) 2)
+        ;; Each write should have hit the live atom separately
+        (is (< 1 @swap-count*) "without batch, writes should hit live atom individually"))
+      (remove-watch app-state* :counter))))
+
+(deftest batch-preserves-concurrent-writes-test
+  (testing "batch flush only overwrites paths it wrote — other paths preserved"
+    (let [app-state* (atom (state/init-state))
+          _          (state/get-or-create-tab! app-state* "s1" "t1")]
+      ;; Pre-seed a value
+      (swap! app-state* assoc-in [:tabs "t1" :data :existing] "untouched")
+      (binding [context/*request* {:hyper/session-id "s1"
+                                   :hyper/tab-id     "t1"
+                                   :hyper/app-state  app-state*}]
+        (hy/batch
+          (reset! (hy/tab-cursor :new-key) "hello")
+          ;; Simulate a concurrent write to a different path
+          ;; (another action handler on a different tab)
+          (swap! app-state* assoc-in [:tabs "t1" :data :concurrent] "written-during-batch")))
+      ;; Batch's write should be present
+      (is (= "hello" (get-in @app-state* [:tabs "t1" :data :new-key])))
+      ;; Pre-existing value should be preserved
+      (is (= "untouched" (get-in @app-state* [:tabs "t1" :data :existing])))
+      ;; Concurrent write should be preserved (not overwritten by flush)
+      (is (= "written-during-batch" (get-in @app-state* [:tabs "t1" :data :concurrent]))))))
+
+(deftest batch-compare-and-set-test
+  (testing "compareAndSet works inside batch"
+    (let [app-state* (atom (state/init-state))
+          _          (state/get-or-create-tab! app-state* "s1" "t1")]
+      (swap! app-state* assoc-in [:tabs "t1" :data :x] 10)
+      (binding [context/*request* {:hyper/session-id "s1"
+                                   :hyper/tab-id     "t1"
+                                   :hyper/app-state  app-state*}]
+        (hy/batch
+          (let [c (hy/tab-cursor :x)]
+            ;; CAS with correct old value should succeed
+            (is (true? (compare-and-set! c 10 20)))
+            (is (= 20 @c))
+            ;; CAS with wrong old value should fail
+            (is (false? (compare-and-set! c 10 30)))
+            (is (= 20 @c))))
+        ;; Flushed value should be 20
+        (is (= 20 (get-in @app-state* [:tabs "t1" :data :x])))))))
+
+(deftest batch-inside-test-action-test
+  (testing "batch works end-to-end inside a test-page/test-action workflow"
+    (let [page-fn (fn [_req]
+                    (let [a* (hy/tab-cursor :a 0)
+                          b* (hy/tab-cursor :b 0)]
+                      [:div
+                       [:p (str @a* " " @b*)]
+                       [:button {:data-on:click
+                                 (hy/action {:as "update-both"}
+                                            (hy/batch
+                                              (reset! (hy/tab-cursor :a) 10)
+                                              (reset! (hy/tab-cursor :b) 20)))}
+                        "Update"]]))
+          result  (ht/test-page page-fn)
+          after   (ht/test-action result "update-both")]
+      (is (= 10 (get-in after [:cursors :tab :a])))
+      (is (= 20 (get-in after [:cursors :tab :b]))))))
+
+(deftest render-overlay-flush-test
+  (testing "render overlay flushes default-value inits to live atom"
+    (let [page-fn (fn [_req]
+                    (let [c* (hy/tab-cursor :auto-init 42)]
+                      [:div [:p (str @c*)]]))
+          result  (ht/test-page page-fn)]
+      ;; Default value should be flushed to the live atom after render
+      (is (= 42 (get-in @(:app-state result) [:tabs "test-tab" :data :auto-init]))))))
+
+(deftest render-overlay-read-consistency-test
+  (testing "cursor reads during render see a consistent snapshot"
+    (let [app-state* (atom (state/init-state))
+          _          (state/get-or-create-tab! app-state* "s1" "t1")
+          ;; Pre-seed state
+          _          (swap! app-state* assoc-in [:tabs "t1" :data :x] 100)
+          captured   (atom nil)
+          page-fn    (fn [_req]
+                       (let [x* (hy/tab-cursor :x)]
+                         ;; Capture the value seen during render
+                         (reset! captured @x*)
+                         [:div (str @x*)]))]
+      (ht/test-page page-fn {:app-state  app-state*
+                             :tab-id     "t1"
+                             :session-id "s1"})
+      ;; Should see the snapshot value
+      (is (= 100 @captured)))))
+
+;; ---------------------------------------------------------------------------
+;; Env
+;; ---------------------------------------------------------------------------
+
+(deftest env-helper-test
+  (testing "env returns nil outside request context"
+    (binding [context/*request* nil]
+      (is (nil? (hy/env)))))
+
+  (testing "env returns the full env map"
+    (binding [context/*request* {:hyper/env {:db :test-db :user {:name "Alice"}}}]
+      (is (= {:db :test-db :user {:name "Alice"}} (hy/env)))))
+
+  (testing "env with key returns a specific value"
+    (binding [context/*request* {:hyper/env {:db :test-db}}]
+      (is (= :test-db (hy/env :db)))
+      (is (nil? (hy/env :missing)))))
+
+  (testing "env with key and default"
+    (binding [context/*request* {:hyper/env {:db :test-db}}]
+      (is (= :test-db (hy/env :db :fallback)))
+      (is (= :fallback (hy/env :missing :fallback))))))
+
+(deftest env-in-render-test
+  (testing "env is available in render functions via test-page :req"
+    (let [captured (atom nil)
+          page-fn  (fn [_req]
+                     (reset! captured (hy/env))
+                     [:div "db: " (str (hy/env :db))])]
+      (ht/test-page page-fn {:req {:hyper/env {:db :test-db}}})
+      (is (= {:db :test-db} @captured)))))
+
+(deftest env-stashed-for-sse-renders-test
+  (testing "env stashed in tab state is available on SSE re-renders (no base-req)"
+    (let [app-state* (atom (state/init-state))
+          session-id "test-session-env"
+          tab-id     "test_tab_env"
+          captured   (atom nil)
+          render-fn  (fn [_req]
+                       (reset! captured (hy/env))
+                       [:div "env"])]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (render/register-render-fn! app-state* tab-id render-fn)
+
+      ;; Simulate stashing env (as page-handler would do)
+      (swap! app-state* assoc-in [:tabs tab-id :env] {:db :prod-db :user {:id 1}})
+
+      ;; SSE re-render — no base-req, env comes from stashed tab state
+      (let [result (render/render-tab app-state* session-id tab-id)]
+        (is (some? result))
+        (is (= {:db :prod-db :user {:id 1}} @captured))))))
+
+(deftest env-base-req-takes-precedence-test
+  (testing "env from base-req (initial page load) takes precedence over stashed env"
+    (let [app-state* (atom (state/init-state))
+          session-id "test-session-env2"
+          tab-id     "test_tab_env2"
+          captured   (atom nil)
+          render-fn  (fn [_req]
+                       (reset! captured (hy/env))
+                       [:div "env"])]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (render/register-render-fn! app-state* tab-id render-fn)
+
+      ;; Stash old env
+      (swap! app-state* assoc-in [:tabs tab-id :env] {:db :old-db})
+
+      ;; Initial page load with fresh env on the request
+      (let [base-req {:hyper/env {:db :fresh-db}}
+            result   (render/render-tab app-state* session-id tab-id base-req)]
+        (is (some? result))
+        (is (= {:db :fresh-db} @captured))))))
+
+(deftest env-nil-does-not-break-test
+  (testing "missing env does not break renders"
+    (let [app-state* (atom (state/init-state))
+          session-id "test-session-env3"
+          tab-id     "test_tab_env3"
+          captured   (atom :sentinel)
+          render-fn  (fn [_req]
+                       (reset! captured (hy/env))
+                       [:div "no env"])]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (render/register-render-fn! app-state* tab-id render-fn)
+      ;; No env stashed, no base-req — should be nil, not throw
+      (let [result (render/render-tab app-state* session-id tab-id)]
+        (is (some? result))
+        (is (nil? @captured))))))
+
+(deftest env-in-action-test
+  (testing "env is available inside action handlers"
+    (let [captured   (atom nil)
+          page-fn    (fn [_req]
+                       [:div
+                        [:button {:data-on:click
+                                  (hy/action {:as "check-env"}
+                                             (reset! captured (hy/env)))}
+                         "Go"]])
+          app-state* (atom (state/init-state))
+          _          (state/get-or-create-tab! app-state* "s1" "t1")
+          ;; Stash env directly (simulating what page-handler does)
+          _          (swap! app-state* assoc-in [:tabs "t1" :env]
+                            {:db :action-db :user {:role :admin}})
+          result     (ht/test-page page-fn {:app-state  app-state*
+                                            :session-id "s1"
+                                            :tab-id     "t1"
+                                            :req        {:hyper/env {:db   :action-db
+                                                                     :user {:role :admin}}}})]
+      (ht/test-action result "check-env")
+      (is (= {:db :action-db :user {:role :admin}} @captured)))))
+
+(deftest env-replaced-on-action-test
+  (testing "env is fully replaced (not merged) when action refreshes it"
+    (let [app-state* (atom (state/init-state))
+          session-id "s-env-replace"
+          tab-id     "t-env-replace"]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      ;; Initial env
+      (swap! app-state* assoc-in [:tabs tab-id :env]
+             {:db :db :user {:name "Alice"} :feature-flags #{:beta}})
+      ;; Simulate action-handler stashing a completely new env (replace semantics)
+      (swap! app-state* assoc-in [:tabs tab-id :env]
+             {:db :db :user {:name "Bob"}})
+      ;; :feature-flags should be gone — full replace, not merge
+      (is (= {:db :db :user {:name "Bob"}}
+             (get-in @app-state* [:tabs tab-id :env]))))))

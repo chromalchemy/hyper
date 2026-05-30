@@ -4,13 +4,20 @@
    Provides Ring handler creation for hyper applications."
   (:require [cheshire.core :as json]
             [clojure.string]
+            [compact-uuids.core :as uuid]
             [dev.onionpancakes.chassis.core :as c]
             [hyper.actions :as actions]
             [hyper.brotli :as br]
             [hyper.context :as context]
+            [hyper.effects :as effects]
+            [hyper.reactive :as reactive]
             [hyper.render :as render]
+            [hyper.render.error :as render.error]
+            [hyper.render.queue :as rq]
             [hyper.routes :as routes]
+            [hyper.signal :as signal]
             [hyper.state :as state]
+            [hyper.utils :as utils]
             [hyper.watch :as watch]
             [org.httpkit.server :as http-kit]
             [reitit.coercion :as coercion]
@@ -25,14 +32,13 @@
             [ring.middleware.not-modified :as not-modified]
             [ring.middleware.params :as params]
             [ring.middleware.resource :as resource]
-            [taoensso.telemere :as t])
-  (:import (java.util.concurrent Semaphore)))
+            [taoensso.telemere :as t]))
 
 (defn generate-session-id []
-  (str "sess-" (java.util.UUID/randomUUID)))
+  (str "ses_" (uuid/str (java.util.UUID/randomUUID))))
 
 (defn generate-tab-id []
-  (str "tab-" (java.util.UUID/randomUUID)))
+  (str "tab_" (uuid/str (java.util.UUID/randomUUID))))
 
 ;; ---------------------------------------------------------------------------
 ;; Per-tab renderer thread
@@ -42,74 +48,159 @@
   "Minimum interval between renders for a single tab (~60fps)."
   16)
 
+(defn- send-sse!
+  "Compress (when br-stream is non-nil) and send an SSE payload over the channel.
+   Returns true when sent, false when the channel is closed."
+  [channel br-out br-stream sse-payload]
+  (let [payload (if br-stream
+                  (br/compress-stream br-out br-stream sse-payload)
+                  sse-payload)]
+    (boolean (http-kit/send! channel payload false))))
+
+(defn- handle-partial-render
+  "Render only the dirty reactive components and send targeted fragments.
+   Returns true/nil on success, false when the channel is closed."
+  [app-state* tab-id dirty-ids channel br-out br-stream]
+  (let [fragments (keep (fn [component-id]
+                          (reactive/partial-render app-state* tab-id component-id))
+                        dirty-ids)]
+    (when (seq fragments)
+      (send-sse! channel br-out br-stream
+                 (render/format-datastar-fragments fragments)))))
+
+(defn- handle-ring-redirect
+  "Convert a 3xx Ring redirect response into a client-side window.location
+   redirect over SSE.  Throws for non-redirect Ring responses."
+  [render-result tab-id channel br-out br-stream]
+  (let [status   (:status render-result)
+        location (get-in render-result [:headers "Location"])]
+    (if (and (<= 300 status 399) location)
+      (let [js (str "window.location.href='" (utils/escape-js-string location) "'")]
+        (send-sse! channel br-out br-stream
+                   (effects/format-execute-script-event js)))
+      (throw (ex-info
+               (str "Render middleware returned a Ring response over SSE that cannot "
+                    "be delivered to the client. Only 3xx redirects with a Location "
+                    "header are supported during SSE re-renders.")
+               {:status  status
+                :headers (:headers render-result)
+                :tab-id  tab-id})))))
+
+(defn- handle-full-render
+  "Perform a full page render and send the assembled SSE events (head update,
+   body fragment, signal patches).  Sweeps stale actions/reactive components
+   and wires up watches for new reactive components.
+   Returns true/nil on success, false when the channel is closed."
+  [app-state* session-id tab-id sig-patches
+   enqueue-partial! channel br-out br-stream]
+  (when-let [render-result (render/render-tab app-state* session-id tab-id)]
+    (if (:status render-result)
+      ;; Ring response passthrough (e.g. redirect from render middleware)
+      (handle-ring-redirect render-result tab-id channel br-out br-stream)
+      ;; Normal render — assemble and send SSE payload
+      (let [{:keys [title head-html body-html url
+                    declared-signals registered-action-ids
+                    registered-reactive-ids]}              render-result]
+        ;; Sweep stale actions + reactive components
+        (actions/sweep-stale-tab-actions! app-state* tab-id registered-action-ids)
+        (reactive/sweep-stale-components! app-state* tab-id registered-reactive-ids)
+        ;; Set up watches for new/changed reactive components
+        (reactive/setup-new-component-watches! app-state* tab-id enqueue-partial!)
+        (let [head-event   (render/format-head-update title head-html)
+              sig-attrs    (signal/format-signal-attrs declared-signals)
+              div-attrs    (cond-> {:id "hyper-app"}
+                             url       (assoc :data-hyper-url url)
+                             sig-attrs (merge sig-attrs))
+              wrapped-html (c/html [:div div-attrs (c/raw body-html)])
+              body-event   (render/format-datastar-fragment wrapped-html)
+              sig-event    (when (seq sig-patches)
+                             (signal/format-patch-signals-event sig-patches))
+              sse-payload  (str head-event body-event sig-event)]
+          (send-sse! channel br-out br-stream sse-payload))))))
+
+(defn- send-pending-scripts!
+  "Send drained scripts over SSE.
+   Returns true/nil on success, false when the channel is closed."
+  [scripts tab-id channel br-out br-stream]
+  (try
+    (when (seq scripts)
+      (send-sse! channel br-out br-stream
+                 (apply str (map effects/format-execute-script-event scripts))))
+    (catch Throwable e
+      (t/error! {:id   :hyper.error/renderer-scripts
+                 :msg  "Error while sending pending scripts"
+                 :data {:hyper/tab-id tab-id}}
+                e)
+      nil)))
+
 (defn- -renderer-loop!
   "Virtual-thread render loop for a single tab.
 
    Owns the http-kit AsyncChannel and (optional) streaming Brotli state,
    guaranteeing single-writer semantics by construction.
 
-   Blocks on a Semaphore until signalled by a watcher, then renders the
-   latest state via render/render-tab, compresses (if enabled), and sends.
-   Exits when shutdown-renderer* is delivered."
+   Blocks on the render queue until events are available, drains them into
+   a consistent batch, then renders and sends.  The queue replaces the
+   previous Semaphore + atoms approach, eliminating all shared mutable state.
+   Exits when a :shutdown event is received."
   [app-state* session-id tab-id channel compress?
-   ^Semaphore semaphore shutdown-renderer*]
-  (let [br-out      (when compress? (br/byte-array-out-stream))
-        br-stream   (when br-out (br/compress-out-stream br-out :window-size 18))
-        headers     (cond-> {"Content-Type" "text/event-stream"}
-                      compress? (assoc "Content-Encoding" "br"))
-        throttle-ms (long (or (get @app-state* :render-throttle-ms)
-                              default-render-throttle-ms))]
+   render-queue]
+  (let [br-out           (when compress? (br/byte-array-out-stream))
+        br-stream        (when br-out (br/compress-out-stream br-out :window-size 18))
+        headers          (cond-> {"Content-Type"      "text/event-stream"
+                                  "Cache-Control"     "no-cache, no-transform"
+                                  "X-Accel-Buffering" "no"}
+                           compress? (assoc "Content-Encoding" "br"))
+        throttle-ms      (long (or (get @app-state* :render-throttle-ms)
+                                   default-render-throttle-ms))
+        enqueue-partial! #(rq/enqueue-partial! render-queue %)]
     (try
       ;; Send the connected event as the initial SSE response (headers + body).
       (let [connected-msg (render/format-connected-event tab-id)
-            payload       (if br-stream
-                            (br/compress-stream br-out br-stream connected-msg)
-                            connected-msg)
-            sent?         (boolean (http-kit/send! channel {:headers headers
-                                                            :body    payload}
-                                                   false))]
+            sent?         (boolean
+                            (http-kit/send! channel
+                                            {:headers headers
+                                             :body    (if br-stream
+                                                        (br/compress-stream br-out br-stream connected-msg)
+                                                        connected-msg)}
+                                            false))]
         (when sent?
-          ;; Main render loop — tracks prev-head-html to avoid FOUC.
-          ;; Head elements (CSS links, fonts, etc.) are only swapped when
-          ;; the rendered head-html actually changes.  Title is always updated.
-          (loop [prev-head-html nil]
-            (.acquire semaphore)
-            (.drainPermits semaphore)
-            (when-not (realized? shutdown-renderer*)
-              (let [result (try
-                             ;; Clean slate — remove stale actions before re-rendering
-                             (actions/cleanup-tab-actions! app-state* tab-id)
-                             (when-let [{:keys [title head-html body-html url]}
-                                        (render/render-tab app-state* session-id tab-id)]
-                               (let [head-changed? (not= head-html prev-head-html)
-                                     head-event    (render/format-head-update title head-html head-changed?)
-                                     div-attrs     (cond-> {:id "hyper-app"}
-                                                     url (assoc :data-hyper-url url))
-                                     wrapped-html  (c/html [:div div-attrs (c/raw body-html)])
-                                     body-event    (render/format-datastar-fragment wrapped-html)
-                                     sse-payload   (str head-event body-event)
-                                     payload       (if br-stream
-                                                     (br/compress-stream br-out br-stream sse-payload)
-                                                     sse-payload)
-                                     sent?         (boolean (http-kit/send! channel payload false))]
-                                 {:sent? sent? :head-html head-html}))
-                             (catch Throwable e
-                               (t/error! e {:id   :hyper.error/renderer
-                                            :data {:hyper/tab-id tab-id}})
-                               nil))
-                    sent?     (if (map? result) (:sent? result) nil)
-                    head-html (if (map? result) (:head-html result) prev-head-html)]
-                ;; sent? is true (ok), nil (no render-fn or error), false (channel closed)
-                (when-not (false? sent?)
-                  ;; Throttle: sleep so triggers during this window accumulate
-                  ;; as semaphore permits, which drainPermits collapses into
-                  ;; a single render on the next iteration.
-                  (Thread/sleep throttle-ms)
-                  (recur head-html)))))))
+          ;; Main render loop — tracks the last-sent signal snapshot so
+          ;; we only emit datastar-patch-signals for actual changes.
+          (loop [last-sent-signals nil]
+            (let [{:keys [shutdown? full-render? dirty-ids scripts]} (rq/drain! render-queue)]
+              (when-not shutdown?
+                (let [current-signals (get-in @app-state* [:tabs tab-id :signals])
+                      sig-patches     (when (and current-signals
+                                                 (not= current-signals last-sent-signals))
+                                        (signal/changed-signals last-sent-signals current-signals))
+                      sent?           (try
+                                        (if (and (seq dirty-ids)
+                                                 (not full-render?)
+                                                 (not (seq sig-patches)))
+                                          (handle-partial-render app-state* tab-id dirty-ids
+                                                                 channel br-out br-stream)
+                                          (handle-full-render app-state* session-id tab-id sig-patches
+                                                              enqueue-partial!
+                                                              channel br-out br-stream))
+                                        (catch Throwable e
+                                          (t/error! {:id   :hyper.error/renderer
+                                                     :msg  "Error rendering page"
+                                                     :data {:hyper/tab-id tab-id}}
+                                                    e)
+                                          nil))
+                      script-sent?    (send-pending-scripts! scripts tab-id
+                                                             channel br-out br-stream)]
+                  ;; sent? is true (ok), nil (no render-fn or error), false (channel closed)
+                  ;; script-sent? follows the same convention
+                  (when-not (or (false? sent?) (false? script-sent?))
+                    (Thread/sleep throttle-ms)
+                    (recur (or current-signals last-sent-signals)))))))))
       (catch Throwable e
-        (when-not (realized? shutdown-renderer*)
-          (t/error! e {:id   :hyper.error/renderer
-                       :data {:hyper/tab-id tab-id}})))
+        (t/error! {:id   :hyper.error/renderer
+                   :msg  "Error rendering page"
+                   :data {:hyper/tab-id tab-id}}
+                  e))
       (finally
         (br/close-stream br-stream)
         (when (instance? org.httpkit.server.AsyncChannel channel)
@@ -124,23 +215,31 @@
   "Start a per-tab renderer on a virtual thread.
 
    Returns a map with:
-   - :trigger-render! — zero-arg fn; call to signal a re-render
-   - :stop!           — zero-arg fn; call to shut down the renderer"
+   - :trigger-render!  — zero-arg fn; call to signal a full re-render
+   - :trigger-partial! — one-arg fn; call with component-id for partial re-render
+   - :enqueue-scripts! — one-arg fn; call with seq of JS strings to execute
+   - :stop!            — zero-arg fn; enqueues a :shutdown event to stop the renderer
+   - :render-queue     — the underlying LinkedBlockingQueue (for testing)"
   [app-state* session-id tab-id channel compress?]
-  (let [semaphore          (Semaphore. 0)
-        shutdown-renderer* (promise)
-        trigger-render!    #(.release semaphore)
-        stop!              #(do (deliver shutdown-renderer* true)
-                                (.release semaphore))
-        thread             (-> (Thread/ofVirtual)
-                               (.name (str "hyper-renderer-" tab-id))
-                               (.start ^Runnable
-                                 #(-renderer-loop! app-state* session-id tab-id
-                                                   channel compress?
-                                                   semaphore shutdown-renderer*)))]
-    {:trigger-render! trigger-render!
-     :stop!           stop!
-     :thread          thread}))
+  (let [render-queue     (rq/make-queue)
+        trigger-render!  #(rq/enqueue-full-render! render-queue)
+        trigger-partial! #(rq/enqueue-partial! render-queue %)
+        enqueue-scripts! #(rq/enqueue-scripts! render-queue %)
+        stop!            #(rq/enqueue-shutdown! render-queue)
+        thread           (-> (Thread/ofVirtual)
+                             (.name (str "hyper-renderer-" tab-id))
+                             (.start ^Runnable
+                               #(-renderer-loop! app-state* session-id tab-id
+                                                 channel compress?
+                                                 render-queue)))]
+    ;; Enqueue the initial full render to kick things off
+    (rq/enqueue-full-render! render-queue)
+    {:trigger-render!  trigger-render!
+     :trigger-partial! trigger-partial!
+     :enqueue-scripts! enqueue-scripts!
+     :stop!            stop!
+     :thread           thread
+     :render-queue     render-queue}))
 
 (defn wrap-hyper-context
   "Middleware that adds session-id and tab-id to the request."
@@ -171,18 +270,19 @@
                          :max-age   (* 60 60 24 7)}) ;; 7 days
               response)))))))
 
-(defn datastar-script
-  "Returns the Datastar CDN script tag."
+(defn default-datastar-script
+  "Returns the default Datastar CDN script tag."
   []
   [:script {:type "module"
             :src  "https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.1/bundles/datastar.js"}])
 
 (defn cleanup-tab!
-  "Clean up all resources for a tab: watchers, renderer thread, actions, and state."
+  "Clean up all resources for a tab: watchers, reactive components, renderer thread, actions, and state."
   [app-state* tab-id]
   (watch/remove-watchers! app-state* tab-id)
   (watch/remove-external-watches! app-state* tab-id)
   (watch/teardown-route-watches! app-state* tab-id)
+  (reactive/teardown-all-components! app-state* tab-id)
   (when-let [stop! (get-in @app-state* [:tabs tab-id :renderer :stop!])]
     (stop!))
   (actions/cleanup-tab-actions! app-state* tab-id)
@@ -218,7 +318,9 @@
                                                                  (filter var?))]
                                               (watch/watch-source! app-state* tab-id trigger-render! source)))
                                           ;; Set up route-level watches (:watches + Var :get handlers)
-                                          (watch/setup-route-watches! app-state* tab-id trigger-render!)))
+                                          (watch/setup-route-watches! app-state* tab-id trigger-render!)
+                                          ;; Promote any watches stashed during the initial HTTP render
+                                          (watch/promote-pending-watches! app-state* tab-id trigger-render!)))
 
                             :on-close (fn [_channel _status]
                                         (t/log! {:level :info
@@ -227,21 +329,40 @@
                                                  :msg   "Tab disconnected"})
                                         (cleanup-tab! app-state* tab-id))}))))
 
-(defn- parse-client-params
-  "Parse client params from a JSON request body, if present.
-   Returns a keyword-keyed map or nil."
+(defn- parse-client-query-params
+  "Extract client params from URL query parameters, JSON-decoding each
+   value.  Skips the `action-id` key (which is a hyper routing param,
+   not a client param).  Returns a keyword-keyed map, or nil when no
+   client params are present.
+
+   Values are JSON-encoded on the client by `hyper.encodeClientParams`, so a
+   round-trip through `JSON.stringify` → URL-encode → URL-decode →
+   `json/parse-string` preserves booleans, numbers, objects, etc."
   [req]
-  (try
-    (when-let [body (:body req)]
-      (let [s (if (string? body) body (slurp body))]
-        (when-not (clojure.string/blank? s)
-          (json/parse-string s true))))
-    (catch Exception _ nil)))
+  (let [qp (get req :query-params {})]
+    (when (> (count qp) 1)                 ;; more than just action-id
+      (reduce-kv (fn [acc k v]
+                   (if (= k "action-id")
+                     acc
+                     (assoc acc (keyword k)
+                            (try (json/parse-string v)
+                                 (catch Exception _ v)))))
+                 {}
+                 qp))))
 
 (defn action-handler
   "Handler for action POST requests.
-   Parses an optional JSON body for client params ($value, $checked, $key,
-   $form-data) and passes them to the action function."
+
+   All actions use Datastar's `@post()`, which sends all non-underscore
+   signals as a JSON body.  Client params ($value, $checked, etc.) are
+   passed as URL query parameters.
+
+   - Parses the body as signal values and binds them to `context/*signals*`
+   - Extracts client params from URL query parameters (JSON-decoded)
+   - Binds `effects/*pending*` to collect side-effects (cookies, scripts)
+   - Returns 204 (with any Set-Cookie headers) to prevent Datastar from
+     merging the response into signals
+   - Queues any pending scripts to the renderer for SSE delivery"
   [app-state*]
   (fn [req]
     (let [action-id (get-in req [:query-params "action-id"])]
@@ -254,19 +375,48 @@
         (let [req-with-state (assoc req
                                     :hyper/app-state app-state*
                                     :hyper/router (get @app-state* :router))
-              client-params  (parse-client-params req)]
-          (push-thread-bindings {#'context/*request* req-with-state})
+              raw-body       (try
+                               (when-let [body (:body req)]
+                                 (let [s (if (string? body) body (slurp body))]
+                                   (when-not (clojure.string/blank? s) s)))
+                               (catch Exception _ nil))
+              signals        (when raw-body
+                               (signal/parse-signals raw-body))
+              client-params  (parse-client-query-params req)
+              ;; Sync client signal values into server state so the
+              ;; render loop can detect changes (e.g. when a user types
+              ;; into a data-bind input, the server needs to know the
+              ;; latest value for changed-signals diffing).
+              action-data    (get-in @app-state* [:actions action-id])
+              tab-id         (:tab-id action-data)]
+          (when (and signals tab-id)
+            (swap! app-state* update-in [:tabs tab-id :signals]
+                   (fn [server-sigs]
+                     (merge server-sigs signals))))
+          (when-let [env (:hyper/env req)]
+            (when tab-id
+              (swap! app-state* assoc-in [:tabs tab-id :env] env)))
+          (push-thread-bindings {#'context/*request*     req-with-state
+                                 #'context/*signals*     signals
+                                 #'context/*action-name* (:as action-data)
+                                 #'effects/*pending*     (effects/init-pending)})
           (try
             (actions/execute-action! app-state* action-id client-params)
 
-            {:status  200
-             :headers {"Content-Type" "application/json"}
-             :body    "{\"success\": true}"}
-
+            ;; Collect accumulated effects
+            (let [pending  (effects/collect-pending!)
+                  ;; Queue pending scripts for SSE delivery via the renderer thread
+                  _        (when-let [scripts (seq (:scripts pending))]
+                             (when-let [renderer (get-in @app-state* [:tabs tab-id :renderer])]
+                               ((:enqueue-scripts! renderer) scripts)))
+                  ;; Build response — 204 with any cookies from effects
+                  response {:status 204}]
+              (effects/apply-cookies-to-response response pending))
             (catch Exception e
-              (t/error! e
-                        {:id   :hyper.error/action-handler
-                         :data {:hyper/action-id action-id}})
+              (t/error! {:id   :hyper.error/action-handler
+                         :msg  "Error executing action handler"
+                         :data {:hyper/action-id action-id}}
+                        e)
               {:status  500
                :headers {"Content-Type" "application/json"}
                :body    (json/generate-string {:error (.getMessage e)})})
@@ -295,20 +445,34 @@
      :query-params (or coerced-query-params raw-query-params {})}))
 
 (defn- hyper-scripts
-  "JavaScript for SPA navigation support:
+  "JavaScript for SPA navigation support and client param encoding:
+   - hyper.encodeClientParams(obj): URL-encodes an object of client params as a
+     query string fragment (e.g. \"value=hello&checked=true\") for use in @post() URLs.
    - MutationObserver on #hyper-app watches data-hyper-url attribute changes
      and syncs the browser URL bar via replaceState. Title syncing is handled
      server-side by re-rendering the full <head> (including <title>) via SSE.
+   - pageshow listener reloads restored documents so stale tab/action state
+     does not survive browser history restoration.
    - popstate listener handles browser back/forward by posting to /hyper/navigate
      and restoring document.title from history state.
 
    Uses c/raw to prevent Chassis from HTML-escaping the JavaScript content
    (e.g., && would become &amp;&amp; which breaks JS syntax)."
-  [tab-id]
+  [tab-id base-path]
   [:script
    (c/raw
      (str "
 (function() {
+  window.hyper = window.hyper || {};
+  window.hyper.encodeClientParams = function(o) {
+    var p = [];
+    for (var k in o) {
+      if (o.hasOwnProperty(k) && o[k] !== undefined) {
+        p.push(encodeURIComponent(k) + '=' + encodeURIComponent(JSON.stringify(o[k])));
+      }
+    }
+    return p.join('&');
+  };
   var appEl = document.getElementById('hyper-app');
   if (appEl) {
     // Seed the initial history entry with the current title so back-navigation restores it
@@ -326,11 +490,17 @@
     });
     observer.observe(appEl, { attributes: true, attributeFilter: ['data-hyper-url'] });
   }
+  window.addEventListener('pageshow', function(event) {
+    var nav = performance.getEntriesByType && performance.getEntriesByType('navigation')[0];
+    if (event.persisted || (nav && nav.type === 'back_forward')) {
+      window.location.reload();
+    }
+  });
   window.addEventListener('popstate', function(e) {
     if (e.state && e.state.title) {
       document.title = e.state.title;
     }
-    fetch('/hyper/navigate?tab-id=" tab-id "&path=' + encodeURIComponent(window.location.pathname + window.location.search), {
+    fetch('" base-path "/hyper/navigate?tab-id=" tab-id "&path=' + encodeURIComponent(window.location.pathname + window.location.search), {
       method: 'POST',
       headers: {'Content-Type': 'application/json'}
     });
@@ -345,12 +515,9 @@
    re-resolution, title/head resolution).
 
    Options:
-   - :head Hiccup nodes to append into the <head>, or (fn [req] ...) -> hiccup.
-           When head is a function, it is re-evaluated on each SSE render cycle
-           and the full <head> is pushed to the client.
-   - :html-attrs Map of attributes to merge onto the root <html> element
-                 (e.g. {:lang \"en\"})."
-  [app-state* {:keys [html-attrs]}]
+   - :datastar-script - Hiccup content for Datastar script added to document head, or nil."
+  [app-state* {:keys [datastar-script open-when-hidden? base-path] :or {open-when-hidden? true
+                                                                        base-path         ""}}]
   (fn [render-fn]
     (fn [req]
       (let [tab-id     (:hyper/tab-id req)
@@ -359,26 +526,33 @@
 
         (render/register-render-fn! app-state* tab-id render-fn)
         (state/set-tab-route! app-state* tab-id route-info)
+        (when-let [env (:hyper/env req)]
+          (swap! app-state* assoc-in [:tabs tab-id :env] env))
 
         (let [result (render/render-tab app-state* session-id tab-id req)]
           ;; Ring response passthrough (e.g. a 302 redirect)
           (if (:status result)
             result
-            (let [{:keys [title head-html body-html]} result
-                  title                               (or title "Hyper App")
-                  html                                (c/html
-                                                        [c/doctype-html5
-                                                         [:html (or html-attrs {})
-                                                          [:head
-                                                           [:meta {:charset "UTF-8"}]
-                                                           [:meta {:name "viewport" :content "width=device-width, initial-scale=1"}]
-                                                           [:title title]
-                                                           (datastar-script)
-                                                           (when head-html (c/raw head-html))]
-                                                          [:body
-                                                           {:data-init (str "@get('/hyper/events?tab-id=" tab-id "', {openWhenHidden: true})")}
-                                                           [:div {:id "hyper-app"} (c/raw body-html)]
-                                                           (hyper-scripts tab-id)]]])]
+            (let [{:keys [title head-html body-html declared-signals]} result
+                  title                                                (or title "Hyper App")
+                  sig-attrs                                            (signal/format-signal-attrs declared-signals)
+                  div-attrs                                            (cond-> {:id "hyper-app"}
+                                                                         sig-attrs (merge sig-attrs))
+                  html                                                 (c/html
+                                                                         [c/doctype-html5
+                                                                          [:html
+                                                                           [:head
+                                                                            [:meta {:charset "UTF-8"}]
+                                                                            [:meta {:name "viewport" :content "width=device-width, initial-scale=1"}]
+                                                                            [:title title]
+                                                                            datastar-script
+                                                                            (when head-html (c/raw head-html))]
+                                                                           [:body
+                                                                            {:data-init (str "@get('" base-path "/hyper/events?tab-id=" tab-id "'"
+                                                                                             (when open-when-hidden? ", {openWhenHidden: true}")
+                                                                                             ")")}
+                                                                            [:div div-attrs (c/raw body-html)]
+                                                                            (hyper-scripts tab-id base-path)]]])]
               {:status  200
                :headers {"Content-Type" "text/html; charset=utf-8"}
                :body    html})))))))
@@ -393,6 +567,9 @@
           _session-id (:hyper/session-id req)
           router      (get @app-state* :router)
           route-index (routes/live-route-index app-state*)]
+      (when-let [env (:hyper/env req)]
+        (when tab-id
+          (swap! app-state* assoc-in [:tabs tab-id :env] env)))
       (if-not (and path tab-id router)
         {:status  400
          :headers {"Content-Type" "application/json"}
@@ -502,61 +679,97 @@
    Options:
    - :head              Hiccup nodes appended to the <head> (e.g. stylesheet <link>),
                         or (fn [req] ...) -> hiccup nodes appended to the <head>
-   - :html-attrs        Map of attributes for the root <html> element
-                        (e.g. {:lang \"en\"}). Defaults to none.
+   - :datastar-script   Hiccup nodes for the Datastar script (or nil to suppress)
+   - :open-when-hidden? Keep the SSE connection open when the browser tab is hidden
+                        (default true). When false, Datastar closes the connection
+                        on tab hide and reopens it when the tab becomes visible.
+   - :base-path         URL path prefix for reverse-proxy deployments where the app
+                        is served under a subfolder (e.g. \"/my-app\"). When set,
+                        all internal hyper endpoints (/hyper/events, /hyper/actions,
+                        /hyper/navigate) are mounted and referenced under this prefix.
+                        Must start with \"/\" and have no trailing slash.
    - :static-resources  Classpath resource root(s) to serve as static assets
    - :static-dir        Filesystem directory (or directories) to serve as static assets
    - :watches           Vector of Watchable sources added to every page route.
                         Useful for top-level atoms that should trigger a re-render
                         on any page (e.g. a global config or feature-flags atom).
-   - :hiccup-transform  (fn [hiccup] hiccup) applied before Chassis serialization.
+   - :middleware        Vector of Ring middleware fns applied inside the HTTP stack.
+                        Each is (fn [handler] (fn [req] ...)).  Runs after Hyper's
+                        built-in cookie, params, and session middleware, so your
+                        middleware sees parsed :cookies, :params, :hyper/session-id,
+                        and :hyper/tab-id.  Use this for auth, :hyper/env setup, and
+                        other request-level concerns.  Middleware can also be applied
+                        outside create-handler, but will not have access to parsed
+                        cookies/params.
+   - :render-middleware Vector of middleware fns applied to every page render.
+                        Each is (fn [handler] (fn [req] ...)), identical to Ring
+                        middleware.  Runs outermost (before per-route middleware).
+                        Applied on both initial HTTP page loads and SSE re-renders.
+   - :render-error      Function `(fn [error req] -> hiccup)` rendered in place
+                        of a view whose render-fn threw.  May be a Var (e.g.
+                        `#'my.app/error-page`) to pick up redefinitions without
+                        restarting the server.  Defaults to
+                        `hyper.render.error/minimal` (generic, production-safe).
+                        Use `hyper.render.error/explain` in development to see
+                        the message, ex-data, and full stack trace.
 
    Routes should use :get handlers that return hiccup (Chassis vectors).
    Hyper will wrap them to provide full HTML responses and SSE connections."
   ([routes app-state*]
-   (create-handler routes app-state* {}))
-  ([routes app-state* {:keys [watches head] :as opts}]
-   (let [page-wrapper                             (page-handler app-state* opts)
-         system-routes                            [["/hyper/events" {:get (sse-events-handler app-state*)}]
-                                                   ["/hyper/actions" {:post (action-handler app-state*)}]
-                                                   ["/hyper/navigate" {:post (navigate-handler app-state*)}]]
+   (create-handler routes app-state* {:datastar-script (default-datastar-script)}))
+  ([routes app-state* {:keys [watches head base-path middleware render-middleware render-error]
+                       :or   {render-error render.error/minimal}
+                       :as   opts}]
+   (let [base-path       (or base-path "")
+         page-wrapper    (page-handler app-state* (assoc opts :base-path base-path))
+         system-routes   [[(str base-path "/hyper/events") {:get (sse-events-handler app-state*)}]
+                          [(str base-path "/hyper/actions") {:post (action-handler app-state*)}]
+                          [(str base-path "/hyper/navigate") {:post (navigate-handler app-state*)}]]
          ;; Store the routes source (Var or value) so title resolution can
          ;; always read the latest route metadata, even between router rebuilds.
          ;; Store global :watches so find-route-watches can prepend them to
          ;; every page route's watch list. Auto-watch :head if it's a Var.
-         _                                        (swap! app-state* assoc
-                                                         :routes-source routes
-                                                         :global-watches (vec watches)
-                                                         :head head
-                                                         :hiccup-transform (:hiccup-transform opts))
-         initial-routes                           (if (var? routes) @routes routes)
-         initial-handler                          (build-ring-handler initial-routes app-state* page-wrapper system-routes)
-         handler                                  (if (var? routes)
-                   ;; Dynamic: rebuild router when the routes Var is redefined.
-                   ;; Uses identical? since a re-def always creates a new object,
-                   ;; avoiding deep equality checks on every request.
-                                                    (let [cached (atom {:routes  initial-routes
-                                                                        :handler initial-handler})]
-                                                      (fn [req]
-                                                        (let [current-routes @routes]
+         ;; Store base-path so actions and navigate can reference prefixed URLs.
+         ;; :render-error is stored as-is (fn or Var); render-tab invokes it
+         ;; via IFn so a Var picks up redefinitions on each call.
+         _               (swap! app-state* assoc
+                                :routes-source routes
+                                :global-watches (vec watches)
+                                :head head
+                                :base-path base-path
+                                :render-middleware (vec render-middleware)
+                                :render-error render-error)
+         initial-routes  (if (var? routes) @routes routes)
+         initial-handler (build-ring-handler initial-routes app-state* page-wrapper system-routes)
+         handler         (if (var? routes)
+                           ;; Dynamic: rebuild router when the routes Var is redefined.
+                           ;; Uses identical? since a re-def always creates a new object,
+                           ;; avoiding deep equality checks on every request.
+                           (let [cached (atom {:routes  initial-routes
+                                               :handler initial-handler})]
+                             (fn [req]
+                               (let [current-routes @routes]
 
-                                                          (when-not (identical? current-routes (:routes @cached))
-                                                            (t/log! {:level :info
-                                                                     :id    :hyper.event/routes-reload
-                                                                     :msg   "Routes changed, rebuilding router"})
-                                                            (let [h (build-ring-handler current-routes app-state*
-                                                                                        page-wrapper system-routes)]
-                                                              (reset! cached {:routes current-routes :handler h})))
-                                                          ((:handler @cached) req))))
-                   ;; Static: use the compiled handler directly
-                                                    initial-handler)
+                                 (when-not (identical? current-routes (:routes @cached))
+                                   (t/log! {:level :info
+                                            :id    :hyper.event/routes-reload
+                                            :msg   "Routes changed, rebuilding router"})
+                                   (let [h (build-ring-handler current-routes app-state*
+                                                               page-wrapper system-routes)]
+                                     (reset! cached {:routes current-routes :handler h})))
+                                 ((:handler @cached) req))))
+                           ;; Static: use the compiled handler directly
+                           initial-handler)
          handler-with-mw
-         (-> handler
-             ((wrap-hyper-context app-state*))
-             (br/wrap-brotli)
-             (keyword-params/wrap-keyword-params)
-             (params/wrap-params)
-             (cookies/wrap-cookies))]
+         (as-> handler h
+           ;; User :middleware runs innermost — after cookies/params/hyper-context
+           ;; are parsed, before routing.  Earlier entries wrap outermost (execute first).
+           (reduce (fn [h mw] (mw h)) h (reverse (vec middleware)))
+           ((wrap-hyper-context app-state*) h)
+           (br/wrap-brotli h)
+           (keyword-params/wrap-keyword-params h)
+           (params/wrap-params h)
+           (cookies/wrap-cookies h))]
      ;; Static middleware should be outermost so static requests avoid params/cookies.
      ;; Attach app-state* as metadata so start! can build a stop fn that cleans up.
      (with-meta (wrap-static handler-with-mw opts)

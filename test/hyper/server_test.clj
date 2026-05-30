@@ -1,12 +1,17 @@
 (ns hyper.server-test
   (:require [clojure.java.io :as io]
+            [clojure.string :as string]
             [clojure.test :refer [deftest is testing]]
             [hyper.actions :as actions]
             [hyper.render :as render]
+            [hyper.render.queue :as rq]
             [hyper.routes :as routes]
             [hyper.server :as server]
             [hyper.state :as state]
-            [hyper.watch :as watch]))
+            [hyper.watch :as watch]
+            [matcher-combinators.matchers :as m]
+            [matcher-combinators.test :refer [match?]]
+            [org.httpkit.server :as http-kit]))
 
 (deftest test-generate-session-id
   (testing "Session ID generation"
@@ -14,8 +19,8 @@
           id2 (server/generate-session-id)]
       (is (string? id1))
       (is (string? id2))
-      (is (.startsWith id1 "sess-"))
-      (is (.startsWith id2 "sess-"))
+      (is (.startsWith id1 "ses_"))
+      (is (.startsWith id2 "ses_"))
       (is (not= id1 id2)))))
 
 (deftest test-generate-tab-id
@@ -24,8 +29,8 @@
           id2 (server/generate-tab-id)]
       (is (string? id1))
       (is (string? id2))
-      (is (.startsWith id1 "tab-"))
-      (is (.startsWith id2 "tab-"))
+      (is (.startsWith id1 "tab_"))
+      (is (.startsWith id2 "tab_"))
       (is (not= id1 id2)))))
 
 (deftest test-wrap-hyper-context-new-session
@@ -41,14 +46,14 @@
 
       (is (contains? (:cookies response) "hyper-session"))
       (is (string? (get-in response [:cookies "hyper-session" :value])))
-      (is (.startsWith (get-in response [:cookies "hyper-session" :value]) "sess-"))
-      (is (.contains (:body response) "session: sess-"))
-      (is (.contains (:body response) "tab: tab-")))))
+      (is (.startsWith (get-in response [:cookies "hyper-session" :value]) "ses_"))
+      (is (.contains (:body response) "session: ses_"))
+      (is (.contains (:body response) "tab: tab_")))))
 
 (deftest test-wrap-hyper-context-existing-session
   (testing "Middleware reuses existing session from cookie"
     (let [app-state*          (atom (state/init-state))
-          existing-session-id "sess-existing-123"
+          existing-session-id "ses_existing_123"
           handler             (fn [req]
                                 {:status 200
                                  :body   (str "session: " (:hyper/session-id req))})
@@ -57,7 +62,7 @@
           response            (wrapped req)]
 
       (is (nil? (get-in response [:cookies "hyper-session"])))
-      (is (.contains (:body response) "session: sess-existing-123")))))
+      (is (.contains (:body response) "session: ses_existing_123")))))
 
 (deftest test-wrap-hyper-context-tab-id-from-query
   (testing "Middleware uses tab-id from query params"
@@ -66,18 +71,45 @@
                        {:status 200
                         :body   (str "tab: " (:hyper/tab-id req))})
           wrapped    ((server/wrap-hyper-context app-state*) handler)
-          req        {:query-params {"tab-id" "tab-from-query"}}
+          req        {:query-params {"tab-id" "tab_from_query"}}
           response   (wrapped req)]
 
-      (is (.contains (:body response) "tab: tab-from-query")))))
+      (is (.contains (:body response) "tab: tab_from_query")))))
 
-(deftest test-datastar-script
+(deftest test-default-datastar-script
   (testing "Datastar script tag generation"
-    (let [script (server/datastar-script)]
+    (let [script (server/default-datastar-script)]
       (is (vector? script))
-      (is (= :script (first script)))
-      (is (contains? (second script) :src))
-      (is (.contains (get (second script) :src) "datastar")))))
+      (is (match?
+            [:script {:src  #".*datastar.*"
+                      :type "module"}]
+            script)))))
+
+(deftest test-initial-sse-response-headers
+  (testing "sends the expected initial SSE response headers"
+    (doseq [[compress? expected-headers]
+            [[false {"Content-Type"      "text/event-stream"
+                     "Cache-Control"     "no-cache, no-transform"
+                     "X-Accel-Buffering" "no"}]
+             [true  {"Content-Type"      "text/event-stream"
+                     "Cache-Control"     "no-cache, no-transform"
+                     "X-Accel-Buffering" "no"
+                     "Content-Encoding"  "br"}]]]
+      (let [captured-response (atom nil)
+            render-queue      (rq/make-queue)]
+        ;; Pre-enqueue a full render so drain! doesn't block forever
+        (rq/enqueue-full-render! render-queue)
+        (with-redefs [http-kit/send! (fn [_channel response _close-after-send?]
+                                       (reset! captured-response response)
+                                       false)]
+          (#'server/-renderer-loop! (atom (state/init-state))
+                                    "ses_test"
+                                    "tab_test"
+                                    ::channel
+                                    compress?
+                                    render-queue)
+          (is (= expected-headers
+                 (:headers @captured-response))))))))
 
 (deftest test-create-handler
   (testing "Creates a working ring handler"
@@ -118,6 +150,34 @@
       (is (.contains (:body response) "content=\"ok\""))
       (is (.contains (:body response) "data-hyper-head")
           "Head elements are marked for SSE management")))
+
+  (testing "Datastar script override"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          handler    (server/create-handler routes app-state*
+                                            {:head            (fn [_req]
+                                                                [[:meta {:name "test" :content "ok"}]])
+                                             :datastar-script [:script {:src "something-else.js"}]})
+          response   (handler {:uri "/" :request-method :get})]
+      (is (match?
+            {:status 200
+             :body   (m/pred #(string/includes? % "<script src=\"something-else.js\">"))}
+            response))))
+
+  (testing "Datastar script suppress"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          handler    (server/create-handler routes app-state*
+                                            {:head            (fn [_req]
+                                                                [[:meta {:name "test" :content "ok"}]])
+                                             :datastar-script nil})
+          response   (handler {:uri "/" :request-method :get})]
+      (is (match?
+            {:status 200
+             :body   (m/pred #(not (string/includes? % "<script src=")))}
+            response))))
 
   (testing "Allows :head to be a Var containing a function"
     (let [app-state* (atom (state/init-state))
@@ -205,6 +265,36 @@
           response   (handler {:uri "/hyper-test-static.txt" :request-method :get})]
       (is (= 200 (:status response)))
       (is (= "static-ok\n" (slurp (:body response)))))))
+
+(deftest test-open-when-hidden
+  (testing "Default includes openWhenHidden: true in data-init"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          handler    (server/create-handler routes app-state*)
+          response   (handler {:uri "/" :request-method :get})]
+      (is (= 200 (:status response)))
+      (is (string/includes? (:body response) "openWhenHidden: true"))))
+
+  (testing "Explicit true includes openWhenHidden: true in data-init"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          handler    (server/create-handler routes app-state*
+                                            {:open-when-hidden? true})
+          response   (handler {:uri "/" :request-method :get})]
+      (is (= 200 (:status response)))
+      (is (string/includes? (:body response) "openWhenHidden: true"))))
+
+  (testing "false omits openWhenHidden from data-init"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          handler    (server/create-handler routes app-state*
+                                            {:open-when-hidden? false})
+          response   (handler {:uri "/" :request-method :get})]
+      (is (= 200 (:status response)))
+      (is (not (string/includes? (:body response) "openWhenHidden"))))))
 
 (deftest test-ring-response-passthrough
   (testing "render fn returning a Ring response map is passed through as-is"
@@ -378,8 +468,8 @@
           handler    (server/create-handler routes app-state*)
           stop-fn    (server/start! handler {:port 13001})
           session-id "test-session"
-          tab-id-1   "test-tab-1"
-          tab-id-2   "test-tab-2"
+          tab-id-1   "test_tab_1"
+          tab-id-2   "test_tab_2"
           stopped    (atom #{})]
 
       ;; Simulate two connected tabs with watchers, actions, and mock renderers
@@ -483,3 +573,83 @@
           response   (handler {:uri "/" :request-method :get})]
       (is (= 200 (:status response)))
       (is (.contains (:body response) "Static")))))
+
+(deftest test-base-path
+  (testing "Default (no :base-path) uses /hyper/* paths"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          handler    (server/create-handler routes app-state*)
+          response   (handler {:uri "/" :request-method :get})
+          body       (:body response)]
+      (is (= 200 (:status response)))
+      (is (string/includes? body "/hyper/events"))
+      (is (string/includes? body "/hyper/navigate"))
+      (is (not (string/includes? body "//hyper")))))
+
+  (testing ":base-path prefixes /hyper/events in data-init"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          handler    (server/create-handler routes app-state*
+                                            {:base-path "/my-app"})
+          response   (handler {:uri "/" :request-method :get})
+          body       (:body response)]
+      (is (= 200 (:status response)))
+      (is (string/includes? body "/my-app/hyper/events"))
+      (is (not (string/includes? body "@get('/hyper/events")))))
+
+  (testing ":base-path prefixes /hyper/navigate in popstate JS"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          handler    (server/create-handler routes app-state*
+                                            {:base-path "/my-app"})
+          response   (handler {:uri "/" :request-method :get})
+          body       (:body response)]
+      (is (string/includes? body "/my-app/hyper/navigate"))
+      (is (not (string/includes? body "fetch('/hyper/navigate")))))
+
+  (testing ":base-path mounts system routes under the prefix"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          handler    (server/create-handler routes app-state*
+                                            {:base-path "/my-app"})
+          ;; System routes should be accessible under /my-app/hyper/*
+          events-res (handler {:uri "/my-app/hyper/events" :request-method :get})
+          ;; And the old paths should not match (404)
+          old-res    (handler {:uri "/hyper/events" :request-method :get})]
+      (is (not= 404 (:status events-res)))
+      (is (= 404 (:status old-res)))))
+
+  (testing ":base-path is stored in app-state"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          _handler   (server/create-handler routes app-state*
+                                            {:base-path "/sub"})]
+      (is (= "/sub" (:base-path @app-state*)))))
+
+  (testing "default (no :base-path) stores empty string in app-state"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          _handler   (server/create-handler routes app-state*)]
+      (is (= "" (:base-path @app-state*)))))
+
+  (testing ":base-path works alongside other options"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          handler    (server/create-handler routes app-state*
+                                            {:base-path         "/app"
+                                             :open-when-hidden? false
+                                             :head              [[:link {:rel "stylesheet" :href "/app.css"}]]})
+          response   (handler {:uri "/" :request-method :get})
+          body       (:body response)]
+      (is (= 200 (:status response)))
+      (is (string/includes? body "/app/hyper/events"))
+      (is (string/includes? body "/app/hyper/navigate"))
+      (is (string/includes? body "rel=\"stylesheet\""))
+      (is (not (string/includes? body "openWhenHidden"))))))

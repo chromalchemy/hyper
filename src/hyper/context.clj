@@ -12,6 +12,101 @@
 ;; enabling effective brotli streaming compression.
 (def ^:dynamic *action-idx* nil)
 
+;; Datastar signal values parsed from the @post() request body during
+;; action execution.  Bound to a keyword-keyed map by the action handler
+;; so that Signal/deref can return the live client-side value.  nil
+;; outside of an action context (i.e. during render).
+(def ^:dynamic *signals* nil)
+
+;; Accumulator for signal declarations emitted during a render pass.
+;; Bound to (atom []) before each render so that (h/signal ...) and
+;; (h/local-signal ...) can register themselves for HTML injection.
+;; Each entry is a map with :html-name, :default-val, and :local? keys.
+(def ^:dynamic *declared-signals* nil)
+
+;; Accumulator for action IDs registered during a render pass.
+;; Bound to (atom #{}) before each render so that register-action!
+;; can track which action IDs are live.  After render, stale actions
+;; (present in the previous cycle but absent from this one) are removed
+;; in a single atomic swap — no cleanup-before-render gap needed.
+(def ^:dynamic *registered-action-ids* nil)
+
+;; State overlay for cursor read/write indirection.
+;;
+;; When non-nil, a map with:
+;;   :state*  — atom holding the shadow state (cursor reads/writes go here)
+;;   :paths*  — atom #{} of full-paths that were written (for selective flush)
+;;
+;; Bound during render (snapshot for read consistency) and inside the
+;; `batch` macro (deferred writes for atomicity).  Cursors check this var
+;; first: if bound, reads/writes go through the overlay; otherwise they
+;; hit app-state* directly.
+;;
+;; At the boundary end (render complete / batch body returns), written
+;; paths are flushed to app-state* in a single swap! via `flush-overlay!`.
+;; nil during action execution (without batch) so that actions see/mutate
+;; live state and each cursor write fires the watcher immediately.
+(def ^:dynamic *state-overlay* nil)
+
+(defn flush-overlay!
+  "Flush written paths from the current overlay to the live atom.
+   Only touches paths that were actually written during the overlay's
+   lifetime, preserving concurrent changes to other paths.
+   No-op when no paths were written."
+  [app-state*]
+  (when-let [{:keys [state* paths*]} *state-overlay*]
+    (let [shadow @state*
+          paths  @paths*]
+      (when (seq paths)
+        (swap! app-state* (fn [live]
+                            (reduce (fn [s p]
+                                      (assoc-in s p (get-in shadow p)))
+                                    live
+                                    paths)))))))
+
+;; The :as name of the currently executing action, or nil when outside
+;; an action context or when the action was not given an :as name.
+;; Bound by the action handler in server.clj so that utility functions
+;; called from within actions can identify which action is running
+;; without the caller having to pass the name explicitly.
+;;
+;; Example:
+;;   (h/action {:as "delete-user"}
+;;     (audit! context/*action-name*)  ;; => "delete-user"
+;;     (delete-user! id))
+(def ^:dynamic *action-name* nil)
+
+;; Accumulator for reactive component IDs registered during a render pass.
+;; Bound to (atom #{}) before each full render so that the reactive macro
+;; can track which components are live.  After render, stale components
+;; (present in the previous cycle but absent from this one) are swept —
+;; their watches are removed and deps released.
+(def ^:dynamic *registered-reactive-ids* nil)
+
+(defn render-bindings
+  "Build the thread-binding map for a full render context.
+   Includes a state overlay snapshot so cursor reads/writes are isolated.
+   Returns a map suitable for `push-thread-bindings`."
+  [req app-state*]
+  {#'*request*                 req
+   #'*action-idx*              (atom 0)
+   #'*declared-signals*        (atom [])
+   #'*registered-action-ids*   (atom #{})
+   #'*registered-reactive-ids* (atom #{})
+   #'*state-overlay*           {:state* (atom @app-state*)
+                                :paths* (atom #{})}})
+
+(defn partial-render-bindings
+  "Build the thread-binding map for a partial (reactive component) render.
+   No state overlay — reads/writes go directly to the live atom."
+  [req]
+  {#'*request*                 req
+   #'*action-idx*              (atom 0)
+   #'*declared-signals*        (atom [])
+   #'*registered-action-ids*   (atom #{})
+   #'*registered-reactive-ids* (atom #{})
+   #'*state-overlay*           nil})
+
 (defn require-context!
   "Extract and validate the request context from *request*.
    Throws if called outside a request context or if required keys are missing.

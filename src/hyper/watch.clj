@@ -12,6 +12,26 @@
 ;; External source watching
 ;; ---------------------------------------------------------------------------
 
+(defn retain-source!
+  "Increment the reference count for a watched source."
+  [app-state* source]
+  (swap! app-state* update-in [:source-refcounts source] (fnil inc 0))
+  nil)
+
+(defn release-source!
+  "Decrement the reference count for a watched source.  When the count
+   reaches zero, calls -dispose and removes the refcount entry."
+  [app-state* source]
+  (let [new-state (swap! app-state* (fn [state]
+                                      (let [n (dec (get-in state [:source-refcounts source] 1))]
+                                        (if (pos? n)
+                                          (assoc-in state [:source-refcounts source] n)
+                                          (-> state
+                                              (update :source-refcounts dissoc source))))))]
+    (when-not (contains? (:source-refcounts new-state) source)
+      (proto/-dispose source)))
+  nil)
+
 (defn- add-external-watch!
   "Watch an external Watchable source for a tab, tracking it under the
    given state-key (:watches or :route-watches). When the source changes,
@@ -21,18 +41,27 @@
     (proto/-add-watch source watch-key
                       (fn [_old _new]
                         (trigger-render!)))
+    (retain-source! app-state* source)
     (swap! app-state* update-in [:tabs tab-id state-key]
            (fnil assoc {}) watch-key source)
     nil))
 
 (defn- remove-external-watches-by-key!
-  "Remove all external watches stored under state-key for a tab."
+  "Remove all external watches stored under state-key for a tab.
+   Decrements the reference count for each source and disposes it
+   only when no other tab is still watching it."
   [app-state* tab-id state-key]
   (let [watches (get-in @app-state* [:tabs tab-id state-key])]
     (doseq [[watch-key source] watches]
-      (proto/-remove-watch source watch-key))
+      (proto/-remove-watch source watch-key)
+      (release-source! app-state* source))
     (swap! app-state* update-in [:tabs tab-id] dissoc state-key))
   nil)
+
+(defn- watch-key-for
+  "Compute the dedup watch key for an external source and tab."
+  [tab-id source prefix]
+  (keyword (str prefix tab-id "-" (System/identityHashCode source))))
 
 (defn watch-source!
   "Watch an external Watchable source for a specific tab. When the source
@@ -41,6 +70,29 @@
    Idempotent — calling with the same source and tab is safe."
   [app-state* tab-id trigger-render! source]
   (add-external-watch! app-state* tab-id trigger-render! source "hyper-ext-" :watches))
+
+(defn stash-pending-watch!
+  "Stash a source under :pending-watches for later promotion when SSE connects.
+   Called by watch! during the initial HTTP render when no trigger-render! is
+   available yet. Uses the same identity-hash key as watch-source! for dedup."
+  [app-state* tab-id source]
+  (let [wk (watch-key-for tab-id source "hyper-ext-")]
+    (swap! app-state* update-in [:tabs tab-id :pending-watches]
+           (fnil assoc {}) wk source))
+  nil)
+
+(defn promote-pending-watches!
+  "Promote any pending watches for a tab into real watches. Called from the
+   SSE on-open callback after the renderer is started. For each stashed
+   source, registers a real watch via watch-source!, then clears the
+   :pending-watches map from the tab state."
+  [app-state* tab-id trigger-render!]
+  (let [pending (get-in @app-state* [:tabs tab-id :pending-watches])]
+    (when (seq pending)
+      (doseq [[_watch-key source] pending]
+        (watch-source! app-state* tab-id trigger-render! source))
+      (swap! app-state* update-in [:tabs tab-id] dissoc :pending-watches)))
+  nil)
 
 (defn remove-external-watches!
   "Remove all external watches for a tab."
@@ -88,26 +140,33 @@
         global-path  [:global]
         session-path [:sessions session-id :data]
         tab-path     [:tabs tab-id :data]
-        route-path   [:tabs tab-id :route]]
+        route-path   [:tabs tab-id :route]
+        signals-path [:tabs tab-id :signals]]
     (add-watch app-state* watch-key
                (fn [_k _r old-state new-state]
                  (let [route-changed? (let [old-route (get-in old-state route-path)
                                             new-route (get-in new-state route-path)]
                                         (and new-route (not= old-route new-route)))]
-                   ;; Swap route-level watches when navigating to a new named route
+                   ;; Swap watches when navigating to a new named route.
+                   ;; Tears down both route-level watches AND user h/watch!
+                   ;; calls — the new page's render will re-register any
+                   ;; watches it needs via fresh h/watch! calls.
                    (when route-changed?
                      (let [old-name (get-in old-state (conj route-path :name))
                            new-name (get-in new-state (conj route-path :name))]
                        (when (not= old-name new-name)
+                         (remove-external-watches! app-state* tab-id)
                          (setup-route-watches! app-state* tab-id trigger-render!))))
-                   ;; Re-render if any watched path changed
+                   ;; Re-render if any watched path changed (including signals)
                    (when (or route-changed?
                              (not= (get-in old-state global-path)
                                    (get-in new-state global-path))
                              (not= (get-in old-state session-path)
                                    (get-in new-state session-path))
                              (not= (get-in old-state tab-path)
-                                   (get-in new-state tab-path)))
+                                   (get-in new-state tab-path))
+                             (not= (get-in old-state signals-path)
+                                   (get-in new-state signals-path)))
                      (trigger-render!))))))
   nil)
 
