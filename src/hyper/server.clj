@@ -347,8 +347,10 @@
    Options:
    - :head Hiccup nodes to append into the <head>, or (fn [req] ...) -> hiccup.
            When head is a function, it is re-evaluated on each SSE render cycle
-           and the full <head> is pushed to the client."
-  [app-state* _opts]
+           and the full <head> is pushed to the client.
+   - :html-attrs Map of attributes to merge onto the root <html> element
+                 (e.g. {:lang \"en\"})."
+  [app-state* {:keys [html-attrs]}]
   (fn [render-fn]
     (fn [req]
       (let [tab-id     (:hyper/tab-id req)
@@ -366,7 +368,7 @@
                   title                               (or title "Hyper App")
                   html                                (c/html
                                                         [c/doctype-html5
-                                                         [:html
+                                                         [:html (or html-attrs {})
                                                           [:head
                                                            [:meta {:charset "UTF-8"}]
                                                            [:meta {:name "viewport" :content "width=device-width, initial-scale=1"}]
@@ -500,6 +502,8 @@
    Options:
    - :head              Hiccup nodes appended to the <head> (e.g. stylesheet <link>),
                         or (fn [req] ...) -> hiccup nodes appended to the <head>
+   - :html-attrs        Map of attributes for the root <html> element
+                        (e.g. {:lang \"en\"}). Defaults to none.
    - :static-resources  Classpath resource root(s) to serve as static assets
    - :static-dir        Filesystem directory (or directories) to serve as static assets
    - :watches           Vector of Watchable sources added to every page route.

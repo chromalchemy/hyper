@@ -283,6 +283,8 @@
    Options (keyword arguments):
    - :app-state         — Atom for application state (default: fresh atom)
    - :head              — Hiccup nodes appended to the HTML <head>, or (fn [req] ...) -> hiccup
+   - :html-attrs        — Map of attributes merged onto the root <html> element
+                          (e.g. {:lang \"en\"})
    - :static-resources  — Classpath resource root(s) to serve as static assets
    - :static-dir        — Filesystem directory (or directories) to serve as static assets
    - :watches           — Vector of Watchable sources added to every page route.
@@ -318,10 +320,11 @@
      (def app (start! handler {:port 3000}))
      ;; Later...
      (stop! app)"
-  [routes & {:keys [app-state head static-resources static-dir watches hiccup-transform]
+  [routes & {:keys [app-state head html-attrs static-resources static-dir watches hiccup-transform]
              :or   {app-state (atom (state/init-state))}}]
   (server/create-handler routes app-state
                          {:head             head
+                          :html-attrs       html-attrs
                           :static-resources static-resources
                           :static-dir       static-dir
                           :watches          watches
