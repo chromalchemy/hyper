@@ -305,7 +305,9 @@
              ;; register actions during realization.  We must read
              ;; *registered-action-ids* AFTER serialization so the
              ;; accumulator captures every action the render produced.
-             (let [body         (unwrap-body raw-body)
+             (let [transform    (get @app-state* :hiccup-transform)
+                   body         (unwrap-body raw-body)
+                   body         (if transform (transform body) body)
                    body-html    (if (vector? body)
                                   (c/html body)
                                   (apply str (map c/html body)))
@@ -314,6 +316,7 @@
                    title        (routes/resolve-title title-spec req)
                    head         (some-> (routes/resolve-head (get @app-state* :head) req)
                                         mark-head-elements)
+                   head         (if (and transform head) (transform head) head)
                    declared     @context/*declared-signals*
                    action-ids   @context/*registered-action-ids*
                    reactive-ids @context/*registered-reactive-ids*]

@@ -559,7 +559,7 @@
      (stop! app)"
   [routes & {:keys [app-state head static-resources static-dir watches
                     datastar-script base-path middleware render-middleware
-                    render-error]
+                    render-error hiccup-transform]
              :or   {app-state       (atom (state/init-state))
                     datastar-script server/default-datastar-script}}]
   (server/create-handler routes app-state
@@ -570,7 +570,8 @@
                                   :watches           watches
                                   :base-path         base-path
                                   :middleware        middleware
-                                  :render-middleware render-middleware}
+                                  :render-middleware render-middleware
+                                  :hiccup-transform  hiccup-transform}
                            ;; Only forward when supplied so server-level
                            ;; default (`render.error/minimal`) applies otherwise.
                            render-error (assoc :render-error render-error))))

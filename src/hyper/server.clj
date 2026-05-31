@@ -741,7 +741,8 @@
                                 :head head
                                 :base-path base-path
                                 :render-middleware (vec render-middleware)
-                                :render-error render-error)
+                                :render-error render-error
+                                :hiccup-transform (:hiccup-transform opts))
          initial-routes  (if (var? routes) @routes routes)
          initial-handler (build-ring-handler initial-routes app-state* page-wrapper system-routes)
          handler         (if (var? routes)
