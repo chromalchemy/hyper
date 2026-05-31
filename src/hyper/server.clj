@@ -404,14 +404,17 @@
             (actions/execute-action! app-state* action-id client-params)
 
             ;; Collect accumulated effects
-            (let [pending  (effects/collect-pending!)
+            (let [pending      (effects/collect-pending!)
                   ;; Queue pending scripts for SSE delivery via the renderer thread
-                  _        (when-let [scripts (seq (:scripts pending))]
-                             (when-let [renderer (get-in @app-state* [:tabs tab-id :renderer])]
-                               ((:enqueue-scripts! renderer) scripts)))
-                  ;; Build response — 204 with any cookies from effects
-                  response {:status 204}]
-              (effects/apply-cookies-to-response response pending))
+                  _            (when-let [scripts (seq (:scripts pending))]
+                                 (when-let [renderer (get-in @app-state* [:tabs tab-id :renderer])]
+                                   ((:enqueue-scripts! renderer) scripts)))
+                  ;; Build response — 204 with any cookies + session writes from effects
+                  base-session (:session req)
+                  response     {:status 204}]
+              (-> response
+                  (effects/apply-cookies-to-response pending)
+                  (effects/apply-session-to-response base-session pending)))
             (catch Exception e
               (t/error! {:id   :hyper.error/action-handler
                          :msg  "Error executing action handler"

@@ -396,7 +396,7 @@ a snippet of JavaScript on the client.
 (require '[hyper.effects :as effects])
 ```
 
-Hyper provides four effect functions, all of which may only be called inside an
+Hyper provides seven effect functions, all of which may only be called inside an
 action body:
 
 | Effect | What it does |
@@ -405,10 +405,18 @@ action body:
 | `set-cookie!` | Set an HTTP cookie on the action response |
 | `delete-cookie!` | Remove an HTTP cookie |
 | `execute-script!` | Run arbitrary JS on the client via SSE |
+| `assoc-session!` | Assoc a key into the Ring session map (persisted via `wrap-session`) |
+| `dissoc-session!` | Dissoc a key from the Ring session map |
+| `update-session!` | Apply `(f current-session & args)` to the Ring session map |
 
 Effects are accumulated during action execution and processed after the action
-completes. Cookies are applied to the HTTP response; scripts are delivered to the
-client via SSE.
+completes. Cookies and session writes are applied to the HTTP response; scripts
+are delivered to the client via SSE.
+
+Session effects require the host app to wrap the `/hyper/actions` route with
+`ring.middleware.session/wrap-session` (or an equivalent) so the response's
+`:session` key is persisted into the chosen store (encrypted cookie, in-memory,
+etc.).
 
 ### `navigate!`
 
@@ -462,6 +470,38 @@ cookies from Hyper, since the SSE channel cannot carry `Set-Cookie` headers.
 
 `delete-cookie!` sets the cookie with an empty value and `max-age 0`. Pass
 `:path` if the original cookie was set on a non-default path.
+
+### `assoc-session!` / `dissoc-session!` / `update-session!`
+
+Read and write the Ring session map from within an action. The action's HTTP
+response carries a `:session` key, which `ring.middleware.session` serializes
+into the session store (encrypted cookie, in-memory, etc.) so writes survive
+across page loads.
+
+```clojure
+;; Magic-link verify — persist :uid into the session
+(h/action
+  (when-let [user (consume-token! token)]
+    (effects/assoc-session! :uid (:email user))
+    (effects/navigate! :dashboard)))
+
+;; Bulk write
+(h/action
+  (effects/update-session! merge {:uid email :role :admin})
+  (effects/navigate! :app))
+
+;; Sign out — drop the :uid
+(h/action
+  (effects/dissoc-session! :uid)
+  (effects/navigate! :home))
+```
+
+Multiple session operations within one action accumulate and apply in order at
+flush time, so later writes win on the same key.
+
+Session writes require the host app to wrap the action route with
+`ring.middleware.session/wrap-session` (or equivalent). Without it, the
+`:session` key on the response is silently dropped.
 
 ### `execute-script!`
 
@@ -1470,7 +1510,8 @@ The E2E suite covers:
   via SSE
 - **Content live reload** — redefining the routes Var with new inline handler
   functions hot-swaps the page content via SSE
-- **Effects** — `navigate!`, `set-cookie!`, `delete-cookie!`, and
+- **Effects** — `navigate!`, `set-cookie!`, `delete-cookie!`,
+  `assoc-session!`, `dissoc-session!`, `update-session!`, and
   `execute-script!` are exercised end-to-end, including combined effects in a
   single action
 

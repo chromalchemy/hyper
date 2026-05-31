@@ -11,11 +11,12 @@
 ;; ---------------------------------------------------------------------------
 
 (deftest test-init-pending
-  (testing "init-pending returns an atom with empty cookies and scripts"
+  (testing "init-pending returns an atom with empty cookies, scripts, and session-ops"
     (let [p (effects/init-pending)]
       (is (instance? clojure.lang.Atom p))
       (is (= {} (:cookies @p)))
-      (is (= [] (:scripts @p))))))
+      (is (= [] (:scripts @p)))
+      (is (= [] (:session-ops @p))))))
 
 (deftest test-emit-outside-context-throws
   (testing "set-cookie! throws outside action context"
@@ -32,7 +33,19 @@
 
   (testing "navigate! throws outside action context"
     (is (thrown-with-msg? Exception #"outside action context"
-                          (effects/navigate! :home)))))
+                          (effects/navigate! :home))))
+
+  (testing "assoc-session! throws outside action context"
+    (is (thrown-with-msg? Exception #"outside action context"
+                          (effects/assoc-session! :uid "x"))))
+
+  (testing "dissoc-session! throws outside action context"
+    (is (thrown-with-msg? Exception #"outside action context"
+                          (effects/dissoc-session! :uid))))
+
+  (testing "update-session! throws outside action context"
+    (is (thrown-with-msg? Exception #"outside action context"
+                          (effects/update-session! assoc :uid "x")))))
 
 (deftest test-set-cookie-accumulation
   (testing "set-cookie! accumulates cookies in *pending*"
@@ -83,6 +96,95 @@
       (is (= {:status 204}
              (effects/apply-cookies-to-response response pending))))))
 
+(deftest test-assoc-session-accumulation
+  (testing "assoc-session! accumulates ops in :session-ops"
+    (binding [effects/*pending* (effects/init-pending)]
+      (effects/assoc-session! :uid "ryan@example.com")
+      (effects/assoc-session! :auth/state "hex123")
+      (let [pending (effects/collect-pending!)]
+        (is (= [{:op :assoc :k :uid :v "ryan@example.com"}
+                {:op :assoc :k :auth/state :v "hex123"}]
+               (:session-ops pending)))))))
+
+(deftest test-dissoc-session-accumulation
+  (testing "dissoc-session! accumulates ops in :session-ops"
+    (binding [effects/*pending* (effects/init-pending)]
+      (effects/dissoc-session! :uid)
+      (let [pending (effects/collect-pending!)]
+        (is (= [{:op :dissoc :k :uid}]
+               (:session-ops pending)))))))
+
+(deftest test-update-session-accumulation
+  (testing "update-session! captures fn and args"
+    (binding [effects/*pending* (effects/init-pending)]
+      (effects/update-session! assoc :uid "ryan@example.com" :role :admin)
+      (let [pending (effects/collect-pending!)
+            op      (first (:session-ops pending))]
+        (is (= :update (:op op)))
+        (is (= assoc (:f op)))
+        (is (= [:uid "ryan@example.com" :role :admin] (:args op)))))))
+
+(deftest test-session-ops-mixed-order
+  (testing "ops accumulate in emission order; later writes win on the same key"
+    (binding [effects/*pending* (effects/init-pending)]
+      (effects/assoc-session! :uid "first@x.com")
+      (effects/assoc-session! :uid "second@x.com")
+      (effects/dissoc-session! :other)
+      (let [pending (effects/collect-pending!)]
+        (is (= [{:op :assoc :k :uid :v "first@x.com"}
+                {:op :assoc :k :uid :v "second@x.com"}
+                {:op :dissoc :k :other}]
+               (:session-ops pending)))))))
+
+(deftest test-apply-session-to-response
+  (testing "applies assoc op to base session"
+    (let [response {:status 204}
+          base     {:existing :keep}
+          pending  {:session-ops [{:op :assoc :k :uid :v "ryan@example.com"}]}]
+      (is (= {:status  204
+              :session {:existing :keep :uid "ryan@example.com"}}
+             (effects/apply-session-to-response response base pending)))))
+
+  (testing "applies dissoc op"
+    (let [response {:status 204}
+          base     {:uid "x" :other :y}
+          pending  {:session-ops [{:op :dissoc :k :uid}]}]
+      (is (= {:status  204
+              :session {:other :y}}
+             (effects/apply-session-to-response response base pending)))))
+
+  (testing "applies update op with args"
+    (let [response {:status 204}
+          base     {:existing :keep}
+          pending  {:session-ops [{:op     :update
+                                   :f      merge
+                                   :args   [{:uid "x" :role :admin}]}]}]
+      (is (= {:status  204
+              :session {:existing :keep :uid "x" :role :admin}}
+             (effects/apply-session-to-response response base pending)))))
+
+  (testing "no-op when no session ops — does NOT add :session to response"
+    (let [response {:status 204}
+          pending  {:session-ops []}]
+      (is (= {:status 204}
+             (effects/apply-session-to-response response {:x 1} pending)))
+      (is (not (contains? (effects/apply-session-to-response response nil pending)
+                          :session)))))
+
+  (testing "handles nil base-session (treats as empty map)"
+    (let [response {:status 204}
+          pending  {:session-ops [{:op :assoc :k :uid :v "x"}]}]
+      (is (= {:status 204 :session {:uid "x"}}
+             (effects/apply-session-to-response response nil pending)))))
+
+  (testing "later writes win on same key (left-to-right reduction)"
+    (let [response {:status 204}
+          base     {}
+          pending  {:session-ops [{:op :assoc :k :uid :v "first"}
+                                  {:op :assoc :k :uid :v "second"}]}]
+      (is (= {:status 204 :session {:uid "second"}}
+             (effects/apply-session-to-response response base pending))))))
+
 (deftest test-format-execute-script-event
   (testing "formats as Datastar patch-elements SSE event with self-removing script"
     (let [event (effects/format-execute-script-event "alert('hi')")]
@@ -116,7 +218,8 @@
           after  (ht/test-action result "noop")]
       (is (contains? after :effects))
       (is (= {} (:cookies (:effects after))))
-      (is (= [] (:scripts (:effects after)))))))
+      (is (= [] (:scripts (:effects after))))
+      (is (= [] (:session-ops (:effects after)))))))
 
 (deftest test-set-cookie-from-action
   (testing "set-cookie! in action appears in test-action :effects"
@@ -238,3 +341,60 @@
           after2 (ht/test-action result "no-effect")]
       (is (= ["doSomething()"] (get-in after1 [:effects :scripts])))
       (is (= [] (get-in after2 [:effects :scripts]))))))
+
+(deftest test-assoc-session-from-action
+  (testing "assoc-session! in action appears in test-action :effects :session-ops"
+    (let [result (ht/test-page
+                   (fn [_req]
+                     [:button {:data-on:click
+                               (h/action {:as "login"}
+                                         (effects/assoc-session! :uid "ryan@example.com")
+                                         (effects/assoc-session! :auth/state "hex123"))}
+                      "Login"]))
+          after  (ht/test-action result "login")]
+      (is (= [{:op :assoc :k :uid :v "ryan@example.com"}
+              {:op :assoc :k :auth/state :v "hex123"}]
+             (get-in after [:effects :session-ops]))))))
+
+(deftest test-dissoc-session-from-action
+  (testing "dissoc-session! in action appears in test-action :effects :session-ops"
+    (let [result (ht/test-page
+                   (fn [_req]
+                     [:button {:data-on:click
+                               (h/action {:as "logout"}
+                                         (effects/dissoc-session! :uid))}
+                      "Logout"]))
+          after  (ht/test-action result "logout")]
+      (is (= [{:op :dissoc :k :uid}]
+             (get-in after [:effects :session-ops]))))))
+
+(deftest test-update-session-from-action
+  (testing "update-session! in action appears in test-action :effects :session-ops"
+    (let [result (ht/test-page
+                   (fn [_req]
+                     [:button {:data-on:click
+                               (h/action {:as "bulk-login"}
+                                         (effects/update-session! merge
+                                                                  {:uid "x@y.com"
+                                                                   :role :admin}))}
+                      "Bulk Login"]))
+          after  (ht/test-action result "bulk-login")
+          op     (first (get-in after [:effects :session-ops]))]
+      (is (= :update (:op op)))
+      (is (= merge (:f op)))
+      (is (= [{:uid "x@y.com" :role :admin}] (:args op))))))
+
+(deftest test-session-and-cookie-coexist-in-one-action
+  (testing "session writes and cookies accumulate independently in one action"
+    (let [result (ht/test-page
+                   (fn [_req]
+                     [:button {:data-on:click
+                               (h/action {:as "full-login"}
+                                         (effects/assoc-session! :uid "ryan@example.com")
+                                         (effects/set-cookie! "theme" "dark"))}
+                      "Full Login"]))
+          after  (ht/test-action result "full-login")]
+      (is (= [{:op :assoc :k :uid :v "ryan@example.com"}]
+             (get-in after [:effects :session-ops])))
+      (is (= {"theme" {:value "dark" :path "/"}}
+             (get-in after [:effects :cookies]))))))

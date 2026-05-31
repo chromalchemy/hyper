@@ -6,17 +6,24 @@
    pure function of state), but some operations genuinely require
    side-effects that can't be expressed as state:
 
-   - `navigate!`       — client-side route change (pushState) from an action
-   - `set-cookie!`     — set an HTTP cookie on the action response
-   - `delete-cookie!`  — remove an HTTP cookie
-   - `execute-script!` — run arbitrary JS on the client via SSE
+   - `navigate!`        — client-side route change (pushState) from an action
+   - `set-cookie!`      — set an HTTP cookie on the action response
+   - `delete-cookie!`   — remove an HTTP cookie
+   - `execute-script!`  — run arbitrary JS on the client via SSE
+   - `assoc-session!`   — assoc a key into the Ring session map
+   - `dissoc-session!`  — dissoc a key from the Ring session map
+   - `update-session!`  — apply (f session & args) to the Ring session map
 
    These are intentionally few.  If you're reaching for execute-script!
    to update UI, consider whether a cursor would be more appropriate.
 
    Effects are accumulated during action execution in a dynamic var and
    processed by the action handler after the action completes.  Cookies
-   are applied to the HTTP response; scripts are sent via SSE.
+   and session writes are applied to the HTTP response; scripts are sent
+   via SSE.  Session writes require the host app to wrap the
+   `/hyper/actions` route with `ring.middleware.session/wrap-session`
+   (or equivalent) so the response's `:session` key is persisted into
+   the cookie / session store of choice.
 
    Example:
      (require '[hyper.effects :as effects])
@@ -49,8 +56,12 @@
 (def ^:dynamic *pending*
   "Accumulator for effects emitted during action execution.
 
-   Bound to (atom {:cookies {} :scripts []}) by the action handler.
-   nil outside action execution."
+   Bound to (atom {:cookies {} :scripts [] :session-ops []}) by the
+   action handler.  nil outside action execution.
+
+   :session-ops is a vector of operation maps applied left-to-right
+   over the base Ring session at flush time.  Each op has shape
+   {:op :assoc  :k k :v v} | {:op :dissoc :k k} | {:op :update :f f :args args}."
   nil)
 
 (defn- require-pending!
@@ -195,6 +206,65 @@
     (swap! pending* update :scripts conj js)
     nil))
 
+(defn assoc-session!
+  "Assoc a key-value pair into the Ring session map from within an action.
+
+   The change is applied to the base session captured at action entry
+   and the resulting map is set as `:session` on the action's HTTP
+   response.  The host app must wrap the action route with
+   `ring.middleware.session/wrap-session` (or equivalent) for the
+   change to be persisted.
+
+   Multiple session operations within one action accumulate and apply
+   in order at flush time, so later writes win on the same key.
+
+   k: Session map key (typically a keyword)
+   v: Value to assoc
+
+   Example:
+     (h/action
+       (when-let [user (authenticate! email)]
+         (effects/assoc-session! :uid (:email user))
+         (effects/navigate! :dashboard)))"
+  [k v]
+  (let [pending* (require-pending! "assoc-session!")]
+    (swap! pending* update :session-ops conj {:op :assoc :k k :v v})
+    nil))
+
+(defn dissoc-session!
+  "Dissoc a key from the Ring session map from within an action.
+
+   k: Session map key
+
+   Example:
+     (h/action
+       (effects/dissoc-session! :uid)
+       (effects/navigate! :home))"
+  [k]
+  (let [pending* (require-pending! "dissoc-session!")]
+    (swap! pending* update :session-ops conj {:op :dissoc :k k})
+    nil))
+
+(defn update-session!
+  "Apply f to the Ring session map: (apply f current-session args).
+
+   Use when assoc/dissoc are insufficient — e.g. bulk merging, removing
+   multiple keys at once, or composing with existing values.
+
+   Example:
+     ;; Merge several keys at once
+     (h/action
+       (effects/update-session! merge {:uid email :role :admin}))
+
+     ;; Replace the entire session
+     (h/action
+       (effects/update-session! (constantly {:uid email})))"
+  [f & args]
+  (let [pending* (require-pending! "update-session!")]
+    (swap! pending* update :session-ops conj
+           {:op :update :f f :args (vec args)})
+    nil))
+
 ;; ---------------------------------------------------------------------------
 ;; Internal — used by action-handler in server.clj
 ;; ---------------------------------------------------------------------------
@@ -203,11 +273,12 @@
   "Create a fresh pending effects atom.  Called by action-handler before
    binding *pending*."
   []
-  (atom {:cookies {} :scripts []}))
+  (atom {:cookies {} :scripts [] :session-ops []}))
 
 (defn collect-pending!
   "Drain and return the accumulated effects.  Returns a map with
-   :cookies and :scripts.  Called by action-handler after action execution."
+   :cookies, :scripts, and :session-ops.  Called by action-handler
+   after action execution."
   []
   (when *pending*
     @*pending*))
@@ -219,6 +290,31 @@
   (let [cookies (:cookies pending-effects)]
     (if (seq cookies)
       (update response :cookies merge cookies)
+      response)))
+
+(defn- apply-session-op
+  "Apply one session op against a session map."
+  [sess {:keys [op k v f args]}]
+  (case op
+    :assoc  (assoc sess k v)
+    :dissoc (dissoc sess k)
+    :update (apply f sess args)))
+
+(defn apply-session-to-response
+  "Apply pending session operations to an HTTP response map.
+
+   Reduces all accumulated :session-ops over `base-session` (defaulting
+   to {} when nil) and assocs the result as `:session` on the response.
+
+   No-op when no session ops were emitted, so an action that didn't
+   touch the session leaves the Ring response's `:session` key absent
+   — letting `ring.middleware.session` preserve the existing session
+   cookie unchanged."
+  [response base-session pending-effects]
+  (let [ops (:session-ops pending-effects)]
+    (if (seq ops)
+      (assoc response :session
+             (reduce apply-session-op (or base-session {}) ops))
       response)))
 
 (defn format-execute-script-event
