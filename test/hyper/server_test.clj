@@ -653,3 +653,85 @@
       (is (string/includes? body "/app/hyper/navigate"))
       (is (string/includes? body "rel=\"stylesheet\""))
       (is (not (string/includes? body "openWhenHidden"))))))
+
+(deftest test-not-found-handler
+  (testing "Unmatched route renders the default 404 view as a full Hyper page"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          handler    (server/create-handler routes app-state*)
+          response   (handler {:uri "/does-not-exist" :request-method :get})
+          body       (:body response)]
+      (is (= 404 (:status response)))
+      (is (string/includes? (get-in response [:headers "Content-Type"]) "text/html"))
+      ;; Full document scaffolding, same as a normal page
+      (is (string/includes? body "<!DOCTYPE html>"))
+      (is (string/includes? body "/hyper/events")
+          "404 page boots the SSE connection like any other page")
+      ;; Default not-found content + title
+      (is (string/includes? body "404"))
+      (is (string/includes? body "<title>Not Found</title>"))))
+
+  (testing "Custom :not-found renderer is used and sees the request"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          handler    (server/create-handler routes app-state*
+                                            {:not-found (fn [req]
+                                                          [:div "Missing: " (:uri req)])})
+          response   (handler {:uri "/ghost" :request-method :get})
+          body       (:body response)]
+      (is (= 404 (:status response)))
+      (is (string/includes? body "Missing: /ghost"))))
+
+  (testing "Custom :not-found may be a Var (picks up redefinitions)"
+    (let [app-state*    (atom (state/init-state))
+          not-found-var (intern *ns* (gensym "nf-")
+                                (fn [_req] [:div "var-404-v1"]))
+          routes        [["/" {:name :home
+                               :get  (fn [_req] [:div "Home"])}]]
+          handler       (server/create-handler routes app-state* {:not-found not-found-var})]
+      (is (string/includes? (:body (handler {:uri "/x" :request-method :get}))
+                            "var-404-v1"))
+      ;; Redefine the Var's value; the handler should pick it up without rebuild
+      (alter-var-root not-found-var (constantly (fn [_req] [:div "var-404-v2"])))
+      (is (string/includes? (:body (handler {:uri "/x" :request-method :get}))
+                            "var-404-v2"))))
+
+  (testing "The :not-found renderer is stored in app-state"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          _handler   (server/create-handler routes app-state*)]
+      (is (fn? (:not-found @app-state*)))))
+
+  (testing ":not-found nil disables the feature (reitit plain-text 404)"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          handler    (server/create-handler routes app-state* {:not-found nil})
+          response   (handler {:uri "/nope" :request-method :get})]
+      (is (= 404 (:status response)))
+      (is (nil? (:not-found @app-state*)))
+      ;; Plain reitit default — not the full Hyper HTML document
+      (is (not (string/includes? (str (:body response)) "<!DOCTYPE html>")))))
+
+  (testing ":not-found nil makes navigate to a dead route reply with JSON 404"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          handler    (server/create-handler routes app-state* {:not-found nil})
+          response   (handler {:uri            "/hyper/navigate"
+                               :request-method :post
+                               :query-params   {"path" "/ghost"}})]
+      (is (= 404 (:status response)))
+      (is (string/includes? (:body response) "Route not found"))))
+
+  (testing "Matched route with unsupported method is not treated as 404"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          handler    (server/create-handler routes app-state*)
+          ;; POST to a GET-only route -> 405, not the 404 page
+          response   (handler {:uri "/" :request-method :post})]
+      (is (= 405 (:status response))))))

@@ -508,6 +508,39 @@
 })();
 "))])
 
+(defn- page-response
+  "Assemble a full HTML document Ring response from a render-tab result.
+
+   Shared by page-handler and not-found-handler so both emit identical document
+   scaffolding, differing only in `status` and `fallback-title` (the <title>
+   used when the result has no :title)."
+  [result {:keys [datastar-script open-when-hidden? base-path] :or {open-when-hidden? true
+                                                                    base-path         ""}}
+   tab-id status fallback-title]
+  (let [{:keys [title head-html body-html declared-signals]} result
+        title                                                (or title fallback-title)
+        sig-attrs                                            (signal/format-signal-attrs declared-signals)
+        div-attrs                                            (cond-> {:id "hyper-app"}
+                                                               sig-attrs (merge sig-attrs))
+        html                                                 (c/html
+                                                               [c/doctype-html5
+                                                                [:html
+                                                                 [:head
+                                                                  [:meta {:charset "UTF-8"}]
+                                                                  [:meta {:name "viewport" :content "width=device-width, initial-scale=1"}]
+                                                                  [:title title]
+                                                                  datastar-script
+                                                                  (when head-html (c/raw head-html))]
+                                                                 [:body
+                                                                  {:data-init (str "@get('" base-path "/hyper/events?tab-id=" tab-id "'"
+                                                                                   (when open-when-hidden? ", {openWhenHidden: true}")
+                                                                                   ")")}
+                                                                  [:div div-attrs (c/raw body-html)]
+                                                                  (hyper-scripts tab-id base-path)]]])]
+    {:status  status
+     :headers {"Content-Type" "text/html; charset=utf-8"}
+     :body    html}))
+
 (defn page-handler
   "Wrap a page render function to provide full HTML response.
    Delegates rendering to render/render-tab so initial page loads share
@@ -516,8 +549,7 @@
 
    Options:
    - :datastar-script - Hiccup content for Datastar script added to document head, or nil."
-  [app-state* {:keys [datastar-script open-when-hidden? base-path] :or {open-when-hidden? true
-                                                                        base-path         ""}}]
+  [app-state* opts]
   (fn [render-fn]
     (fn [req]
       (let [tab-id     (:hyper/tab-id req)
@@ -533,29 +565,33 @@
           ;; Ring response passthrough (e.g. a 302 redirect)
           (if (:status result)
             result
-            (let [{:keys [title head-html body-html declared-signals]} result
-                  title                                                (or title "Hyper App")
-                  sig-attrs                                            (signal/format-signal-attrs declared-signals)
-                  div-attrs                                            (cond-> {:id "hyper-app"}
-                                                                         sig-attrs (merge sig-attrs))
-                  html                                                 (c/html
-                                                                         [c/doctype-html5
-                                                                          [:html
-                                                                           [:head
-                                                                            [:meta {:charset "UTF-8"}]
-                                                                            [:meta {:name "viewport" :content "width=device-width, initial-scale=1"}]
-                                                                            [:title title]
-                                                                            datastar-script
-                                                                            (when head-html (c/raw head-html))]
-                                                                           [:body
-                                                                            {:data-init (str "@get('" base-path "/hyper/events?tab-id=" tab-id "'"
-                                                                                             (when open-when-hidden? ", {openWhenHidden: true}")
-                                                                                             ")")}
-                                                                            [:div div-attrs (c/raw body-html)]
-                                                                            (hyper-scripts tab-id base-path)]]])]
-              {:status  200
-               :headers {"Content-Type" "text/html; charset=utf-8"}
-               :body    html})))))))
+            (page-response result opts tab-id 200 "Hyper App")))))))
+
+(defn- not-found-handler
+  "Reitit default-handler for unmatched routes: renders the configured
+   :not-found view as a full Hyper page with HTTP 404.
+
+   Registers the not-found render-fn and a nameless route from the request URI;
+   render-tab falls back to the stored render-fn when the route has no :name,
+   so no reitit route is needed and the SSE connection re-renders the view."
+  [app-state* opts]
+  (fn [req]
+    (let [tab-id       (:hyper/tab-id req)
+          session-id   (:hyper/session-id req)
+          not-found-fn (get @app-state* :not-found)
+          route-info   {:path         (:uri req)
+                        :query-params (into {}
+                                            (map (fn [[k v]] [(keyword k) v]))
+                                            (:query-params req))}]
+      (render/register-render-fn! app-state* tab-id not-found-fn)
+      (state/set-tab-route! app-state* tab-id route-info)
+      (when-let [env (:hyper/env req)]
+        (swap! app-state* assoc-in [:tabs tab-id :env] env))
+      (let [result (render/render-tab app-state* session-id tab-id req)]
+        ;; Ring response passthrough (e.g. a redirect from render middleware)
+        (if (:status result)
+          result
+          (page-response result opts tab-id 404 "Not Found"))))))
 
 (defn- navigate-handler
   "Handler for popstate/navigation POST requests.
@@ -581,9 +617,22 @@
               ;; Match the path using the reitit router
               match                    (reitit/match-by-path router path-part)]
           (if-not match
-            {:status  404
-             :headers {"Content-Type" "application/json"}
-             :body    "{\"error\": \"Route not found\"}"}
+            ;; No route matched — when :not-found is set, register it and set
+            ;; the route so the route watcher re-renders the 404 over SSE and
+            ;; syncs the URL bar, matching an initial-load 404.  When disabled
+            ;; (nil), reply with the plain JSON 404.
+            (if-let [not-found-fn (get @app-state* :not-found)]
+              (do
+                (render/register-render-fn! app-state* tab-id not-found-fn)
+                (state/set-tab-route! app-state* tab-id
+                                      {:path         path-part
+                                       :query-params raw-query-params})
+                {:status  200
+                 :headers {"Content-Type" "application/json"}
+                 :body    "{\"success\": true}"})
+              {:status  404
+               :headers {"Content-Type" "application/json"}
+               :body    "{\"error\": \"Route not found\"}"})
 
             (let [route-name   (get-in match [:data :name])
                   ;; Coerce parameters using reitit's coercion if the route has specs
@@ -611,8 +660,9 @@
   "Build the Ring handler for the given user routes.
    Wraps user :get handlers with page-handler, combines with hyper system routes,
    compiles the reitit router, and updates app-state with the current routes and router.
+   The supplied default-handler renders the :not-found view when no route matches.
    Returns the compiled Ring handler (without outer middleware)."
-  [user-routes app-state* page-wrapper system-routes]
+  [user-routes app-state* page-wrapper system-routes default-handler]
   (let [flat-routes    (-> user-routes reitit/router reitit/routes)
         wrapped-routes (mapv (fn [[path route-data]]
                                (if (and (:get route-data) (not (:hyper/disabled? route-data)))
@@ -628,7 +678,7 @@
     (swap! app-state* assoc
            :router router
            :routes flat-routes)
-    (ring/ring-handler router (ring/create-default-handler))))
+    (ring/ring-handler router default-handler)))
 
 (defn- wrap-static
   "Optionally serve static assets.
@@ -712,16 +762,31 @@
                         `hyper.render.error/minimal` (generic, production-safe).
                         Use `hyper.render.error/explain` in development to see
                         the message, ex-data, and full stack trace.
+   - :not-found         Function `(fn [req] -> hiccup)` rendered when no route
+                        matches, served as a full page with HTTP 404 (and over
+                        SSE for client-side navigation).  May be a Var to pick
+                        up redefinitions.  Defaults to
+                        `hyper.render.error/not-found`; pass `nil` to disable
+                        and fall back to reitit's plain-text 404.
 
    Routes should use :get handlers that return hiccup (Chassis vectors).
    Hyper will wrap them to provide full HTML responses and SSE connections."
   ([routes app-state*]
    (create-handler routes app-state* {:datastar-script (default-datastar-script)}))
-  ([routes app-state* {:keys [watches head base-path middleware render-middleware render-error]
-                       :or   {render-error render.error/minimal}
+  ([routes app-state* {:keys [watches head base-path middleware render-middleware render-error not-found]
+                       :or   {render-error render.error/minimal
+                              not-found    render.error/not-found}
                        :as   opts}]
    (let [base-path       (or base-path "")
-         page-wrapper    (page-handler app-state* (assoc opts :base-path base-path))
+         opts            (assoc opts :base-path base-path)
+         page-wrapper    (page-handler app-state* opts)
+         ;; Override only the genuine "no route matched" (404) case, leaving
+         ;; reitit's 405/406 discrimination intact.  When :not-found is nil the
+         ;; feature is disabled and reitit's plain-text default handler is used.
+         default-handler (if not-found
+                           (ring/create-default-handler
+                             {:not-found (not-found-handler app-state* opts)})
+                           (ring/create-default-handler))
          system-routes   [[(str base-path "/hyper/events") {:get (sse-events-handler app-state*)}]
                           [(str base-path "/hyper/actions") {:post (action-handler app-state*)}]
                           [(str base-path "/hyper/navigate") {:post (navigate-handler app-state*)}]]
@@ -738,9 +803,10 @@
                                 :head head
                                 :base-path base-path
                                 :render-middleware (vec render-middleware)
-                                :render-error render-error)
+                                :render-error render-error
+                                :not-found not-found)
          initial-routes  (if (var? routes) @routes routes)
-         initial-handler (build-ring-handler initial-routes app-state* page-wrapper system-routes)
+         initial-handler (build-ring-handler initial-routes app-state* page-wrapper system-routes default-handler)
          handler         (if (var? routes)
                            ;; Dynamic: rebuild router when the routes Var is redefined.
                            ;; Uses identical? since a re-def always creates a new object,
@@ -755,7 +821,8 @@
                                             :id    :hyper.event/routes-reload
                                             :msg   "Routes changed, rebuilding router"})
                                    (let [h (build-ring-handler current-routes app-state*
-                                                               page-wrapper system-routes)]
+                                                               page-wrapper system-routes
+                                                               default-handler)]
                                      (reset! cached {:routes current-routes :handler h})))
                                  ((:handler @cached) req))))
                            ;; Static: use the compiled handler directly

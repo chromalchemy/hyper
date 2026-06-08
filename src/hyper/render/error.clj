@@ -14,6 +14,9 @@
      `ex-data`, and the full stack trace including the cause chain.  Use in
      development.
 
+   This namespace also provides `not-found`, the default `:not-found`
+   renderer — a `(fn [req] -> hiccup)` shown when no route matches a request.
+
    You can also supply your own renderer.  Pass a Var to pick up REPL
    redefinitions without restarting the server:
 
@@ -39,6 +42,13 @@
 (def ^:private pre-style
   "background: #fff; padding: 10px; border-radius: 4px; overflow: auto;
    white-space: pre-wrap; word-break: break-word; font-size: 0.85em;")
+
+(def ^:private not-found-container-style
+  "padding: 40px 20px; font-family: sans-serif; text-align: center;
+   color: #333;")
+
+(def ^:private not-found-heading-style
+  "font-size: 4em; margin: 0 0 8px; color: #666; font-weight: 700;")
 
 ;; ---------------------------------------------------------------------------
 ;; minimal
@@ -110,3 +120,21 @@
         [:strong "Caused by chain (" (count chain) " exceptions):"]])
      [:pre {:style pre-style}
       (string/trimr (stack-trace-string error))]]))
+
+;; ---------------------------------------------------------------------------
+;; not-found
+;; ---------------------------------------------------------------------------
+
+(defn not-found
+  "Default `:not-found` renderer for `hyper.core/create-handler`.
+
+   A not-found renderer is a function `(fn [req] -> hiccup)` shown when no route
+   matches; it can read the attempted `:uri` from the request.  This default is
+   generic and production-safe — supply your own (a Var to pick up REPL
+   redefinitions) to brand it:
+
+       (h/create-handler routes :not-found #'my.app.errors/not-found-page)"
+  [_req]
+  [:div {:style not-found-container-style}
+   [:h1 {:style not-found-heading-style} "404"]
+   [:p "The page you're looking for doesn't exist."]])

@@ -921,6 +921,29 @@ doesn't fit the render-and-stream model:
 This works for any status code or response shape — 301/302 redirects, 403
 forbidden, JSON responses, etc.
 
+### Custom 404 page
+
+When no route matches, Hyper renders a built-in 404 page through the normal
+render pipeline — full HTML with HTTP 404 on initial loads, and pushed over SSE
+when client-side navigation hits a dead URL. Override it with `:not-found`, a
+`(fn [req] -> hiccup)`:
+
+```clojure
+(defn not-found-page [req]
+  [:div
+   [:h1 "Page not found"]
+   [:p "No page at " [:code (:uri req)]]
+   [:a (h/navigate :home) "Go home"]])
+
+(def handler
+  (h/create-handler #'routes
+    :not-found #'not-found-page))
+```
+
+Pass a Var to pick up REPL redefinitions without restarting. The default lives
+at `hyper.render.error/not-found`. Pass `:not-found nil` to disable the feature
+and fall back to Reitit's plain-text 404.
+
 ## Suppress hyper wrapping certain endpoints
 
 You can suppress hyper wrapping an endpoint altogether by marking it as `:hyper/disabled?`
