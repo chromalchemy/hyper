@@ -282,13 +282,22 @@
            base        (if base-req
                          base-req
                          (utils/warn-on-access-map {}))
+           ;; Resolve env up front from base-req (regular map) rather than
+           ;; reading it back off the synthetic request — reading a missing
+           ;; key through the warn-on-access map would itself log a warning.
+           env         (or (:hyper/env base-req) tab-env)
            req         (cond-> base
                          true    (assoc :hyper/session-id session-id
                                         :hyper/tab-id     tab-id
                                         :hyper/app-state  app-state*)
                          router  (assoc :hyper/router router)
                          route   (assoc :hyper/route route)
-                         tab-env (update :hyper/env #(or % tab-env))
+                         ;; Always seed :hyper/env (a reserved, framework-propagated
+                         ;; key) so reading it via h/env never trips the
+                         ;; warn-on-access map.  The value may be nil — that's
+                         ;; fine, it matches the silent nil returned on initial
+                         ;; page load.
+                         true    (assoc :hyper/env env)
                          true    (dissoc :reitit.core/match))]
        (push-thread-bindings (context/render-bindings req app-state*))
        (try

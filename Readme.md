@@ -750,7 +750,7 @@ In an action:
 | Entry point | What happens |
 |---|---|
 | **Page load** (GET) | Ring middleware sets `:hyper/env` → Hyper stashes per-tab → render fn sees it |
-| **SSE re-render** | Hyper merges stashed env into the synthetic request → render fn sees it |
+| **SSE re-render** | Hyper seeds the synthetic request with the stashed env → render fn sees it |
 | **Action POST** | Ring middleware refreshes `:hyper/env` → Hyper re-stashes (full replace) → action body sees it |
 | **SPA navigation** | No HTTP request → render uses stashed env from last capture |
 
