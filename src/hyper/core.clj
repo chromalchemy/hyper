@@ -522,6 +522,12 @@
                           to `hyper.render.error/minimal` (generic, production-
                           safe).  Use `hyper.render.error/explain` in development
                           to render the message, ex-data, and full stack trace.
+   - :not-found         — Function `(fn [req] -> hiccup)` rendered when no route
+                          matches, served as a full page with HTTP 404 (and over
+                          SSE for client-side navigation).  May be a Var to pick
+                          up redefinitions.  Defaults to
+                          `hyper.render.error/not-found`; pass `nil` to disable
+                          and fall back to reitit's plain-text 404.
 
    The request key :hyper/env is reserved for application-provided context.
    Ring middleware that sets :hyper/env on the request will have it automatically
@@ -557,7 +563,8 @@
                     datastar-script base-path middleware render-middleware
                     render-error]
              :or   {app-state       (atom (state/init-state))
-                    datastar-script server/default-datastar-script}}]
+                    datastar-script server/default-datastar-script}
+             :as   opts}]
   (server/create-handler routes app-state
                          (cond-> {:head              head
                                   :datastar-script   datastar-script
@@ -567,9 +574,10 @@
                                   :base-path         base-path
                                   :middleware        middleware
                                   :render-middleware render-middleware}
-                           ;; Only forward when supplied so server-level
-                           ;; default (`render.error/minimal`) applies otherwise.
-                           render-error (assoc :render-error render-error))))
+                           ;; Only forward when supplied so server defaults apply.
+                           render-error (assoc :render-error render-error)
+                           ;; `contains?` so an explicit `:not-found nil` (disable) is honored.
+                           (contains? opts :not-found) (assoc :not-found (:not-found opts)))))
 
 (defn start!
   "Start the hyper application server.

@@ -4,6 +4,7 @@
             [hyper.context :as context]
             [hyper.core :as hy]
             [hyper.render :as render]
+            [hyper.render.error :as render.error]
             [hyper.state :as state]
             [hyper.test :as ht]
             [reitit.ring :as ring]))
@@ -198,7 +199,33 @@
           _handler   (hy/create-handler routes
                                         :app-state app-state*
                                         :base-path "/sub")]
-      (is (= "/sub" (:base-path @app-state*))))))
+      (is (= "/sub" (:base-path @app-state*)))))
+
+  (testing ":not-found defaults to render.error/not-found when not supplied"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          _handler   (hy/create-handler routes :app-state app-state*)]
+      (is (= render.error/not-found (:not-found @app-state*)))))
+
+  (testing ":not-found is passed through to server and stored in app-state"
+    (let [app-state* (atom (state/init-state))
+          not-found  (fn [_req] [:div "Nope"])
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          _handler   (hy/create-handler routes
+                                        :app-state app-state*
+                                        :not-found not-found)]
+      (is (= not-found (:not-found @app-state*)))))
+
+  (testing "explicit :not-found nil disables the feature"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          _handler   (hy/create-handler routes
+                                        :app-state app-state*
+                                        :not-found nil)]
+      (is (nil? (:not-found @app-state*))))))
 
 (deftest test-server-lifecycle
   (testing "start! and stop! work together"
