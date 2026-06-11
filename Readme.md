@@ -56,6 +56,11 @@ grateful to the people whose work and ideas made this possible:
   [Squint](https://github.com/squint-cljs/squint) compiler, which runs on
   the JVM and makes it possible to compile client components to JavaScript
   at macro-expansion time — no Node, no build step.
+- [Casey Link](https://github.com/ramblurr)'s
+  [datastar-expressions](https://github.com/outskirtslabs/datastar-expressions),
+  whose transpiler core — sandbox-safe operator output, `@action` syntax
+  restoration, kebab-case signal preservation — hyper's
+  [`expr`](#expressions) macro is ported from.
 
 ## Project Status
 
@@ -321,6 +326,13 @@ Datastar expressions with normal string operations:
 [:div {:data-show (str @name* " !== ''")} "Has name"] ;; → data-show="$userName !== ''"
 ```
 
+For anything beyond trivial concatenation, prefer [`expr`](#expressions),
+which compiles s-expressions to Datastar expressions:
+
+```clojure
+[:div {:data-show (h/expr (not= @name* ""))} "Has name"]
+```
+
 The signal itself **without deref** renders as the raw signal name (no `$`
 prefix), which is the correct format for `data-bind`:
 
@@ -374,8 +386,8 @@ dropdown visibility, accordion state, modal toggles:
 ```clojure
 (let [open?* (h/local-signal :open false)]
   [:div
-   ;; Build a toggle expression using deref
-   [:button {:data-on:click (str @open?* " = !" @open?*)} "Toggle"]
+   ;; Toggle with atom vocabulary — compiles to "$_open = !($_open)"
+   [:button {:data-on:click (h/expr (swap! open?* not))} "Toggle"]
    ;; data-show needs the expression form (@)
    [:div {:data-show @open?*} "Collapsible content"]])
 ```
@@ -398,6 +410,63 @@ Under the hood, `h/signal` does three things:
 All actions use Datastar's `@post()` under the hood, so signal values are
 always available — even in actions that also use client params like `$value`,
 `$key`, etc.
+
+## Expressions
+
+`expr` compiles Clojure s-expressions into
+[Datastar expression](https://data-star.dev/guide/datastar_expressions)
+strings, eliminating string-concatenation gymnastics in `data-*` attributes:
+
+```clojure
+(let [open?*  (h/local-signal :open false)
+      query*  (h/signal :query "")]
+  [:div
+   ;; signals use atom vocabulary — exactly like in actions
+   [:button {:data-on:click (h/expr (swap! open?* not))} "Toggle"]
+   ;; → data-on:click="$_open = !($_open)"
+
+   [:input {:data-on:keydown
+            (h/expr (when (= evt.key "Enter")
+                      (reset! query* evt.target.value)
+                      (@post "/search")))}]
+   ;; → guard + assignment + Datastar action, in one expression
+
+   [:div {:data-show (h/expr (not= @query* ""))} "Searching…"]])
+```
+
+The key idea: **the same vocabulary means the same thing everywhere** — a
+`(reset! sig v)` inside `h/action` is a server round-trip; inside `h/expr`
+it compiles to an instant client-side assignment. The surrounding macro
+decides where code runs, not the syntax.
+
+`expr` infers the Clojure/client boundary automatically:
+
+| Form | Treatment |
+|---|---|
+| Locals from surrounding scope | Spliced at runtime — signals become `$refs`, values become JS literals |
+| `(reset! sig v)` / `(swap! sig f & args)` | Client-side signal assignment |
+| `@sig` | Signal reference (`$name`) |
+| `(:kw m)` keyword calls | Evaluated as Clojure, spliced as literals |
+| `~form` | Explicit splice (escape hatch for arbitrary Clojure) |
+| `$signals`, `evt`, `el`, `(@post "/x")`, JS interop | Pass through to the client |
+
+Compilation happens at macro-expansion time (via the same embedded
+[Squint](https://github.com/squint-cljs/squint) compiler that powers
+[client components](#client-components-web-components)) — runtime cost is
+string interpolation of spliced values only. Output is dependency-free
+JavaScript suitable for Datastar's sandboxed evaluator.
+
+`expr` also works in `action`'s `:when` guard:
+
+```clojure
+[:input {:data-on:keydown (h/action {:when (h/expr (= evt.key "Enter"))}
+                            (search! $value))}]
+```
+
+It covers the simple, obvious expressions a human would write; it is
+possible to construct forms that compile to broken JavaScript. Raw strings
+remain supported everywhere expressions are accepted. The canonical
+namespace is `hyper.expr` (`->expr`); `h/expr` is a re-export.
 
 ## Effects
 
@@ -1172,9 +1241,7 @@ The model follows Datastar's recommended pattern for rich client-side
 islands: **props down (attributes), events up (CustomEvents)**.
 
 ```clojure
-(require '[hyper.component :as hc])
-
-(hc/defc temp-gauge
+(h/defc temp-gauge
   "A client-side temperature gauge."
   [{:keys [value max label]}]              ;; ← observed attributes
 
@@ -1236,7 +1303,7 @@ in the bundle, deduplicated across components; an alias may map to only
 one URL across the app (conflicts throw at definition time).
 
 ```clojure
-(hc/defc stock-chart
+(h/defc stock-chart
   {:require [["https://esm.sh/d3@7" :as d3]]}
   [{:keys [points]}]
   (render [:svg [:path {:d (d3/line points)}]]))
@@ -1252,7 +1319,7 @@ on every change would destroy the chart instance. Seamless mode hands data
 changes to the library instead:
 
 ```clojure
-(hc/defc live-bars
+(h/defc live-bars
   {:require [["https://esm.sh/d3@7" :as d3]]}
   [{:keys [values]}]
 
@@ -1334,6 +1401,10 @@ not Clojure — they compile to JavaScript and run in the browser:
 Hyper ships clj-kondo config (see [clj-kondo](#clj-kondo)) that validates
 `defc` structure at lint time and makes attrs, `emit`, and `ctx` resolve
 inside segments.
+
+`h/defc` is a re-export; the canonical namespace is `hyper.component`,
+which also houses the lower-level API (`register-component!`, `attrs`,
+the bundle registry).
 
 For self-hosted/air-gapped deploys, override the Squint runtime CDN URL
 with the `:squint-core-url` option on `create-handler`.

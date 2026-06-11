@@ -1,5 +1,6 @@
 {:hooks
- {:analyze-call {hyper.component/defc hooks.hyper.component/defc}}
+ {:analyze-call {hyper.component/defc hooks.hyper.component/defc
+                 hyper.core/defc      hooks.hyper.component/defc}}
 
  :config-in-call
  {hyper.component/defc
@@ -9,6 +10,20 @@
   ;; structures — so namespace resolution and type checks are not kondo's
   ;; to make inside defc.
   {:linters {:unresolved-namespace {:level :off}
+             :type-mismatch        {:level :off}}}
+  hyper.core/defc
+  {:linters {:unresolved-namespace {:level :off}
+             :type-mismatch        {:level :off}}}
+
+  ;; expr bodies are Datastar expressions: $signals, evt, el, and
+  ;; @actions are client-side vocabulary, invisible to kondo.
+  hyper.expr/->expr
+  {:linters {:unresolved-symbol    {:level :off}
+             :unresolved-namespace {:level :off}
+             :type-mismatch        {:level :off}}}
+  hyper.core/expr
+  {:linters {:unresolved-symbol    {:level :off}
+             :unresolved-namespace {:level :off}
              :type-mismatch        {:level :off}}}}
 
  :linters

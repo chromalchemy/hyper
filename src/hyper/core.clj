@@ -10,7 +10,9 @@
   (:require [clojure.string :as str]
             [hyper.actions :as actions]
             [hyper.client-params :as client-params]
+            [hyper.component :as component]
             [hyper.context :as context :refer [*request* *action-idx*]]
+            [hyper.expr]
             [hyper.reactive :as reactive]
             [hyper.render :as render]
             [hyper.routes :as routes]
@@ -418,6 +420,47 @@
                                                               ~(when as-name {:as as-name}))
            base-path#               (get @app-state*# :base-path "")]
        (build-action-expr action-id# '~used-params ~js base-path#))))
+
+;; ---------------------------------------------------------------------------
+;; Client-side expressions and components (re-exports)
+;; ---------------------------------------------------------------------------
+
+(defmacro expr
+  "Compile Clojure forms into a Datastar expression string for use in
+   data-* attributes, action :when guards, etc.
+
+   Signals use atom vocabulary — the same (reset! sig v) that means a
+   server round-trip inside `action` compiles to an instant client-side
+   assignment here:
+
+     (let [open?* (local-signal :open false)]
+       [:button {:data-on:click (expr (swap! open?* not))} \"Toggle\"]
+       [:div {:data-show (expr @open?*)} \"...\"])
+
+     [:input {:data-on:keydown
+              (expr (when (= evt.key \"Enter\") (@post \"/search\")))}]
+
+   Locals splice automatically; evt/el/$signals/JS interop pass through
+   to the client.  Canonical documentation: hyper.expr/->expr."
+  [& forms]
+  `(hyper.expr/->expr ~@forms))
+
+(defmacro defc
+  "Define a client-side web component, authored in a CLJS dialect (Squint)
+   and compiled to JavaScript on the JVM at macro-expansion time.
+
+     (defc temp-gauge
+       [{:keys [value max label]}]
+       (event ::selected [_e]
+         (emit \"gauge-selected\" {:value value :label label}))
+       (render
+         [:div {:on {:click ::selected}} label \": \" value]))
+
+   Also defines a server-side render function of the same name, so pages
+   call components like ordinary hiccup functions.  Canonical
+   documentation: hyper.component/defc."
+  [& args]
+  `(component/defc ~@args))
 
 (defn navigate
   "Create a navigation link using reitit named routes.

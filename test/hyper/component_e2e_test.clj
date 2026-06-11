@@ -129,6 +129,11 @@
                         :n    @(h/tab-cursor :ks-n 3)})
      [:button#ks-toggle {:data-on:click (h/action (swap! (h/tab-cursor :ks-flag) not))} "toggle"]
      [:button#ks-grow {:data-on:click (h/action (swap! (h/tab-cursor :ks-n) inc))} "grow"]
+     ;; h/expr: client-side local-signal toggle, no server involvement
+     (let [panel?* (h/local-signal :panel false)]
+       [:div
+        [:button#expr-toggle {:data-on:click (h/expr (swap! panel?* not))} "toggle panel"]
+        [:div#expr-panel {:data-show @panel?* :style "display:none"} "panel content"]])
      [:button#hotter {:data-on:click (h/action (swap! (h/tab-cursor :temp) + 5))} "+5"]
      [:button#noise {:data-on:click (h/action (swap! (h/tab-cursor :noise) inc))} "noise"]
      [:span#noise-count (str @noise*)]
@@ -312,6 +317,30 @@
                 (= 4 (ks-js "r.querySelectorAll('#ks-list li').length")) (is true)
                 (> (System/currentTimeMillis) deadline) (is (= 4 (ks-js "r.querySelectorAll('#ks-list li').length")))
                 :else (do (Thread/sleep 100) (recur)))))))
+      (finally
+        (e2e/close-browser! browser-info)))))
+
+(deftest ^:e2e expr-transpiler-test
+  ;; Proves h/expr output executes in Datastar's sandboxed evaluator:
+  ;; a (swap! local-signal not) toggle, entirely client-side.
+  (let [browser-info (e2e/launch-browser)
+        ctx          (e2e/new-context browser-info)
+        page         (e2e/new-page ctx)
+        display      #(e2e/eval-js "getComputedStyle(document.querySelector('#expr-panel')).display")]
+    (try
+      (w/with-page page
+        (w/navigate (str base-url "/components"))
+        (e2e/wait-for-sse)
+        (is (e2e/wait-for-text "#expr-toggle" "toggle panel"))
+
+        (testing "hidden initially"
+          (is (= "none" (display))))
+
+        (testing "expr-compiled toggle shows and hides, client-side"
+          (w/click "#expr-toggle")
+          (is (not= "none" (display)))
+          (w/click "#expr-toggle")
+          (is (= "none" (display)))))
       (finally
         (e2e/close-browser! browser-info)))))
 

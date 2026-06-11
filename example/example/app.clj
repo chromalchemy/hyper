@@ -1,6 +1,5 @@
 (ns example.app
-  (:require [hyper.component :as hc]
-            [hyper.core :as h]
+  (:require [hyper.core :as h]
             [hyper.effects :as effects]
             [hyper.state]))
 
@@ -206,7 +205,7 @@
         ;; Local signal — client-only toggle
         (card "Local signal (client-only)"
               "Local signals never leave the browser. Toggle without a server round-trip."
-              [:button {:data-on:click (str @open?* " = !" @open?*)} "Toggle"]
+              [:button {:data-on:click (h/expr (swap! open?* not))} "Toggle"]
               [:div {:data-show @open?* :style "display:none"}
                [:p "👋 This content is toggled by a local signal."]])))))
 
@@ -294,7 +293,7 @@
 ;;   frozen during unrelated server re-renders).
 ;; - Events are the channel out: clicking the gauge emits "gauge-selected"
 ;;   which the server handles as a normal data-on action via $detail.
-(hc/defc temp-gauge
+(h/defc temp-gauge
   "A client-side temperature gauge with a history sparkline."
   [{:keys [value max label history]}]
 
@@ -322,7 +321,7 @@
 ;; The server pushes :values through the attribute boundary; `update` hands
 ;; each change to d3, which animates the delta. The chart instance survives
 ;; arbitrary server re-renders — `mount` runs exactly once.
-(hc/defc live-bars
+(h/defc live-bars
   "An animated d3 bar chart driven by server state."
   {:require [["https://esm.sh/d3@7" :as d3]]}
   [{:keys [values]}]
