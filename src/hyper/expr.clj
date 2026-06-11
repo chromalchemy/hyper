@@ -1,0 +1,362 @@
+(ns hyper.expr
+  "Clojure → Datastar expression transpiler.
+
+   Write Datastar (data-*) expressions as s-expressions with hyper's own
+   vocabulary — signals are atoms here exactly as they are in actions:
+
+     (let [open?* (h/local-signal :open false)]
+       [:button {:data-on:click (->expr (swap! open?* not))}]   ;; \"$_open = !($_open)\"
+       [:div {:data-show (->expr @open?*)}])                     ;; \"$_open\"
+
+   The same `(reset! sig v)` form means a server round-trip inside
+   `h/action` and an instant client-side assignment inside `->expr` —
+   the surrounding macro decides where the code runs, not the syntax.
+
+   **Boundary inference** — what is Clojure and what is client-side:
+
+   - Locals (anything bound in the surrounding scope) splice at runtime:
+     signal objects become `$signal` references, plain values become JS
+     literals.  No unquoting needed.
+   - `(reset! sig v)` / `(swap! sig f & args)` on a signal local compile
+     to assignments: `$sig = ...`.
+   - `@sig` (deref of a local) becomes a `$sig` reference.
+   - Keyword-call forms `(:id person)` evaluate as Clojure at runtime and
+     splice as literals (keywords are not callable client-side).
+   - `~form` explicitly splices any other Clojure expression.
+   - Everything else is client-side: `$signal` symbols, `evt`/`el`,
+     Datastar actions (`(@post \"/x\")`), JS interop and operators.
+
+   Compilation happens at macro-expansion time via Squint — runtime cost
+   is string interpolation of spliced values only.  Output is
+   dependency-free JavaScript for Datastar's sandboxed evaluator:
+   `and`/`or`/`not`/`str` etc. emit bare JS operators, never library calls.
+
+   The transpiler core is ported, with gratitude, from Casey Link's
+   datastar-expressions (https://github.com/outskirtslabs/datastar-expressions,
+   MIT).  Hyper's additions: macro-time compilation with runtime splicing,
+   boundary inference via &env, and atom-vocabulary signal support.
+
+   Covered: the simple, obvious expressions a human would write.  It is
+   possible to write forms that produce broken JavaScript — raw strings
+   remain the escape hatch everywhere expressions are accepted."
+  (:require [clojure.string :as str]
+            [clojure.walk :as walk]
+            [hyper.signal]
+            [squint.compiler :as squint])
+  (:import (hyper.signal LocalSignal Signal)))
+
+;; ---------------------------------------------------------------------------
+;; Squint special-form overrides
+;; ---------------------------------------------------------------------------
+;; Datastar expressions run in a sandboxed evaluator with no library
+;; runtime, so boolean/control/string forms must compile to bare JS
+;; operators rather than squint_core calls.  These compiler macros
+;; (squint's :macros option) replace the defaults.
+
+(defn- bool-expr [e]
+  (if (boolean? e)
+    e
+    (vary-meta e assoc :tag 'boolean)))
+
+(defn- expr-and
+  ([_ _] true)
+  ([_ _ x] x)
+  ([_ _ x & next]
+   (let [js (str/join " && " (repeat (inc (count next)) "(~{})"))]
+     (bool-expr (concat (list 'js* js) (cons x next))))))
+
+(defn- expr-or
+  ([_ _] nil)
+  ([_ _ x] x)
+  ([_ _ x & next]
+   (let [js (str/join " || " (repeat (inc (count next)) "(~{})"))]
+     (bool-expr (concat (list 'js* js) (cons x next))))))
+
+(defn- expr-not [_ _ x]
+  (bool-expr (concat (list 'js* "(!(~{}))") (list x))))
+
+(defn- expr-do
+  ([_ _] nil)
+  ([_ _ & exprs]
+   (let [js (str/join ", " (repeat (count exprs) "(~{})"))]
+     (concat (list 'js* js) exprs))))
+
+(defn- expr-if [_ _ test & body]
+  (list 'if (bool-expr test) (first body) (second body)))
+
+(defn- expr-when [_ _ test & body]
+  (list 'if (bool-expr test) (cons 'expr/do body)))
+
+(defn- expr-when-not [_ _ test & body]
+  (list 'if-not (bool-expr test) (cons 'expr/do body)))
+
+(defn- expr-eq
+  ([_ _ _x] true)
+  ([_ _ x y]
+   (bool-expr (concat (list 'js* "(~{}) === (~{})") (list x y))))
+  ([_ _ x y & more]
+   (let [args  (list* x y more)
+         pairs (partition 2 1 args)
+         js    (str/join " && " (repeat (count pairs) "((~{}) === (~{}))"))]
+     (bool-expr (concat (list 'js* js) (mapcat identity pairs))))))
+
+(defn- expr-str
+  ([_ _] "")
+  ([_ _ & exprs]
+   (let [js (str/join " + " (cons "''" (repeat (count exprs) "(~{})")))]
+     (concat (list 'js* js) exprs))))
+
+(defn- expr-println [_ _ & exprs]
+  (let [js (str/join "," (repeat (count exprs) "(~{})"))]
+    (concat (list 'js* (str "console.log(" js ")")) exprs)))
+
+(defn- expr-raw
+  ([_ _] (list 'js* ""))
+  ([_ _ x]
+   (let [js (str/join (repeat (count x) "~{}"))]
+     (concat (list 'js* js) x))))
+
+(def ^:private macro-replacements
+  {'and      'expr/and
+   '&&       'expr/and
+   'or       'expr/or
+   '||       'expr/or
+   'if       'expr/if
+   'not      'expr/not
+   '=        'expr/=
+   'str      'expr/str
+   'println  'expr/println
+   'when     'expr/when
+   'when-not 'expr/when-not
+   'expr/raw 'expr/raw})
+
+(def ^:private compiler-macros
+  {'expr {'and      expr-and
+          'or       expr-or
+          'when     expr-when
+          'when-not expr-when-not
+          'do       expr-do
+          'if       expr-if
+          'not      expr-not
+          '=        expr-eq
+          'str      expr-str
+          'println  expr-println
+          'raw      expr-raw}})
+
+;; ---------------------------------------------------------------------------
+;; Pre-processing (form level)
+;; ---------------------------------------------------------------------------
+
+(defn- process-not-equals
+  "(not= x y) -> (not (= x y)) to avoid a squint_core dependency."
+  [form]
+  (walk/postwalk
+    (fn [node]
+      (if (and (seq? node) (= 'not= (first node)))
+        (list 'not (cons '= (rest node)))
+        node))
+    form))
+
+(defn- process-macros [form]
+  (walk/postwalk
+    (fn [node]
+      (if (and (seq? node) (contains? macro-replacements (first node)))
+        (cons (get macro-replacements (first node)) (rest node))
+        node))
+    form))
+
+(defn- pre-process [form]
+  (-> form process-not-equals process-macros))
+
+;; ---------------------------------------------------------------------------
+;; Post-processing (compiled JS level)
+;; ---------------------------------------------------------------------------
+
+(defn- replace-deref
+  "(@get \"/x\") reads as ((deref get) \"/x\") and compiles to
+   squint_core.deref(get)(...) — restore Datastar's @action syntax."
+  [js]
+  (-> js
+      (str/replace #"squint_core\.deref\(squint_core\.(get)\)\s*\(" "@$1(")
+      (str/replace #"squint_core\.deref\(([a-zA-Z_$][a-zA-Z0-9_$]*)\)\s*\(" "@$1(")))
+
+(defn- replace-truth
+  "squint_core.truth_(x) -> !!(x) — no library runtime in the sandbox."
+  [js]
+  (str/replace js #"squint_core\.truth_\((.*)\)" "!!($1)"))
+
+(defn- collect-kebab-signals
+  "All $signal symbols containing dashes, as name strings."
+  [form]
+  (into #{}
+        (comp (filter symbol?)
+              (map name)
+              (filter #(and (str/starts-with? % "$")
+                            (str/includes? % "-"))))
+        (tree-seq coll? seq form)))
+
+(defn- restore-signal-casing
+  "Squint munges $record-id to $record_id; Datastar accepts kebab signal
+   names, so restore the original spelling."
+  [js form]
+  (reduce (fn [s kebab]
+            (str/replace s (str/replace kebab "-" "_") kebab))
+          js
+          (collect-kebab-signals form)))
+
+;; ---------------------------------------------------------------------------
+;; Boundary inference
+;; ---------------------------------------------------------------------------
+;; Walk the expression deciding what is Clojure (spliced at runtime) and
+;; what is client-side (compiled by Squint).  Placeholder symbols stand in
+;; for spliced values and are substituted into the compiled template at
+;; runtime.
+
+(def ^:private deref-sym 'clojure.core/deref)
+
+(defn- deref-form? [form]
+  (and (seq? form) (= deref-sym (first form))))
+
+(defn- add-placeholder!
+  "Register expr for runtime splicing; returns the placeholder symbol.
+   mode is :value (signals -> $ref, other values -> JS literal) or
+   :signal (must be a signal; -> $ref)."
+  [pairs* expr mode]
+  (let [ph (symbol (str "__hyper_s" (count @pairs*) "__"))]
+    (swap! pairs* conj [(name ph) expr mode])
+    ph))
+
+(defn- infer-boundary
+  "Transform form, replacing Clojure-side expressions with placeholders.
+   env-locals is the set of locally-bound symbols from &env."
+  [form env-locals pairs*]
+  (letfn [(clj? [sym] (and (symbol? sym) (contains? env-locals sym)))
+          (xf [node]
+            (cond
+              ;; ~form — explicit splice
+              (and (seq? node) (= 'clojure.core/unquote (first node)))
+              (add-placeholder! pairs* (second node) :value)
+
+              ;; (reset! sig v) -> (set! $sig v)
+              (and (seq? node) (= 'reset! (first node)))
+              (let [[_ target v] node
+                    ph           (add-placeholder! pairs* target :signal)]
+                (list 'set! ph (xf v)))
+
+              ;; (swap! sig f & args) -> (set! $sig (f $sig & args))
+              (and (seq? node) (= 'swap! (first node)))
+              (let [[_ target f & args] node
+                    ph                  (add-placeholder! pairs* target :signal)]
+                (list 'set! ph (xf (list* f ph (map xf args)))))
+
+              ;; @local -> $ref / literal splice
+              (and (deref-form? node) (clj? (second node)))
+              (add-placeholder! pairs* (second node) :value)
+
+              ;; (:kw m) — keyword calls are Clojure, not client-side
+              (and (seq? node) (keyword? (first node)))
+              (add-placeholder! pairs* node :value)
+
+              ;; calls: keep the head symbol (or @action head) client-side,
+              ;; transform arguments
+              (seq? node)
+              (let [[head & args] node]
+                (if (or (symbol? head) (deref-form? head))
+                  (cons head (map xf args))
+                  (cons (xf head) (map xf args))))
+
+              (vector? node) (mapv xf node)
+              (map? node)    (into {} (map (fn [[k v]] [(xf k) (xf v)])) node)
+              (set? node)    (into #{} (map xf) node)
+
+              ;; bare local in value position -> splice
+              (clj? node)
+              (add-placeholder! pairs* node :value)
+
+              :else node))]
+    (xf form)))
+
+;; ---------------------------------------------------------------------------
+;; Compilation
+;; ---------------------------------------------------------------------------
+
+(defn compile-form
+  "Compile a single (boundary-inferred) form to a Datastar expression
+   string.  Public for testing."
+  [form]
+  (let [processed (pre-process form)]
+    ;; pr-str, not str — embedded lazy seqs from the boundary walk would
+    ;; stringify as "clojure.lang.LazySeq@hash" under str.
+    (-> (squint/compile-string (pr-str processed)
+                               {:elide-imports true
+                                :elide-exports true
+                                :top-level     false
+                                :context       :expr
+                                :macros        compiler-macros})
+        replace-deref
+        replace-truth
+        (restore-signal-casing processed)
+        (str/replace #"\n" " ")
+        str/trim
+        (str/replace #";$" ""))))
+
+;; ---------------------------------------------------------------------------
+;; Runtime splicing
+;; ---------------------------------------------------------------------------
+
+(defn- signal? [v]
+  (or (instance? Signal v) (instance? LocalSignal v)))
+
+(defn splice
+  "Encode a spliced runtime value.  :signal mode requires a signal object
+   (the target of reset!/swap!); :value mode turns signals into $refs and
+   everything else into a JS literal."
+  [v mode]
+  (case mode
+    :signal (if (signal? v)
+              (str "$" v)
+              (throw (ex-info "reset!/swap! target in an expression must be a signal"
+                              {:value v})))
+    :value  (if (signal? v)
+              (str "$" v)
+              (hyper.signal/clj->js-literal v))))
+
+(defn substitute
+  "Replace placeholders in a compiled template with spliced runtime values."
+  [template pairs]
+  (reduce (fn [s [ph v mode]] (str/replace s ph (splice v mode)))
+          template
+          pairs))
+
+;; ---------------------------------------------------------------------------
+;; The macro
+;; ---------------------------------------------------------------------------
+
+(defmacro ->expr
+  "Compile Clojure forms into a Datastar expression string.
+
+   Signals use atom vocabulary — reset!, swap!, deref — exactly as in
+   actions, but compile to instant client-side signal operations.  Locals
+   splice automatically; `evt`, `el`, `$signal` symbols, Datastar actions
+   ((@post \"/x\")) and JS interop pass through to the client.  Multiple
+   forms join with `;`.
+
+   Examples:
+     (->expr (swap! open?* not))                ;; \"$_open = !($_open)\"
+     (->expr (reset! query* evt.target.value))
+     (->expr (when (= evt.key \"Enter\") (@post \"/search\")))
+     (->expr (set! $count 0))                   ;; raw Datastar style works too
+     (->expr (reset! person-id* (:id person)))  ;; keyword calls are Clojure
+
+   Compilation happens at macro-expansion; spliced values interpolate at
+   runtime.  See the hyper.expr namespace docs for boundary rules."
+  [& forms]
+  (let [env-locals (set (keys &env))
+        pairs*     (atom [])
+        forms*     (mapv #(infer-boundary % env-locals pairs*) forms)
+        template   (str/join "; " (map compile-form forms*))
+        pairs      @pairs*]
+    (if (empty? pairs)
+      template
+      `(substitute ~template
+                   [~@(map (fn [[ph expr mode]] [ph expr mode]) pairs)]))))
