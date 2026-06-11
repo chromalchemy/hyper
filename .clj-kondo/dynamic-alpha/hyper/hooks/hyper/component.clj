@@ -110,6 +110,109 @@
       (api/token-node nil))))
 
 ;; ---------------------------------------------------------------------------
+;; Event cross-validation
+;; ---------------------------------------------------------------------------
+;; ::handler keywords referenced in :on maps must have matching (event ...)
+;; declarations, and declared events should be referenced somewhere.
+
+(defn- walk-nodes
+  "Depth-first seq of node and all its descendants."
+  [node]
+  (tree-seq (fn [n] (seq (:children n))) :children node))
+
+(defn- auto-kw-name
+  "When node is an auto-resolved keyword literal (::foo), return \"foo\".
+   Comparison is by literal text — the convention is to use the same ::kw
+   form in (event ...) and in :on references."
+  [node]
+  (let [s (str node)]
+    (when (str/starts-with? s "::")
+      (subs s 2))))
+
+(defn- declared-event-nodes
+  "Seq of [name-string event-kw-node] for each (event ::kw ...) segment."
+  [segments]
+  (for [seg segments
+        :when (= 'event (segment-name seg))
+        :let [kw-node (second (:children seg))
+              nm      (some-> kw-node auto-kw-name)]
+        :when nm]
+    [nm kw-node]))
+
+(defn- on-map-event-refs
+  "Seq of [name-string kw-node] for every ::kw used as a handler value
+   inside an {:on {...}} map anywhere in the given segments."
+  [segments]
+  (for [seg   segments
+        node  (walk-nodes seg)
+        :when (api/map-node? node)
+        :let  [children (:children node)
+               pairs    (partition 2 children)]
+        [k v] pairs
+        :when (and (api/keyword-node? k) (= :on (api/sexpr k))
+                   (api/map-node? v))
+        [_ev handler] (partition 2 (:children v))
+        :let  [nm (auto-kw-name handler)]
+        :when nm]
+    [nm handler]))
+
+(defn- validate-events!
+  [segments]
+  (let [declared (declared-event-nodes segments)
+        refs     (on-map-event-refs segments)
+        decl-set (set (map first declared))
+        ref-set  (set (map first refs))]
+    (doseq [[nm node] refs
+            :when (not (contains? decl-set nm))]
+      (finding! node :error
+                (str "No (event ::" nm " ...) declaration for this handler reference")
+                :hyper.component/undeclared-event))
+    (doseq [[nm node] declared
+            :when (not (contains? ref-set nm))]
+      (finding! node :warning
+                (str "Event ::" nm " is declared but never referenced in render")
+                :hyper.component/unused-event))))
+
+;; ---------------------------------------------------------------------------
+;; Require-alias validation
+;; ---------------------------------------------------------------------------
+;; Alias-qualified symbols in segments (d3/line) must refer to a declared
+;; :require alias.  Lowercase namespaces only — capitalized namespaces
+;; (Math/round, JSON/parse) are JS global interop and pass through, as does
+;; js/*.
+
+(defn- declared-aliases
+  "Set of alias name strings from the defc opts map's :require entries."
+  [opts-node]
+  (when (and opts-node (api/map-node? opts-node))
+    (let [m (try (api/sexpr opts-node) (catch Exception _ nil))]
+      (when (map? m)
+        (->> (:require m)
+             (keep (fn [entry]
+                     (when (and (vector? entry) (= 3 (count entry)))
+                       (str (nth entry 2)))))
+             set)))))
+
+(defn- validate-aliases!
+  [opts-node segments]
+  (let [aliases (or (declared-aliases opts-node) #{})]
+    (doseq [seg   segments
+            node  (walk-nodes seg)
+            :when (api/token-node? node)
+            :let  [v (try (api/sexpr node) (catch Exception _ nil))]
+            :when (and (symbol? v) (namespace v))
+            :let  [ns-str (namespace v)]
+            :when (and (re-matches #"[a-z][a-zA-Z0-9_$-]*" ns-str)
+                       (not= "js" ns-str)
+                       (not (contains? aliases ns-str)))]
+      (finding! node :error
+                (str ns-str "/" (name v) " — \"" ns-str
+                     "\" is not a :require alias of this component"
+                     (when (seq aliases)
+                       (str " (declared: " (str/join ", " (sort aliases)) ")")))
+                :hyper.component/unresolved-alias))))
+
+;; ---------------------------------------------------------------------------
 ;; Component-level validation
 ;; ---------------------------------------------------------------------------
 
@@ -154,10 +257,14 @@
    and register findings for structural problems."
   [{:keys [node]}]
   (let [[_ cname & body]         (:children node)
-        ;; Docstring (or anything else) before the binding vector is dropped
-        ;; from analysis output but kept out of the segments.
+        ;; Docstring before the binding vector is dropped from analysis
+        ;; output; the opts map is captured for :require alias validation.
+        prefix                   (take-while #(not (api/vector-node? %)) body)
+        opts-node                (some #(when (api/map-node? %) %) prefix)
         [binding-vec & segments] (drop-while #(not (api/vector-node? %)) body)
         _                        (validate-component! node binding-vec segments)
+        _                        (validate-events! segments)
+        _                        (validate-aliases! opts-node segments)
         let-node                 (api/list-node
                                    (list*
                                      (api/token-node 'let)
