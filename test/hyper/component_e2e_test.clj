@@ -54,11 +54,26 @@
   (unmount [_root]
     (set! js/window.__lcUnmounts (inc (or js/window.__lcUnmounts 0)))))
 
+;; Signal-linked component: reads :linked like any attribute; writes it back
+;; by emitting an event named after the attribute. The whole loop is
+;; client-side — Datastar assigns the signal, data-attr rewrites the
+;; attribute, and the change gate re-renders.
+(hc/defc sig-reflector
+  [{:keys [linked]}]
+  (event ::bump [_e]
+    (emit "linked" (str linked "+")))
+  (render
+    [:div#reflect-root
+     [:span#reflect-val (str linked)]
+     [:button#reflect-btn {:on {:click ::bump}}]]))
+
 (defn- components-get [_]
   (let [temp*     (h/tab-cursor :temp 10)
         selected* (h/tab-cursor :selected nil)
         noise*    (h/tab-cursor :noise 0)
-        lc-data*  (h/tab-cursor :lc-data 5)]
+        lc-data*  (h/tab-cursor :lc-data 5)
+        hov*      (h/signal :hov "init")
+        saved*    (h/tab-cursor :saved-hov "")]
     [:div
      (e2e-gauge {:value @temp*
                  :max   40
@@ -68,6 +83,13 @@
                            (reset! (h/tab-cursor :selected) $detail))})
      (e2e-lifecycle {:data @lc-data*})
      [:button#lc-inc {:data-on:click (h/action (swap! (h/tab-cursor :lc-data) + 3))} "+3"]
+     ;; Signal bind: component + data-text span + server action all share hov*
+     (sig-reflector {:linked hov*})
+     [:span#hov-text {:data-text @hov*}]
+     [:button#save-hov {:data-on:click (h/action {:as "save-hov"}
+                                                 (reset! (h/tab-cursor :saved-hov) @hov*))}
+      "save"]
+     [:span#saved-hov (str @saved*)]
      [:button#hotter {:data-on:click (h/action (swap! (h/tab-cursor :temp) + 5))} "+5"]
      [:button#noise {:data-on:click (h/action (swap! (h/tab-cursor :noise) inc))} "noise"]
      [:span#noise-count (str @noise*)]
@@ -180,6 +202,38 @@
           (is (= 1 (e2e/eval-js "window.__lcUnmounts || 0")))
           ;; Scaffold re-rendered fresh on remount
           (is (= "0" (w/text-content "#lc-updates")))))
+      (finally
+        (e2e/close-browser! browser-info)))))
+
+(deftest ^:e2e component-signal-bind-test
+  (let [browser-info (e2e/launch-browser)
+        ctx          (e2e/new-context browser-info)
+        page         (e2e/new-page ctx)]
+    (try
+      (w/with-page page
+        (w/navigate (str base-url "/components"))
+        (e2e/wait-for-sse)
+
+        (testing "signal-linked attr seeds from the signal default"
+          (is (e2e/wait-for-text "#reflect-val" "init")))
+
+        (testing "component emit writes the signal; the page reacts client-side"
+          (w/click "#reflect-btn")
+          ;; Component re-renders from its own write, round-tripped through
+          ;; Datastar: emit -> $hov assignment -> data-attr -> change gate.
+          (is (e2e/wait-for-text "#reflect-val" "init+"))
+          ;; A plain data-text subscriber to the same signal also updates —
+          ;; it's the shared page signal, not component-local state.
+          (is (e2e/wait-for-text "#hov-text" "init+")))
+
+        (testing "loop composes: second click appends again"
+          (w/click "#reflect-btn")
+          (is (e2e/wait-for-text "#reflect-val" "init++"))
+          (is (e2e/wait-for-text "#hov-text" "init++")))
+
+        (testing "server actions see the live signal value"
+          (w/click "#save-hov")
+          (is (e2e/wait-for-text "#saved-hov" "init++"))))
       (finally
         (e2e/close-browser! browser-info)))))
 

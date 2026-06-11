@@ -27,6 +27,7 @@
             [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.walk :as walk]
+            [hyper.signal :as signal]
             [squint.compiler :as squint]))
 
 ;; ---------------------------------------------------------------------------
@@ -508,12 +509,51 @@
     (boolean? v) (str v)
     :else        (stable-json v)))
 
+(defn- signal-link-attrs
+  "Generate the attribute triple that live-links a component attribute to a
+   Datastar signal:
+
+   1. The attribute itself, JSON-encoded from the signal's current
+      server-side value — correct first paint before Datastar runs.
+   2. `data-attr:<name>` — Datastar reactively rewrites the attribute
+      (JSON-encoded) whenever the signal changes, flowing through the
+      component's normal change gate with zero server involvement.
+   3. `data-on:<name>` — an event of the attribute's name assigns the
+      signal from `evt.detail`, so `(emit \"<name>\" v)` inside the
+      component writes the signal.
+
+   The JSON encoding on both sides means values round-trip through the
+   existing attribute parser uniformly (strings, numbers, booleans,
+   collections)."
+  [acc k sig]
+  (let [attr-name (name k)
+        js-name   (signal/js-name sig)]
+    (-> acc
+        (assoc k (stable-json (signal/current-value sig)))
+        (assoc (keyword (str "data-attr:" attr-name))
+               (str "JSON.stringify($" js-name ")"))
+        (assoc (keyword (str "data-on:" attr-name))
+               (str "$" js-name " = evt.detail")))))
+
 (defn attrs
   "Serialize a map of component attribute values for use in hiccup.
 
    Component data attrs are serialized via `attr-value`.  Keys that are
    part of the host-element contract — `data-*` (e.g. `data-on:*` action
    bindings), :id, :class, :style — pass through untouched.
+
+   Passing a **signal object** (un-deref'd) as an attribute value creates a
+   live two-way client-side link: Datastar keeps the attribute synced to
+   the signal (component re-renders/updates on signal change with no server
+   round-trip), and the component writes the signal back by emitting an
+   event named after the attribute:
+
+     ;; server render fn
+     (let [hover* (h/signal :hovered-symbol nil)]
+       (stock-chart {:points @points* :hover hover*}))
+
+     ;; inside the component: read `hover` like any attr; write it with
+     (emit \"hover\" \"AAPL\")
 
    Example:
      [:temp-gauge (hc/attrs {:value @temp*
@@ -523,9 +563,15 @@
   (reduce-kv
     (fn [acc k v]
       (let [kn (name k)]
-        (if (or (str/starts-with? kn "data-")
-                (contains? #{"id" "class" "style"} kn))
+        (cond
+          (or (str/starts-with? kn "data-")
+              (contains? #{"id" "class" "style"} kn))
           (assoc acc k v)
+
+          (signal/signal? v)
+          (signal-link-attrs acc k v)
+
+          :else
           (assoc acc k (attr-value v)))))
     {}
     m))

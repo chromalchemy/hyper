@@ -156,6 +156,31 @@
   (toString [_] sig-name))
 
 ;; ---------------------------------------------------------------------------
+;; Signal introspection
+;; ---------------------------------------------------------------------------
+;; Used by hyper.component to generate signal-linked component attributes
+;; without reaching into deftype fields from another namespace.
+
+(defn signal?
+  "True when x is a (non-local) Datastar signal."
+  [x]
+  (instance? Signal x))
+
+(defn js-name
+  "The signal's Datastar JS name, e.g. \"userName\" or \"user.name\"."
+  [^Signal sig]
+  (.-sig-name sig))
+
+(defn current-value
+  "The signal's current server-side value from tab state, falling back to
+   its default.  Used to seed signal-linked component attributes on first
+   paint, before Datastar's reactive attributes take over."
+  [^Signal sig]
+  (get-in @(.-app-state* sig)
+          (into [:tabs (.-tab-id sig) :signals] (.-store-path sig))
+          (.-default-val sig)))
+
+;; ---------------------------------------------------------------------------
 ;; Chassis protocol extensions
 ;; ---------------------------------------------------------------------------
 ;; Extend Chassis's AttributeValueFragment so that signals used as attribute

@@ -3,7 +3,8 @@
    registry, attribute serialization, and bundle assembly."
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
-            [hyper.component :as hc]))
+            [hyper.component :as hc]
+            [hyper.signal :as signal]))
 
 (defn- with-fresh-registry*
   "Run f with an isolated component registry and bundle cache."
@@ -101,6 +102,28 @@
       (is (= "wide" (:class out)))
       (is (= "color:red" (:style out)))
       (is (= "@post('/x')" (:data-on:gauge-selected out))))))
+
+(deftest test-attrs-signal-link
+  (testing "signal object as attr value generates the live-link triple"
+    (let [sig (signal/->Signal "hovSym" "hov-sym" [:hov-sym] (atom {}) "tab1" "init")
+          out (hc/attrs {:linked sig :label "x"})]
+      (testing "attr seeded from signal default, JSON-encoded for first paint"
+        (is (= "\"init\"" (:linked out))))
+      (testing "Datastar keeps the attribute synced to the signal"
+        (is (= "JSON.stringify($hovSym)" (:data-attr:linked out))))
+      (testing "an event named after the attr writes the signal"
+        (is (= "$hovSym = evt.detail" (:data-on:linked out))))
+      (testing "other attrs unaffected"
+        (is (= "x" (:label out))))))
+
+  (testing "current tab-state value wins over the default"
+    (let [app-state (atom {:tabs {"t1" {:signals {:hov-sym "live"}}}})
+          sig       (signal/->Signal "hovSym" "hov-sym" [:hov-sym] app-state "t1" "init")]
+      (is (= "\"live\"" (:linked (hc/attrs {:linked sig}))))))
+
+  (testing "collection values JSON-encode deterministically"
+    (let [sig (signal/->Signal "sel" "sel" [:sel] (atom {}) "t1" {:b 2 :a 1})]
+      (is (= "{\"a\":1,\"b\":2}" (:sel (hc/attrs {:sel sig})))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Bundle assembly
