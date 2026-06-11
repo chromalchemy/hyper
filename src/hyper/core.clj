@@ -317,6 +317,18 @@
                    (assoc m sym (client-params/client-param sym)))
                  {}))))
 
+(defn sanitize-guard
+  "Validate an action :when guard at runtime.  Returns the guard string,
+   nil for nil/blank guards, and throws for anything else — a guard must
+   evaluate to a Datastar expression string (e.g. from `expr` or a raw
+   string)."
+  [g]
+  (cond
+    (nil? g)    nil
+    (string? g) (when-not (str/blank? g) g)
+    :else       (throw (ex-info "action :when guard must evaluate to a string Datastar expression"
+                                {:guard g}))))
+
 (defn build-action-expr
   "Build the Datastar/JS expression string for an action.
    Always uses Datastar's @post() so that all non-underscore signals are
@@ -391,9 +403,13 @@
                                  (some #{:when :as} (keys maybe-opts)))
         [js as-name body]   (if opts-map?
                               (let [guard (:when maybe-opts)
-                                    js    (when (and (string? guard)
-                                                     (not (str/blank? guard)))
-                                            guard)]
+                                    ;; String literals are validated here; any
+                                    ;; other form (e.g. (expr ...)) is deferred
+                                    ;; to runtime evaluation — sanitize-guard
+                                    ;; validates the result.
+                                    js    (cond
+                                            (string? guard) (when-not (str/blank? guard) guard)
+                                            (some? guard)   guard)]
                                 [js (:as maybe-opts) body])
                               [nil nil args])
         used-params         (find-client-params body)
@@ -419,7 +435,7 @@
            _#                       (actions/register-action! app-state*# session-id# tab-id# action-fn# action-id#
                                                               ~(when as-name {:as as-name}))
            base-path#               (get @app-state*# :base-path "")]
-       (build-action-expr action-id# '~used-params ~js base-path#))))
+       (build-action-expr action-id# '~used-params (sanitize-guard ~js) base-path#))))
 
 ;; ---------------------------------------------------------------------------
 ;; Client-side expressions and components (re-exports)

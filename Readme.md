@@ -263,9 +263,12 @@ The guard runs before the action fires, letting you filter events at the browser
 ```clojure
 ;; Only POST when Enter is pressed — no network traffic on other keystrokes
 [:input {:type "text"
-         :data-on:keydown (h/action {:when "evt.key === 'Enter'"}
+         :data-on:keydown (h/action {:when (h/expr (= evt.key "Enter"))}
                            (reset! (h/tab-cursor :value) $value))}]
 ```
+
+The guard is any Datastar expression — build it with [`expr`](#expressions)
+as above, or pass a raw string (`{:when "evt.key === 'Enter'"}`).
 
 ## Signals
 
@@ -1656,7 +1659,7 @@ Without `:as`, actions are keyed by their auto-generated action ID. `:as` can
 be combined with `:when`:
 
 ```clojure
-(h/action {:as "search" :when "evt.key === 'Enter'"} (search! $value))
+(h/action {:as "search" :when (h/expr (= evt.key "Enter"))} (search! $value))
 ```
 
 ### `test-action`

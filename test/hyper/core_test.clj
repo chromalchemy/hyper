@@ -473,7 +473,32 @@
           (is (.contains action-expr "@post("))
           (is (.contains action-expr "hyper.encodeClientParams"))
           (is (.contains action-expr "value:evt.target.value"))
-          (is (not (.contains action-expr " && "))))))))
+          (is (not (.contains action-expr " && ")))))))
+
+  (testing ":when accepts a runtime-evaluated form, e.g. (hy/expr ...)"
+    (let [app-state* (atom (state/init-state))
+          session-id "test-session-js"
+          tab-id     "test_tab_js"]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (binding [context/*request* {:hyper/session-id session-id
+                                   :hyper/tab-id     tab-id
+                                   :hyper/app-state  app-state*}]
+        (let [action-expr (hy/action {:when (hy/expr (= evt.key "Enter"))}
+                                     (reset! (hy/tab-cursor :val) $value))]
+          (is (.startsWith action-expr "(evt.key) === (\"Enter\") && "))
+          (is (.contains action-expr "@post("))))))
+
+  (testing ":when guard evaluating to a non-string throws"
+    (let [app-state* (atom (state/init-state))
+          session-id "test-session-js"
+          tab-id     "test_tab_js"]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (binding [context/*request* {:hyper/session-id session-id
+                                   :hyper/tab-id     tab-id
+                                   :hyper/app-state  app-state*}]
+        (is (thrown-with-msg?
+              Exception #"must evaluate to a string"
+              (hy/action {:when 42} (reset! (hy/tab-cursor :val) $value))))))))
 
 (deftest test-base-path-action
   (testing "action macro uses /hyper/actions without :base-path"
