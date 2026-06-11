@@ -4,7 +4,7 @@
    Handles rendering hiccup to HTML and formatting Datastar SSE events."
   (:require [clojure.string :as string]
             [dev.onionpancakes.chassis.core :as c]
-            [hyper.component :as component]
+            [hyper.component.bundle :as component.bundle]
             [hyper.context :as context]
             [hyper.routes :as routes]
             [hyper.state :as state]
@@ -138,7 +138,7 @@
    hiccup or nil."
   [app-state* req]
   (let [user-head (routes/resolve-head (get @app-state* :head) req)
-        comp-tag  (component/head-script-tag
+        comp-tag  (component.bundle/head-script-tag
                     (get @app-state* :base-path "")
                     {:squint-core-url (get @app-state* :squint-core-url)})
         els       (cond-> (head-elements user-head)

@@ -1,16 +1,19 @@
 (ns hyper.component-test
-  "Unit tests for hyper.component — squint compilation, the component
-   registry, attribute serialization, and bundle assembly."
+  "Unit tests for hyper.component and its sub-namespaces — squint
+   compilation, the component registry, attribute serialization,
+   macro-time hiccup compilation, and bundle assembly."
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [hyper.component :as hc]
+            [hyper.component.bundle :as hcb]
+            [hyper.component.hiccup :as hch]
             [hyper.signal :as signal]))
 
 (defn- with-fresh-registry*
   "Run f with an isolated component registry and bundle cache."
   [f]
   (with-redefs-fn {#'hc/registry*                          (atom {})
-                   #'hyper.component/bundle-cache*         (atom nil)}
+                   #'hyper.component.bundle/bundle-cache*  (atom nil)}
     f))
 
 (defmacro with-fresh-registry [& body]
@@ -132,30 +135,30 @@
 (deftest test-bundle
   (with-fresh-registry
     (testing "nil when no components are registered"
-      (is (nil? (hc/bundle)))
-      (is (nil? (hc/head-script-tag "" nil))))
+      (is (nil? (hcb/bundle)))
+      (is (nil? (hcb/head-script-tag "" nil))))
 
     (hc/register-component! "a-widget" {:attrs [:v] :render "(fn [{:keys [v]} _] [:em v])"})
 
     (testing "bundle is a single ES module: prelude, runtime, components"
-      (let [{:keys [js hash]} (hc/bundle)]
+      (let [{:keys [js hash]} (hcb/bundle)]
         (is (str/starts-with? js "import * as $sc from"))
-        (is (str/includes? js hc/default-squint-core-url))
+        (is (str/includes? js hcb/default-squint-core-url))
         (is (str/includes? js "function $define(") "runtime shim included")
         (is (str/includes? js "$define(\"a-widget\"") "component included")
         (is (= 16 (count hash)))))
 
     (testing "bundle is cached against the registry snapshot"
-      (is (identical? (hc/bundle) (hc/bundle))))
+      (is (identical? (hcb/bundle) (hcb/bundle))))
 
     (testing "core url override lands in the prelude"
-      (is (str/includes? (:js (hc/bundle {:squint-core-url "/vendor/squint-core.js"}))
+      (is (str/includes? (:js (hcb/bundle {:squint-core-url "/vendor/squint-core.js"}))
                          "from '/vendor/squint-core.js'")))
 
     (testing "registering another component changes the hash and sorts by name"
-      (let [h1 (:hash (hc/bundle))]
+      (let [h1 (:hash (hcb/bundle))]
         (hc/register-component! "b-widget" {:attrs [] :render "(fn [_ _] [:i])"})
-        (let [{:keys [js hash]} (hc/bundle)]
+        (let [{:keys [js hash]} (hcb/bundle)]
           (is (not= h1 hash))
           (is (< (str/index-of js "$define(\"a-widget\"")
                  (str/index-of js "$define(\"b-widget\""))))))))
@@ -165,52 +168,52 @@
 ;; ---------------------------------------------------------------------------
 
 (deftest test-parse-tag
-  (is (= ["div" nil nil]       (hc/parse-tag :div)))
-  (is (= ["div" "m" nil]       (hc/parse-tag :div#m)))
-  (is (= ["div" nil "a b"]     (hc/parse-tag :div.a.b)))
-  (is (= ["svg" "c" "chart"]   (hc/parse-tag :svg.chart#c)))
-  (is (= ["div" nil "box"]     (hc/parse-tag :.box)))
-  (is (= ["div" "only" nil]    (hc/parse-tag :#only)))
-  (is (= ["my-widget" nil nil] (hc/parse-tag :my-widget))))
+  (is (= ["div" nil nil]       (hch/parse-tag :div)))
+  (is (= ["div" "m" nil]       (hch/parse-tag :div#m)))
+  (is (= ["div" nil "a b"]     (hch/parse-tag :div.a.b)))
+  (is (= ["svg" "c" "chart"]   (hch/parse-tag :svg.chart#c)))
+  (is (= ["div" nil "box"]     (hch/parse-tag :.box)))
+  (is (= ["div" "only" nil]    (hch/parse-tag :#only)))
+  (is (= ["my-widget" nil nil] (hch/parse-tag :my-widget))))
 
 (deftest test-compile-hiccup
   (testing "basic elements compile to $h descriptor calls"
     (is (= '($h "div" nil nil nil ["x"])
-           (hc/compile-hiccup '[:div "x"])))
+           (hch/compile-hiccup '[:div "x"])))
     (is (= '($h "div" "m" "box" {:title "t"} ["x"])
-           (hc/compile-hiccup '[:div.box#m {:title "t"} "x"]))))
+           (hch/compile-hiccup '[:div.box#m {:title "t"} "x"]))))
 
   (testing "children compile recursively; expressions stay in child position"
     (is (= '($h "div" nil nil nil [($h "span" nil nil nil [y]) (str a b)])
-           (hc/compile-hiccup '[:div [:span y] (str a b)]))))
+           (hch/compile-hiccup '[:div [:span y] (str a b)]))))
 
   (testing "a non-literal second position is a child, not attrs"
     (is (= '($h "div" nil nil nil [props "x"])
-           (hc/compile-hiccup '[:div props "x"]))))
+           (hch/compile-hiccup '[:div props "x"]))))
 
   (testing "control forms recurse into value positions only"
     (is (= '(if c ($h "i" nil nil nil ["y"]) ($h "em" nil nil nil ["n"]))
-           (hc/compile-hiccup '(if c [:i "y"] [:em "n"]))))
+           (hch/compile-hiccup '(if c [:i "y"] [:em "n"]))))
     (is (= '(let [pct 5] ($h "div" nil nil nil [pct]))
-           (hc/compile-hiccup '(let [pct 5] [:div pct]))))
+           (hch/compile-hiccup '(let [pct 5] [:div pct]))))
     (is (= '(for [v vs] ($h "li" nil nil nil [v]))
-           (hc/compile-hiccup '(for [v vs] [:li v]))))
+           (hch/compile-hiccup '(for [v vs] [:li v]))))
     (is (= '(when c (log! [:not :hiccup]) ($h "b" nil nil nil []))
-           (hc/compile-hiccup '(when c (log! [:not :hiccup]) [:b])))
+           (hch/compile-hiccup '(when c (log! [:not :hiccup]) [:b])))
         "earlier (side-effect) body forms are untouched")
     (is (= '(cond a ($h "i" nil nil nil []) :else ($h "em" nil nil nil []))
-           (hc/compile-hiccup '(cond a [:i] :else [:em])))
+           (hch/compile-hiccup '(cond a [:i] :else [:em])))
         "cond compiles results, never tests"))
 
   (testing "keyword vectors inside unknown expressions are never corrupted"
     (is (= '(get m [:a :b])
-           (hc/compile-hiccup '(get m [:a :b]))))
+           (hch/compile-hiccup '(get m [:a :b]))))
     (is (= '(my-helper [:div "raw"])
-           (hc/compile-hiccup '(my-helper [:div "raw"])))
+           (hch/compile-hiccup '(my-helper [:div "raw"])))
         "unknown calls pass through whole — runtime fallback handles results"))
 
   (testing "non-keyword-head vectors are untouched"
-    (is (= '[a b c] (hc/compile-hiccup '[a b c])))))
+    (is (= '[a b c] (hch/compile-hiccup '[a b c])))))
 
 (deftest test-defc-compiles-render-hiccup
   (with-fresh-registry
@@ -316,7 +319,7 @@
                requires))
         (is (str/includes? js "d3.line"))
         (is (str/includes? js "chart_lib.init") "alias munged like squint output"))
-      (let [bundle-js (:js (hc/bundle))]
+      (let [bundle-js (:js (hcb/bundle))]
         (is (str/includes? bundle-js "import * as d3 from 'https://esm.sh/d3@7';"))
         (is (str/includes? bundle-js "import * as chart_lib from 'https://esm.sh/chart';"))))
 
@@ -326,7 +329,7 @@
         {:require [["https://esm.sh/d3@7" :as d3]]}
         [{:keys [data]}]
         (render [:svg (d3/area data)]))
-      (let [bundle-js (:js (hc/bundle))]
+      (let [bundle-js (:js (hcb/bundle))]
         (is (= 1 (count (re-seq #"import \* as d3 " bundle-js))))))
 
     (testing "alias conflict (same alias, different URL) throws at registration"
@@ -426,9 +429,9 @@
   (with-fresh-registry
     (hc/register-component! "a-widget" {:attrs [] :render "(fn [_ _] [:i])"})
     (testing "script tag carries base-path and content hash"
-      (let [[tag attrs] (hc/head-script-tag "/my-app" nil)]
+      (let [[tag attrs] (hcb/head-script-tag "/my-app" nil)]
         (is (= :script tag))
         (is (= "module" (:type attrs)))
         (is (str/starts-with? (:src attrs) "/my-app/hyper/components.js?v="))
-        (is (= (str "/my-app/hyper/components.js?v=" (:hash (hc/bundle)))
+        (is (= (str "/my-app/hyper/components.js?v=" (:hash (hcb/bundle)))
                (:src attrs)))))))

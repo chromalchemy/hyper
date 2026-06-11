@@ -311,12 +311,8 @@
 
         (testing "re-render semantics: growing fragments"
           (w/click "#ks-grow")
-          (let [deadline (+ (System/currentTimeMillis) 5000)]
-            (loop []
-              (cond
-                (= 4 (ks-js "r.querySelectorAll('#ks-list li').length")) (is true)
-                (> (System/currentTimeMillis) deadline) (is (= 4 (ks-js "r.querySelectorAll('#ks-list li').length")))
-                :else (do (Thread/sleep 100) (recur)))))))
+          (e2e/wait-for-pred #(= 4 (ks-js "r.querySelectorAll('#ks-list li').length")))
+          (is (= 4 (ks-js "r.querySelectorAll('#ks-list li').length")))))
       (finally
         (e2e/close-browser! browser-info)))))
 

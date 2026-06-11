@@ -41,9 +41,8 @@
    remain the escape hatch everywhere expressions are accepted."
   (:require [clojure.string :as str]
             [clojure.walk :as walk]
-            [hyper.signal]
-            [squint.compiler :as squint])
-  (:import (hyper.signal LocalSignal Signal)))
+            [hyper.signal :as signal]
+            [squint.compiler :as squint]))
 
 ;; ---------------------------------------------------------------------------
 ;; Squint special-form overrides
@@ -304,22 +303,19 @@
 ;; Runtime splicing
 ;; ---------------------------------------------------------------------------
 
-(defn- signal? [v]
-  (or (instance? Signal v) (instance? LocalSignal v)))
-
 (defn splice
   "Encode a spliced runtime value.  :signal mode requires a signal object
    (the target of reset!/swap!); :value mode turns signals into $refs and
    everything else into a JS literal."
   [v mode]
   (case mode
-    :signal (if (signal? v)
-              (str "$" v)
+    :signal (if (signal/any-signal? v)
+              (signal/js-ref v)
               (throw (ex-info "reset!/swap! target in an expression must be a signal"
                               {:value v})))
-    :value  (if (signal? v)
-              (str "$" v)
-              (hyper.signal/clj->js-literal v))))
+    :value  (if (signal/any-signal? v)
+              (signal/js-ref v)
+              (signal/clj->js-literal v))))
 
 (defn substitute
   "Replace placeholders in a compiled template with spliced runtime values."

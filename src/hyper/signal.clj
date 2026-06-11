@@ -158,18 +158,38 @@
 ;; ---------------------------------------------------------------------------
 ;; Signal introspection
 ;; ---------------------------------------------------------------------------
-;; Used by hyper.component to generate signal-linked component attributes
-;; without reaching into deftype fields from another namespace.
+;; Used by hyper.component (signal-linked attributes) and hyper.expr
+;; (runtime splicing) without reaching into deftype fields from other
+;; namespaces.
 
 (defn signal?
   "True when x is a (non-local) Datastar signal."
   [x]
   (instance? Signal x))
 
+(defn local-signal?
+  "True when x is a client-only (underscore-prefixed) local signal."
+  [x]
+  (instance? LocalSignal x))
+
+(defn any-signal?
+  "True when x is any signal object — Signal or LocalSignal."
+  [x]
+  (or (signal? x) (local-signal? x)))
+
 (defn js-name
-  "The signal's Datastar JS name, e.g. \"userName\" or \"user.name\"."
-  [^Signal sig]
-  (.-sig-name sig))
+  "The signal's Datastar JS name, e.g. \"userName\", \"user.name\" or
+   \"_open\" (local signals carry their underscore prefix)."
+  [sig]
+  (cond
+    (signal? sig)       (.-sig-name ^Signal sig)
+    (local-signal? sig) (.-sig-name ^LocalSignal sig)
+    :else (throw (ex-info "Not a signal" {:value sig}))))
+
+(defn js-ref
+  "The Datastar expression reference for a signal, e.g. \"$userName\"."
+  [sig]
+  (str "$" (js-name sig)))
 
 (defn current-value
   "The signal's current server-side value from tab state, falling back to

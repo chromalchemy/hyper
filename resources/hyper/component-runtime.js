@@ -36,6 +36,10 @@ function $parseAttr(raw) {
   return raw;
 }
 
+// JVM twin: hyper.component.hiccup/parse-tag — same tag-shorthand contract,
+// applied at macro-expansion for literal hiccup. This runtime parser only
+// handles the dynamic-array fallback path. Keep the two in agreement (the
+// kitchen-sink conformance e2e test pins the contract).
 function $parseTag(spec) {
   let tag = 'div';
   let id = null;
@@ -71,7 +75,7 @@ function $setAttrs(el, attrs) {
 const $SVG_NS = 'http://www.w3.org/2000/svg';
 
 // Descriptor constructor for hiccup compiled at macro-expansion time by
-// hyper.component/compile-hiccup. Tag/id/class parsing and attrs detection
+// hyper.component.hiccup/compile-hiccup. Tag/id/class parsing and attrs detection
 // happened on the JVM — this path has no heuristics.
 function $h(tag, id, cls, attrs, children) {
   return { $hd: 1, tag, id, cls, attrs, children };

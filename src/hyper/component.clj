@@ -21,12 +21,16 @@
    behaviour to JS at macro-expansion time and emits a server-side render fn
    so call sites look like ordinary hiccup functions.  `register-component!`
    is the lower-level escape hatch for cases where raw Squint strings are
-   needed."
+   needed.
+
+   Related namespaces: hyper.component.hiccup (macro-time hiccup -> ($h ...)
+   descriptor compilation) and hyper.component.bundle (ES module assembly
+   and the head script tag)."
   (:require [cheshire.core :as json]
             [clojure.core.memoize :as memo]
-            [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.walk :as walk]
+            [hyper.component.hiccup :as hiccup]
             [hyper.signal :as signal]
             [squint.compiler :as squint]))
 
@@ -81,6 +85,17 @@
                             requires))
          "))\n")))
 
+(defn- define-call-source
+  "Assemble the full Squint source for a component definition: the optional
+   ns/require form followed by a call to the runtime's `$define` (which the
+   bundle prelude provides) with the given spec-entry strings as the spec
+   map body.  Shared by registration-source (raw Squint strings) and
+   squint-source (defc)."
+  [tag-name requires spec-entries]
+  (str (ns-form-source tag-name requires)
+       "($define " (pr-str tag-name) " "
+       "{" (str/join " " spec-entries) "})"))
+
 (defn- registration-source
   "Build the Squint source for a component registration call.
 
@@ -88,16 +103,11 @@
    `spec` keys:
    - :attrs    — vector of observed attribute name strings
    - :render   — Squint source string for a `(fn [props ctx] hiccup)` form
-   - :requires — optional seq of {:url \"...\" :alias sym} ES module deps
-
-   The emitted form calls the runtime's `$define`, which the bundle
-   prelude provides."
+   - :requires — optional seq of {:url \"...\" :alias sym} ES module deps"
   [name {:keys [attrs render requires]}]
-  (str (ns-form-source name requires)
-       "($define \"" name "\" "
-       "{:attrs " (pr-str (mapv clojure.core/name attrs))
-       " :render " (str/trim render)
-       "})"))
+  (define-call-source name requires
+    [(str ":attrs " (pr-str (mapv clojure.core/name attrs)))
+     (str ":render " (str/trim render))]))
 
 (defn parse-requires
   "Normalize and validate a :require option value.
@@ -300,100 +310,6 @@
         x))
     form))
 
-;; ---------------------------------------------------------------------------
-;; Macro-time hiccup compilation
-;; ---------------------------------------------------------------------------
-;; Literal hiccup in render segments is compiled into ($h ...) descriptor
-;; calls at macro-expansion time, so the client runtime needs no parsing
-;; heuristics for the common path: tag shorthand, attrs-map detection, and
-;; element-vs-fragment disambiguation are all resolved here, on the JVM,
-;; where they are unit-testable.  Dynamically constructed hiccup (vectors
-;; built at runtime) falls back to the runtime array interpreter.
-
-(defn parse-tag
-  "Parse a hiccup tag keyword into [tag id classes].
-   :div         -> [\"div\" nil nil]
-   :div#m       -> [\"div\" \"m\" nil]
-   :div.a.b     -> [\"div\" nil \"a b\"]
-   :svg.chart#c -> [\"svg\" \"c\" \"chart\"]
-   :.box        -> [\"div\" nil \"box\"]"
-  [tag-kw]
-  (let [s       (name tag-kw)
-        parts   (str/split s #"(?=[#.])")
-        tag     (let [t (first parts)]
-                  (if (or (str/blank? t) (str/starts-with? t "#") (str/starts-with? t "."))
-                    "div"
-                    t))
-        parts   (if (= tag (first parts)) (rest parts) parts)
-        id      (some #(when (str/starts-with? % "#") (subs % 1)) parts)
-        classes (->> parts
-                     (filter #(str/starts-with? % "."))
-                     (map #(subs % 1))
-                     seq)]
-    [tag id (when classes (str/join " " classes))]))
-
-(def ^:private value-position-forms
-  "Control forms whose value positions are recursed into by compile-hiccup.
-   Anything else is left untouched and handled by the runtime fallback."
-  '#{if when when-not when-let if-let when-some if-some do let for cond})
-
-(declare compile-hiccup)
-
-(defn- hiccup-vector? [form]
-  (and (vector? form)
-       (keyword? (first form))))
-
-(defn- compile-element
-  "Compile a literal hiccup vector into an ($h ...) call form.
-   The attrs position is decided syntactically: a map literal in second
-   position is attrs; anything else is a child."
-  [[tag-kw & body]]
-  (let [[tag id classes]  (parse-tag tag-kw)
-        [attrs children]  (if (map? (first body))
-                            [(first body) (rest body)]
-                            [nil body])]
-    (list '$h tag id classes attrs
-          (mapv compile-hiccup children))))
-
-(defn- compile-expr
-  "Recurse into the value positions of known control forms so hiccup inside
-   (if ...), (for ...), (let ...) etc. still compiles.  For `let`/`do`/`when`
-   style bodies only the final (value) form is compiled — earlier forms are
-   side effects.  `cond` compiles result positions, never tests.  Unknown
-   expressions pass through untouched (runtime fallback)."
-  [form]
-  (let [[head & args] form]
-    (case head
-      (if if-let if-some)
-      (list* head (first args) (map compile-hiccup (rest args)))
-
-      (when when-not when-let when-some do let for)
-      ;; Compile only the last (value-position) form.
-      (let [body     (vec args)
-            last-idx (dec (count body))]
-        (list* head (concat (subvec body 0 last-idx)
-                            [(compile-hiccup (nth body last-idx))])))
-
-      cond
-      (list* head (map-indexed (fn [i x] (if (odd? i) (compile-hiccup x) x)) args))
-
-      ;; Unknown expression — leave for the runtime fallback.
-      form)))
-
-(defn compile-hiccup
-  "Compile literal hiccup in a render form into ($h tag id classes attrs
-   [children]) descriptor calls.  See compile-element / compile-expr for
-   the rules.  Public for testing."
-  [form]
-  (cond
-    (hiccup-vector? form)
-    (compile-element form)
-
-    (and (seq? form) (contains? value-position-forms (first form)))
-    (compile-expr form)
-
-    :else form))
-
 (defn- squint-source
   "Build the complete Squint source for a `defc` component.
 
@@ -428,7 +344,7 @@
         (when render
           (let [render-rewritten (-> render
                                      (rewrite-event-refs ns-str)
-                                     compile-hiccup)
+                                     hiccup/compile-hiccup)
                 handler-bindings (mapcat (fn [[kw fn-form]]
                                            [(symbol (str "on-" (clojure.core/name kw))) fn-form])
                                          events)
@@ -447,10 +363,7 @@
                        mount     (conj (str ":mount " (pr-str (lifecycle-fn mount))))
                        update    (conj (str ":update " (pr-str (lifecycle-fn update))))
                        unmount   (conj (str ":unmount " (pr-str (lifecycle-fn unmount)))))]
-    (str (ns-form-source tag-name requires)
-         "($define " (pr-str tag-name) " "
-         "{" (str/join " " spec-entries) "}"
-         ")")))
+    (define-call-source tag-name requires spec-entries)))
 
 (defmacro defc
   "Define a client-side web component.
@@ -623,13 +536,13 @@
    collections)."
   [acc k sig]
   (let [attr-name (name k)
-        js-name   (signal/js-name sig)]
+        sig-ref   (signal/js-ref sig)]
     (-> acc
         (assoc k (stable-json (signal/current-value sig)))
         (assoc (keyword (str "data-attr:" attr-name))
-               (str "JSON.stringify($" js-name ")"))
+               (str "JSON.stringify(" sig-ref ")"))
         (assoc (keyword (str "data-on:" attr-name))
-               (str "$" js-name " = evt.detail")))))
+               (str sig-ref " = evt.detail")))))
 
 (defn attrs
   "Serialize a map of component attribute values for use in hiccup.
@@ -672,89 +585,3 @@
     {}
     m))
 
-;; ---------------------------------------------------------------------------
-;; Bundle assembly
-;; ---------------------------------------------------------------------------
-
-(def default-squint-core-url
-  "CDN URL for squint's core.js runtime, version-matched to the compiler
-   dependency in deps.edn.  Override via the :squint-core-url option on
-   create-handler to self-host."
-  "https://cdn.jsdelivr.net/npm/squint-cljs@0.9.184/src/squint/core.js")
-
-(defn- runtime-js []
-  (slurp (io/resource "hyper/component-runtime.js")))
-
-(defn- sha256-hex
-  [^String s]
-  (let [d (.digest (java.security.MessageDigest/getInstance "SHA-256")
-                   (.getBytes s "UTF-8"))]
-    (apply str (map #(format "%02x" %) (take 8 d)))))
-
-(defn- import-lines
-  "Build the deduplicated ES module import statements for all component
-   :requires across the registry.  Aliases are munged the same way Squint
-   munges them in compiled output (e.g. chart-lib -> chart_lib), so the
-   import identifier matches the compiled references.
-
-   Throws when an alias maps to more than one URL — the bundle is a single
-   module scope (this is also checked per-component at registration; this
-   guard catches stale-registry edge cases)."
-  [registry]
-  (let [pairs (->> (vals registry)
-                   (mapcat :requires)
-                   (map (juxt :alias :url))
-                   distinct
-                   (sort-by (comp str first)))]
-    (doseq [[alias urls] (group-by first pairs)
-            :when (> (count urls) 1)]
-      (throw (ex-info (str "Alias " alias " maps to multiple URLs across components: "
-                           (pr-str (mapv second urls)))
-                      {:alias alias :urls (mapv second urls)})))
-    (apply str
-           (map (fn [[alias url]]
-                  (str "import * as " (munge (name alias)) " from '" url "';\n"))
-                pairs))))
-
-(defn- assemble-bundle
-  [registry squint-core-url]
-  (let [js (str "import * as $sc from '" (or squint-core-url default-squint-core-url) "';\n"
-                (import-lines registry)
-                (runtime-js)
-                "\n"
-                (->> (sort-by key registry)
-                     (map (comp :js val))
-                     (str/join "\n")))]
-    {:js js :hash (sha256-hex js)}))
-
-(defonce ^:private bundle-cache* (atom nil))
-
-(defn bundle
-  "Assemble (or return cached) the components JS bundle.
-
-   Returns {:js \"...\" :hash \"...\"} or nil when no components are
-   registered.  The bundle is a single ES module: squint core import,
-   the hyper component runtime, then each registered component sorted
-   by name.  Cached against the registry snapshot + core URL."
-  ([] (bundle nil))
-  ([{:keys [squint-core-url]}]
-   (let [registry @registry*]
-     (when (seq registry)
-       (let [cache-key [registry squint-core-url]
-             cached    @bundle-cache*]
-         (if (= cache-key (:key cached))
-           (:bundle cached)
-           (let [b (assemble-bundle registry squint-core-url)]
-             (reset! bundle-cache* {:key cache-key :bundle b})
-             b)))))))
-
-(defn head-script-tag
-  "Hiccup script tag for the components bundle, or nil when no components
-   are registered.  The content hash is carried in the query string so the
-   endpoint can serve immutable cache headers and a registry change rotates
-   the URL (which, combined with head-element fingerprint diffing, makes
-   REPL redefinition hot-swap the bundle over SSE)."
-  [base-path opts]
-  (when-let [{:keys [hash]} (bundle opts)]
-    [:script {:type "module"
-              :src  (str base-path "/hyper/components.js?v=" hash)}]))

@@ -317,39 +317,6 @@
                    (assoc m sym (client-params/client-param sym)))
                  {}))))
 
-(defn sanitize-guard
-  "Validate an action :when guard at runtime.  Returns the guard string,
-   nil for nil/blank guards, and throws for anything else — a guard must
-   evaluate to a Datastar expression string (e.g. from `expr` or a raw
-   string)."
-  [g]
-  (cond
-    (nil? g)    nil
-    (string? g) (when-not (str/blank? g) g)
-    :else       (throw (ex-info "action :when guard must evaluate to a string Datastar expression"
-                                {:guard g}))))
-
-(defn build-action-expr
-  "Build the Datastar/JS expression string for an action.
-   Always uses Datastar's @post() so that all non-underscore signals are
-   automatically sent in the request body.  When client params are present,
-   they are URL-encoded into the query string via the hyper.encodeClientParams helper
-   so the server can read them from query-params.
-   Optionally injects a custom Datastar expression to conditionally prevent the post.
-   base-path is prepended to the /hyper/actions endpoint (empty string when not set)."
-  [action-id used-params js base-path]
-  (let [js-injection (when js (str js " && "))]
-    (if (empty? used-params)
-      (str js-injection "@post('" base-path "/hyper/actions?action-id=" action-id "')")
-      (let [obj-entries (->> used-params
-                             vals
-                             (map (fn [{:keys [js key]}]
-                                    (str key ":" js)))
-                             (str/join ","))]
-        (str js-injection
-             "@post('" base-path "/hyper/actions?action-id=" action-id
-             "&' + hyper.encodeClientParams({" obj-entries "}))")))))
-
 (defmacro action
   "Create a server action expression for use in Datastar event attributes.
    Returns a Datastar expression string that can be bound to any event.
@@ -435,7 +402,7 @@
            _#                       (actions/register-action! app-state*# session-id# tab-id# action-fn# action-id#
                                                               ~(when as-name {:as as-name}))
            base-path#               (get @app-state*# :base-path "")]
-       (build-action-expr action-id# '~used-params (sanitize-guard ~js) base-path#))))
+       (actions/build-action-expr action-id# '~used-params (actions/sanitize-guard ~js) base-path#))))
 
 ;; ---------------------------------------------------------------------------
 ;; Client-side expressions and components (re-exports)

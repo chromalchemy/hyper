@@ -9,6 +9,7 @@
             [hyper.actions :as actions]
             [hyper.brotli :as br]
             [hyper.component :as component]
+            [hyper.component.bundle :as component.bundle]
             [hyper.context :as context]
             [hyper.effects :as effects]
             [hyper.reactive :as reactive]
@@ -608,12 +609,12 @@
   "Serve the assembled client-components ES module bundle.
 
    The bundle URL carries a content hash in its query string (see
-   hyper.component/head-script-tag), so the response is served with
+   hyper.component.bundle/head-script-tag), so the response is served with
    immutable cache headers — a registry change rotates the URL rather
    than invalidating this response."
   [app-state*]
   (fn [_req]
-    (if-let [{:keys [js hash]} (component/bundle
+    (if-let [{:keys [js hash]} (component.bundle/bundle
                                  {:squint-core-url (get @app-state* :squint-core-url)})]
       {:status  200
        :headers {"Content-Type"  "text/javascript; charset=utf-8"

@@ -323,43 +323,43 @@
   [js]
   (.evaluate (w/get-page) js))
 
+(defn wait-for-pred
+  "Poll a zero-arg predicate every 100ms until it returns truthy or the
+   timeout elapses.  Exceptions from pred count as falsey (elements may not
+   exist yet).  Returns true on success, false on timeout — callers decide
+   how to assert/report failure."
+  [pred & {:keys [timeout] :or {timeout 5000}}]
+  (let [deadline (+ (System/currentTimeMillis) timeout)]
+    (loop []
+      (cond
+        (try (boolean (pred)) (catch Exception _ false)) true
+        (> (System/currentTimeMillis) deadline)          false
+        :else (do (Thread/sleep 100) (recur))))))
+
 (defn wait-for-text
   "Poll until an element's text content matches expected, with timeout."
   [selector expected & {:keys [timeout] :or {timeout 5000}}]
-  (let [deadline (+ (System/currentTimeMillis) timeout)]
-    (loop []
+  (or (wait-for-pred #(= expected (w/text-content selector)) :timeout timeout)
       (let [actual (try (w/text-content selector) (catch Exception _ nil))]
-        (if (= expected actual)
-          true
-          (if (> (System/currentTimeMillis) deadline)
-            (do (is (= expected actual)
-                    (str "Timed out waiting for " selector " to equal " (pr-str expected)
-                         ", last saw " (pr-str actual)))
-                false)
-            (do (Thread/sleep 100)
-                (recur))))))))
+        (is (= expected actual)
+            (str "Timed out waiting for " selector " to equal " (pr-str expected)
+                 ", last saw " (pr-str actual)))
+        false)))
 
 (defn wait-for-cookie
   "Poll until document.cookie contains (or no longer contains) a cookie name=value pair.
    When `absent?` is true, waits until the cookie name is NOT present."
   [cookie-name expected-value & {:keys [timeout absent?] :or {timeout 5000 absent? false}}]
-  (let [deadline (+ (System/currentTimeMillis) timeout)
-        pattern  (str cookie-name "=" expected-value)]
-    (loop []
-      (let [cookies (try (eval-js "document.cookie") (catch Exception _ ""))]
-        (if absent?
-          (if (not (.contains (str cookies) (str cookie-name "=")))
-            true
-            (if (> (System/currentTimeMillis) deadline)
-              (do (is false (str "Timed out waiting for cookie " cookie-name " to be absent, saw: " cookies))
-                  false)
-              (do (Thread/sleep 100) (recur))))
-          (if (.contains (str cookies) pattern)
-            true
-            (if (> (System/currentTimeMillis) deadline)
-              (do (is false (str "Timed out waiting for cookie " pattern " in: " cookies))
-                  false)
-              (do (Thread/sleep 100) (recur)))))))))
+  (let [pattern (str cookie-name "=" expected-value)
+        pred    (if absent?
+                  #(not (.contains (str (eval-js "document.cookie")) (str cookie-name "=")))
+                  #(.contains (str (eval-js "document.cookie")) pattern))]
+    (or (wait-for-pred pred :timeout timeout)
+        (let [cookies (try (eval-js "document.cookie") (catch Exception _ ""))]
+          (is false (if absent?
+                      (str "Timed out waiting for cookie " cookie-name " to be absent, saw: " cookies)
+                      (str "Timed out waiting for cookie " pattern " in: " cookies)))
+          false))))
 
 (defn counter-text
   "Get the text of a counter's h2 heading."
