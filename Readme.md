@@ -45,6 +45,17 @@ grateful to the people whose work and ideas made this possible:
   [From Tomorrow Back to Yesterday](https://www.youtube.com/watch?v=8W6Lr1hRgXo&t=2s)
   at Clojure/conj 2025 shaped our thinking on server-driven UI and the
   direction of web development in Clojure.
+- [Thomas Heller](https://github.com/thheller)'s
+  [shadow-grove](https://github.com/thheller/shadow-grove), whose `defc`
+  macro — declarative segments for event handlers and rendering — directly
+  shaped the API of hyper's [client components](#client-components-web-components).
+  Its community-contributed
+  [defc linter](https://github.com/thheller/shadow-grove/pull/10) likewise
+  inspired our clj-kondo hook design.
+- [Michiel Borkent](https://github.com/borkdude)'s
+  [Squint](https://github.com/squint-cljs/squint) compiler, which runs on
+  the JVM and makes it possible to compile client components to JavaScript
+  at macro-expansion time — no Node, no build step.
 
 ## Project Status
 
@@ -1145,6 +1156,187 @@ into functions:
      [:h1 "Dashboard"]
      (live-clock clock*)]))
 ```
+
+## Client Components (Web Components)
+
+Most hyper UIs need no client-side code at all — but some islands genuinely
+do: charts, editors, maps, anything built on a JavaScript library that owns
+its own DOM. `hyper.component/defc` lets you author those islands as
+**web components** written in a ClojureScript dialect
+([Squint](https://github.com/squint-cljs/squint)), compiled to JavaScript
+**on the JVM at macro-expansion time** — no Node, no build step, no npm.
+Compiled components are served as a single ES module at
+`/hyper/components.js` and auto-injected into the page `<head>`.
+
+The model follows Datastar's recommended pattern for rich client-side
+islands: **props down (attributes), events up (CustomEvents)**.
+
+```clojure
+(require '[hyper.component :as hc])
+
+(hc/defc temp-gauge
+  "A client-side temperature gauge."
+  [{:keys [value max label]}]              ;; ← observed attributes
+
+  (event ::selected [_e]
+    (emit "gauge-selected" {:label label :value value}))
+
+  (render
+    (let [pct (js/Math.round (* 100 (/ value max)))]
+      [:div {:on {:click ::selected}}
+       [:strong label] " "
+       [:span pct "%"]])))
+```
+
+`defc` also emits a server-side function of the same name, so pages use
+components like ordinary hiccup functions:
+
+```clojure
+(defn dashboard [req]
+  (let [temp* (h/tab-cursor :temp 20)]
+    [:div
+     (temp-gauge {:value @temp*
+                  :max   40
+                  :label "CPU"
+                  :data-on:gauge-selected
+                  (h/action (handle-selection! $detail))})]))
+```
+
+### Attributes are the boundary
+
+The server pushes data into the component through HTML attributes —
+strings and numbers serialize raw, collections as deterministic JSON.
+When state changes, hyper re-renders the page and Datastar's morph updates
+attributes in place. The component re-renders **only when an attribute
+string actually changed** — unrelated server re-renders are a no-op (a
+single string comparison, no parse, no render). Multiple attribute changes
+in one morph are batched into a single client-side update.
+
+Because Squint uses plain JS data structures, a parsed attribute *is*
+native component data — `{:keys [...]}` destructuring works directly on
+it, with zero conversion.
+
+The boundary is JSON-typed: strings, numbers, booleans, vectors, and maps
+round-trip; **keywords become strings** on the client (Squint has no
+keyword type).
+
+### Events are the channel out
+
+`emit` (in scope in every segment) dispatches a bubbling, composed
+`CustomEvent` that crosses the shadow boundary. The server catches it with
+an ordinary `data-on:*` action; the payload arrives via the `$detail`
+client param as an idiomatic Clojure map. Parent elements can also
+intercept events before (or instead of) the server — composition is just
+DOM event bubbling.
+
+### JS libraries: `:require`
+
+Declare ES module dependencies with `:require`. Each URL is imported once
+in the bundle, deduplicated across components; an alias may map to only
+one URL across the app (conflicts throw at definition time).
+
+```clojure
+(hc/defc stock-chart
+  {:require [["https://esm.sh/d3@7" :as d3]]}
+  [{:keys [points]}]
+  (render [:svg [:path {:d (d3/line points)}]]))
+```
+
+Global-script libraries also work without `:require` — load them via a
+`:head` script tag and call them through `js/` interop.
+
+### Seamless mode: `mount` / `update` / `unmount`
+
+For libraries that animate data transitions (d3, charting libs), re-rendering
+on every change would destroy the chart instance. Seamless mode hands data
+changes to the library instead:
+
+```clojure
+(hc/defc live-bars
+  {:require [["https://esm.sh/d3@7" :as d3]]}
+  [{:keys [values]}]
+
+  (render                                  ;; once-only scaffold
+    [:svg {:width 560 :height 180}])
+
+  (mount [root]                            ;; runs once
+    (let [draw (fn [vs]
+                 (-> (d3/select (.querySelector root "svg"))
+                     (.selectAll "rect") (.data vs) (.join "rect")
+                     (.transition) (.duration 500)
+                     (.attr "height" (fn [v] (* v 3)))))]
+      (set! (.-draw ctx) draw)             ;; ctx = per-instance state slot
+      (draw values)))
+
+  (update [_root]                          ;; runs on each data change
+    ((.-draw ctx) values)))
+```
+
+The contract: `mount` once, `update` per real data change, `unmount` on
+true removal. The DOM is never re-rendered after mount, so chart instances
+and in-flight transitions survive arbitrary server re-renders — morphs
+that merely move the element are debounced and do **not** unmount.
+`update` optionally receives the previous attributes:
+`(update [root old-attrs] ...)`.
+
+`ctx` is a stable per-instance JS object available in every segment — it
+carries `emit` and serves as the instance state slot
+(`(set! (.-chart ctx) ...)`).
+
+### Signal-linked attributes
+
+Pass a [signal](#signals) object (un-deref'd, mirroring `data-bind`) as an
+attribute value to create a **live two-way client-side link** — the
+component reacts to signal changes with zero server round-trips, and
+writes the signal back by emitting an event named after the attribute:
+
+```clojure
+(defn dashboard [req]
+  (let [hover* (h/signal :hovered-symbol nil)]
+    [:div
+     (stock-chart {:points @points* :hover hover*})
+     (sparkline   {:points @points* :hover hover*})   ;; shared crosshair
+     [:span {:data-text @hover*}]]))                  ;; same signal, plain hiccup
+
+;; inside either component: read `hover` like any attribute; write it with
+(emit "hover" "AAPL")
+```
+
+The component cannot tell whether an attribute is driven by the server, a
+signal, or a test — components stay pure functions of their attributes.
+
+### Styles
+
+Components render into shadow DOM (which also makes them invisible to
+Datastar's morph — internals are never clobbered). Document stylesheets
+are inherited into each shadow root automatically, so global CSS — e.g. a
+Tailwind build included via `:head` — styles component internals without
+extra wiring.
+
+### Live reload
+
+Re-evaluating a `defc` at the REPL recompiles the component and hot-swaps
+it into every connected tab over SSE: declarative components re-render,
+seamless components unmount and remount against the new code. Instance
+`ctx` survives the swap.
+
+### The Squint dialect
+
+`defc` segment bodies are [Squint](https://github.com/squint-cljs/squint),
+not Clojure — they compile to JavaScript and run in the browser:
+
+- Data structures are plain JS objects/arrays; keywords are strings
+- `js/` interop everywhere (`js/Math.round`, `(.querySelector root "svg")`)
+- Squint's core library covers most of `clojure.core`, operating on JS data
+- Compilation happens at macro-expansion — Squint errors fail your build
+  with the generated source attached, never reaching the browser
+
+Hyper ships clj-kondo config (see [clj-kondo](#clj-kondo)) that validates
+`defc` structure at lint time and makes attrs, `emit`, and `ctx` resolve
+inside segments.
+
+For self-hosted/air-gapped deploys, override the Squint runtime CDN URL
+with the `:squint-core-url` option on `create-handler`.
 
 ## Batched cursor updates
 
