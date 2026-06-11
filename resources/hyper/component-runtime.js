@@ -70,8 +70,30 @@ function $setAttrs(el, attrs) {
 
 const $SVG_NS = 'http://www.w3.org/2000/svg';
 
+// Descriptor constructor for hiccup compiled at macro-expansion time by
+// hyper.component/compile-hiccup. Tag/id/class parsing and attrs detection
+// happened on the JVM — this path has no heuristics.
+function $h(tag, id, cls, attrs, children) {
+  return { $hd: 1, tag, id, cls, attrs, children };
+}
+
 function $appendHiccup(parent, h, ns) {
   if (h === null || h === undefined || h === false) return;
+  if (h.$hd === 1) {
+    // Compiled descriptor — the fast, unambiguous path.
+    const childNs = h.tag === 'svg' ? $SVG_NS
+                  : h.tag === 'foreignObject' ? null
+                  : ns;
+    const el = childNs
+      ? document.createElementNS(childNs, h.tag)
+      : document.createElement(h.tag);
+    if (h.id) el.id = h.id;
+    if (h.cls) el.setAttribute('class', h.cls);
+    if (h.attrs) $setAttrs(el, h.attrs);
+    for (const child of h.children) $appendHiccup(el, child, childNs);
+    parent.appendChild(el);
+    return;
+  }
   if (typeof h === 'string') {
     parent.appendChild(document.createTextNode(h));
     return;

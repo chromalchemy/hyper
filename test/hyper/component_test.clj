@@ -161,6 +161,72 @@
                  (str/index-of js "$define(\"b-widget\""))))))))
 
 ;; ---------------------------------------------------------------------------
+;; Macro-time hiccup compilation
+;; ---------------------------------------------------------------------------
+
+(deftest test-parse-tag
+  (is (= ["div" nil nil]       (hc/parse-tag :div)))
+  (is (= ["div" "m" nil]       (hc/parse-tag :div#m)))
+  (is (= ["div" nil "a b"]     (hc/parse-tag :div.a.b)))
+  (is (= ["svg" "c" "chart"]   (hc/parse-tag :svg.chart#c)))
+  (is (= ["div" nil "box"]     (hc/parse-tag :.box)))
+  (is (= ["div" "only" nil]    (hc/parse-tag :#only)))
+  (is (= ["my-widget" nil nil] (hc/parse-tag :my-widget))))
+
+(deftest test-compile-hiccup
+  (testing "basic elements compile to $h descriptor calls"
+    (is (= '($h "div" nil nil nil ["x"])
+           (hc/compile-hiccup '[:div "x"])))
+    (is (= '($h "div" "m" "box" {:title "t"} ["x"])
+           (hc/compile-hiccup '[:div.box#m {:title "t"} "x"]))))
+
+  (testing "children compile recursively; expressions stay in child position"
+    (is (= '($h "div" nil nil nil [($h "span" nil nil nil [y]) (str a b)])
+           (hc/compile-hiccup '[:div [:span y] (str a b)]))))
+
+  (testing "a non-literal second position is a child, not attrs"
+    (is (= '($h "div" nil nil nil [props "x"])
+           (hc/compile-hiccup '[:div props "x"]))))
+
+  (testing "control forms recurse into value positions only"
+    (is (= '(if c ($h "i" nil nil nil ["y"]) ($h "em" nil nil nil ["n"]))
+           (hc/compile-hiccup '(if c [:i "y"] [:em "n"]))))
+    (is (= '(let [pct 5] ($h "div" nil nil nil [pct]))
+           (hc/compile-hiccup '(let [pct 5] [:div pct]))))
+    (is (= '(for [v vs] ($h "li" nil nil nil [v]))
+           (hc/compile-hiccup '(for [v vs] [:li v]))))
+    (is (= '(when c (log! [:not :hiccup]) ($h "b" nil nil nil []))
+           (hc/compile-hiccup '(when c (log! [:not :hiccup]) [:b])))
+        "earlier (side-effect) body forms are untouched")
+    (is (= '(cond a ($h "i" nil nil nil []) :else ($h "em" nil nil nil []))
+           (hc/compile-hiccup '(cond a [:i] :else [:em])))
+        "cond compiles results, never tests"))
+
+  (testing "keyword vectors inside unknown expressions are never corrupted"
+    (is (= '(get m [:a :b])
+           (hc/compile-hiccup '(get m [:a :b]))))
+    (is (= '(my-helper [:div "raw"])
+           (hc/compile-hiccup '(my-helper [:div "raw"])))
+        "unknown calls pass through whole — runtime fallback handles results"))
+
+  (testing "non-keyword-head vectors are untouched"
+    (is (= '[a b c] (hc/compile-hiccup '[a b c])))))
+
+(deftest test-defc-compiles-render-hiccup
+  (with-fresh-registry
+    #_{:clj-kondo/ignore [:inline-def]}
+    (hc/defc compiled-widget
+      [{:keys [items]}]
+      (render
+        [:ul.list
+         (for [i items] [:li i])]))
+    (let [js (get-in @hc/registry* ["compiled-widget" :js])]
+      (is (str/includes? js "$h(\"ul\", null, \"list\", null,")
+          "literal hiccup compiles to descriptor calls")
+      (is (str/includes? js "$h(\"li\", null, null, null,")
+          "hiccup inside (for ...) compiles too"))))
+
+;; ---------------------------------------------------------------------------
 ;; defc macro
 ;; ---------------------------------------------------------------------------
 

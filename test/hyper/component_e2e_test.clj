@@ -67,6 +67,40 @@
      [:span#reflect-val (str linked)]
      [:button#reflect-btn {:on {:click ::bump}}]]))
 
+;; Kitchen-sink conformance component: the executable spec for the client
+;; hiccup contract. Every interpreter/materializer feature is exercised —
+;; compiled descriptors, the dynamic-array fallback, namespaces, attrs
+;; semantics, and re-render behavior.
+(hc/defc e2e-kitchen-sink
+  [{:keys [flag n]}]
+  (event ::clicked [_e] (emit "ks-clicked" {}))
+  (event ::entered [_e] (emit "ks-entered" {}))
+  (render
+    [:div#ks-root
+     ;; tag shorthand: id + classes
+     [:span#ks-id.cls-a.cls-b "short"]
+     ;; class merging: shorthand + :class attr
+     [:p#ks-classes.base {:class "extra"} "classes"]
+     ;; boolean attr — removed when false on re-render
+     [:input#ks-check {:type "checkbox" :checked flag}]
+     ;; style as string and as map
+     [:i#ks-style-str {:style "color: rgb(1, 2, 3);"} "s"]
+     [:i#ks-style-map {:style {:color "rgb(4, 5, 6)" :background-color "rgb(7, 8, 9)"}} "m"]
+     ;; text children: numbers, nil/false holes, conditional
+     [:span#ks-text 1 nil " " false 2.5 (when flag "F")]
+     ;; fragments from (for ...)
+     [:ul#ks-list (for [i (range n)] [:li (str "i" i)])]
+     ;; dynamic fallback: raw hiccup array through an unknown call —
+     ;; exercises the runtime tag parser + array interpretation
+     [:div#ks-dyn (identity [:span#ks-dyn-inner.dyn-cls "dyn"])]
+     ;; svg: nested elements inherit the namespace; foreignObject switches back
+     [:svg#ks-svg {:width 20 :height 20}
+      [:g [:rect#ks-rect {:width 5 :height 5}]]
+      [:foreignObject {:width 10 :height 10}
+       [:div#ks-fo-div "html in svg"]]]
+     ;; multiple :on handlers on one element
+     [:button#ks-btn {:on {:click ::clicked :mouseenter ::entered}} "b"]]))
+
 (defn- components-get [_]
   (let [temp*     (h/tab-cursor :temp 10)
         selected* (h/tab-cursor :selected nil)
@@ -90,6 +124,11 @@
                                                  (reset! (h/tab-cursor :saved-hov) @hov*))}
       "save"]
      [:span#saved-hov (str @saved*)]
+     ;; Kitchen-sink conformance
+     (e2e-kitchen-sink {:flag @(h/tab-cursor :ks-flag true)
+                        :n    @(h/tab-cursor :ks-n 3)})
+     [:button#ks-toggle {:data-on:click (h/action (swap! (h/tab-cursor :ks-flag) not))} "toggle"]
+     [:button#ks-grow {:data-on:click (h/action (swap! (h/tab-cursor :ks-n) inc))} "grow"]
      [:button#hotter {:data-on:click (h/action (swap! (h/tab-cursor :temp) + 5))} "+5"]
      [:button#noise {:data-on:click (h/action (swap! (h/tab-cursor :noise) inc))} "noise"]
      [:span#noise-count (str @noise*)]
@@ -202,6 +241,77 @@
           (is (= 1 (e2e/eval-js "window.__lcUnmounts || 0")))
           ;; Scaffold re-rendered fresh on remount
           (is (= "0" (w/text-content "#lc-updates")))))
+      (finally
+        (e2e/close-browser! browser-info)))))
+
+(defn- ks-js
+  "Eval JS against the kitchen-sink component's shadow root."
+  [expr]
+  (e2e/eval-js
+    (str "(function(){var r=document.querySelector('e2e-kitchen-sink').shadowRoot;"
+         "return " expr ";})()")))
+
+(deftest ^:e2e component-hiccup-conformance-test
+  (let [browser-info (e2e/launch-browser)
+        ctx          (e2e/new-context browser-info)
+        page         (e2e/new-page ctx)]
+    (try
+      (w/with-page page
+        (w/navigate (str base-url "/components"))
+        (e2e/wait-for-sse)
+        (is (e2e/wait-for-text "#ks-id" "short"))
+
+        (testing "tag shorthand: id and classes"
+          (is (= "cls-a cls-b" (ks-js "r.querySelector('#ks-id').getAttribute('class')"))))
+
+        (testing "class merging: shorthand + :class attr"
+          (is (= "base extra" (ks-js "r.querySelector('#ks-classes').getAttribute('class')"))))
+
+        (testing "boolean attr present when true"
+          (is (true? (ks-js "r.querySelector('#ks-check').hasAttribute('checked')"))))
+
+        (testing "style string and style map (incl. kebab-case key)"
+          (is (= "rgb(1, 2, 3)" (ks-js "r.querySelector('#ks-style-str').style.color")))
+          (is (= "rgb(4, 5, 6)" (ks-js "r.querySelector('#ks-style-map').style.color")))
+          (is (= "rgb(7, 8, 9)" (ks-js "r.querySelector('#ks-style-map').style.backgroundColor"))))
+
+        (testing "text children: numbers render, nil/false skipped, conditional present"
+          (is (= "1 2.5F" (w/text-content "#ks-text"))))
+
+        (testing "fragments from (for ...)"
+          (is (= 3 (ks-js "r.querySelectorAll('#ks-list li').length")))
+          (is (= "i0" (ks-js "r.querySelector('#ks-list li').textContent"))))
+
+        (testing "dynamic raw-array fallback (runtime tag parsing)"
+          (is (= "dyn" (w/text-content "#ks-dyn-inner")))
+          (is (= "dyn-cls" (ks-js "r.querySelector('#ks-dyn-inner').getAttribute('class')"))))
+
+        (testing "svg namespace inheritance + foreignObject escape"
+          (is (true? (ks-js "r.querySelector('#ks-svg') instanceof SVGSVGElement")))
+          (is (true? (ks-js "r.querySelector('#ks-rect') instanceof SVGRectElement")))
+          (is (true? (ks-js "r.querySelector('#ks-fo-div') instanceof HTMLDivElement"))))
+
+        (testing "multiple :on handlers on one element"
+          (e2e/eval-js "window.__ksClicks=0; window.__ksEnters=0;
+                        document.addEventListener('ks-clicked', function(){window.__ksClicks++});
+                        document.addEventListener('ks-entered', function(){window.__ksEnters++});")
+          (w/click "#ks-btn")
+          (is (= 1 (e2e/eval-js "window.__ksClicks")))
+          (is (<= 1 (e2e/eval-js "window.__ksEnters"))))
+
+        (testing "re-render semantics: boolean attr removal + conditional text"
+          (w/click "#ks-toggle")
+          (e2e/wait-for-text "#ks-text" "1 2.5")
+          (is (false? (ks-js "r.querySelector('#ks-check').hasAttribute('checked')"))))
+
+        (testing "re-render semantics: growing fragments"
+          (w/click "#ks-grow")
+          (let [deadline (+ (System/currentTimeMillis) 5000)]
+            (loop []
+              (cond
+                (= 4 (ks-js "r.querySelectorAll('#ks-list li').length")) (is true)
+                (> (System/currentTimeMillis) deadline) (is (= 4 (ks-js "r.querySelectorAll('#ks-list li').length")))
+                :else (do (Thread/sleep 100) (recur)))))))
       (finally
         (e2e/close-browser! browser-info)))))
 
