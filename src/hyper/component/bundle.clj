@@ -43,7 +43,7 @@
                    distinct
                    (sort-by (comp str first)))]
     (doseq [[alias urls] (group-by first pairs)
-            :when (> (count urls) 1)]
+            :when        (> (count urls) 1)]
       (throw (ex-info (str "Alias " alias " maps to multiple URLs across components: "
                            (pr-str (mapv second urls)))
                       {:alias alias :urls (mapv second urls)})))

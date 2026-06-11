@@ -20,7 +20,7 @@
 (hc/defc e2e-gauge
   [{:keys [value max label]}]
   (event ::selected [_e]
-    (emit "gauge-selected" {:label label :value value}))
+         (emit "gauge-selected" {:label label :value value}))
   (render
     [:div#gauge-root {:on {:click ::selected}}
      [:span#gauge-label label]
@@ -43,16 +43,16 @@
      [:svg#lc-svg {:width 10 :height 10}
       [:rect {:width 5 :height 5}]]])
   (mount [root]
-    (set! (.-mounts ctx) (inc (or (.-mounts ctx) 0)))
-    (set! (.-updates ctx) 0)
-    (set! (.-textContent (.querySelector root "#lc-mounts")) (str (.-mounts ctx)))
-    (set! (.-textContent (.querySelector root "#lc-data")) (str data)))
+         (set! (.-mounts ctx) (inc (or (.-mounts ctx) 0)))
+         (set! (.-updates ctx) 0)
+         (set! (.-textContent (.querySelector root "#lc-mounts")) (str (.-mounts ctx)))
+         (set! (.-textContent (.querySelector root "#lc-data")) (str data)))
   (update [root _old]
-    (set! (.-updates ctx) (inc (.-updates ctx)))
-    (set! (.-textContent (.querySelector root "#lc-updates")) (str (.-updates ctx)))
-    (set! (.-textContent (.querySelector root "#lc-data")) (str data)))
+          (set! (.-updates ctx) (inc (.-updates ctx)))
+          (set! (.-textContent (.querySelector root "#lc-updates")) (str (.-updates ctx)))
+          (set! (.-textContent (.querySelector root "#lc-data")) (str data)))
   (unmount [_root]
-    (set! js/window.__lcUnmounts (inc (or js/window.__lcUnmounts 0)))))
+           (set! js/window.__lcUnmounts (inc (or js/window.__lcUnmounts 0)))))
 
 ;; Signal-linked component: reads :linked like any attribute; writes it back
 ;; by emitting an event named after the attribute. The whole loop is
@@ -61,7 +61,7 @@
 (hc/defc sig-reflector
   [{:keys [linked]}]
   (event ::bump [_e]
-    (emit "linked" (str linked "+")))
+         (emit "linked" (str linked "+")))
   (render
     [:div#reflect-root
      [:span#reflect-val (str linked)]
@@ -141,9 +141,9 @@
      [:span#selected-label (str (get @selected* :label "none"))]]))
 
 (def ^:private routes
-  [["/components" {:name :components
+  [["/components" {:name  :components
                    :title "Components"
-                   :get  #'components-get}]])
+                   :get   #'components-get}]])
 
 ;; ---------------------------------------------------------------------------
 ;; Server lifecycle (own port — independent of hyper.e2e-test's server)
@@ -385,8 +385,8 @@
 
         (testing "re-registering a component hot-swaps live instances over SSE"
           (hc/register-component! "e2e-gauge"
-            {:attrs  [:value :max :label]
-             :render "
+                                  {:attrs  [:value :max :label]
+                                   :render "
 (fn [{:keys [value max label]} _ctx]
   [:div#gauge-root
    [:span#gauge-label (str \"v2:\" label)]

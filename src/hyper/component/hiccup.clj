@@ -55,10 +55,10 @@
    The attrs position is decided syntactically: a map literal in second
    position is attrs; anything else is a child."
   [[tag-kw & body]]
-  (let [[tag id classes]  (parse-tag tag-kw)
-        [attrs children]  (if (map? (first body))
-                            [(first body) (rest body)]
-                            [nil body])]
+  (let [[tag id classes] (parse-tag tag-kw)
+        [attrs children] (if (map? (first body))
+                           [(first body) (rest body)]
+                           [nil body])]
     (list '$h tag id classes attrs
           (mapv compile-hiccup children))))
 

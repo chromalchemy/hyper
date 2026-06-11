@@ -136,9 +136,9 @@
   [tag-name requires]
   (doseq [{:keys [url alias]} requires]
     (doseq [[other-name {other-requires :requires}] @registry*
-            :when (not= other-name tag-name)
-            {other-url :url other-alias :alias} other-requires
-            :when (and (= other-alias alias) (not= other-url url))]
+            :when                                   (not= other-name tag-name)
+            {other-url :url other-alias :alias}     other-requires
+            :when                                   (and (= other-alias alias) (not= other-url url))]
       (throw (ex-info (str "Component \"" tag-name "\" requires \"" url "\" :as " alias
                            ", but component \"" other-name "\" already requires \""
                            other-url "\" :as " alias
@@ -332,14 +332,14 @@
    All forms are emitted as Clojure data (readable by Squint) so no
    string-quoting escaping is needed — `pr-str` handles it."
   [tag-name attr-keys {:keys [events render mount update unmount]} ns-str requires]
-  (let [attr-strs    (mapv clojure.core/name attr-keys)
+  (let [attr-strs        (mapv clojure.core/name attr-keys)
         attr-destructure {:keys (mapv symbol (map clojure.core/name attr-keys))}
-        lifecycle-fn (fn [{:keys [args body]}]
+        lifecycle-fn     (fn [{:keys [args body]}]
                        ;; Runtime calls (props, ctx, root[, old-props]);
                        ;; user binding vector supplies names for root [+ old].
-                       `(~'fn [~attr-destructure ~'ctx ~@args]
-                          (~'let [~'emit (.-emit ~'ctx)]
-                            ~@body)))
+                           `(~'fn [~attr-destructure ~'ctx ~@args]
+                                  (~'let [~'emit (.-emit ~'ctx)]
+                                         ~@body)))
         render-fn
         (when render
           (let [render-rewritten (-> render
@@ -354,15 +354,15 @@
                                                (symbol (str "on-" (clojure.core/name kw)))]))
                                        events)]
             `(~'fn [~attr-destructure ~'ctx]
-               (~'let [~'emit (.-emit ~'ctx)
-                       ~@handler-bindings
-                       ~@(when (seq events) ['$handlers handlers-map])]
-                 ~render-rewritten))))
-        spec-entries (cond-> [(str ":attrs " (pr-str attr-strs))]
-                       render-fn (conj (str ":render " (pr-str render-fn)))
-                       mount     (conj (str ":mount " (pr-str (lifecycle-fn mount))))
-                       update    (conj (str ":update " (pr-str (lifecycle-fn update))))
-                       unmount   (conj (str ":unmount " (pr-str (lifecycle-fn unmount)))))]
+                   (~'let [~'emit (.-emit ~'ctx)
+                           ~@handler-bindings
+                           ~@(when (seq events) ['$handlers handlers-map])]
+                          ~render-rewritten))))
+        spec-entries     (cond-> [(str ":attrs " (pr-str attr-strs))]
+                           render-fn (conj (str ":render " (pr-str render-fn)))
+                           mount     (conj (str ":mount " (pr-str (lifecycle-fn mount))))
+                           update    (conj (str ":update " (pr-str (lifecycle-fn update))))
+                           unmount   (conj (str ":unmount " (pr-str (lifecycle-fn unmount)))))]
     (define-call-source tag-name requires spec-entries)))
 
 (defmacro defc
@@ -441,37 +441,37 @@
            [:div {:on {:click ::selected}}
             [:span label \": \" pct \"%\"]])))"
   [cname & body]
-  (let [[docstring body] (if (string? (first body))
-                           [(first body) (rest body)]
-                           [nil body])
-        [opts body] (if (map? (first body))
-                      [(first body) (rest body)]
-                      [{} body])
-        requires   (parse-requires (:require opts))
+  (let [[docstring body]         (if (string? (first body))
+                                   [(first body) (rest body)]
+                                   [nil body])
+        [opts body]              (if (map? (first body))
+                                   [(first body) (rest body)]
+                                   [{} body])
+        requires                 (parse-requires (:require opts))
         [binding-vec & segments] body
-        _          (assert (vector? binding-vec)
-                           (str "defc " cname ": expected attribute binding vector, got "
-                                (pr-str binding-vec)))
-        attr-keys  (extract-attrs binding-vec)
-        _          (assert (seq attr-keys)
-                           (str "defc " cname ": binding vector must use {:keys [...]} form "
-                                "so attribute names are statically visible"))
-        tag-name   (sym->tag cname)
-        _          (assert (str/includes? tag-name "-")
-                           (str "defc " cname ": tag name \"" tag-name
-                                "\" must contain a hyphen (Custom Elements spec)"))
-        parsed     (parse-segments cname segments)
-        _          (assert (or (:render parsed) (:mount parsed))
-                           (str "defc " cname ": a (render ...) or (mount ...) segment is required"))
-        ns-str     (str *ns*)
-        src        (squint-source tag-name attr-keys parsed ns-str requires)
-        tag-kw     (keyword tag-name)
+        _                        (assert (vector? binding-vec)
+                                         (str "defc " cname ": expected attribute binding vector, got "
+                                              (pr-str binding-vec)))
+        attr-keys                (extract-attrs binding-vec)
+        _                        (assert (seq attr-keys)
+                                         (str "defc " cname ": binding vector must use {:keys [...]} form "
+                                              "so attribute names are statically visible"))
+        tag-name                 (sym->tag cname)
+        _                        (assert (str/includes? tag-name "-")
+                                         (str "defc " cname ": tag name \"" tag-name
+                                              "\" must contain a hyphen (Custom Elements spec)"))
+        parsed                   (parse-segments cname segments)
+        _                        (assert (or (:render parsed) (:mount parsed))
+                                         (str "defc " cname ": a (render ...) or (mount ...) segment is required"))
+        ns-str                   (str *ns*)
+        src                      (squint-source tag-name attr-keys parsed ns-str requires)
+        tag-kw                   (keyword tag-name)
         ;; Compile at macro-expansion time so Squint errors surface at compile
         ;; time (with the source attached), but emit the registration into the
         ;; expansion so it executes at runtime.  This keeps defc AOT-safe
         ;; (expansion-time side effects don't survive AOT compilation) and
         ;; testable (with-redefs of registry* works).
-        compiled-js (compile-squint src)]
+        compiled-js              (compile-squint src)]
     `(do
        (check-alias-conflicts! ~tag-name '~requires)
        (swap! registry* assoc ~tag-name {:attrs    ~attr-keys
@@ -584,4 +584,3 @@
           (assoc acc k (attr-value v)))))
     {}
     m))
-

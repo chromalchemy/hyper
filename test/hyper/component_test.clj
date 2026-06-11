@@ -12,8 +12,8 @@
 (defn- with-fresh-registry*
   "Run f with an isolated component registry and bundle cache."
   [f]
-  (with-redefs-fn {#'hc/registry*                          (atom {})
-                   #'hyper.component.bundle/bundle-cache*  (atom nil)}
+  (with-redefs-fn {#'hc/registry*                         (atom {})
+                   #'hyper.component.bundle/bundle-cache* (atom nil)}
     f))
 
 (defmacro with-fresh-registry [& body]
@@ -89,12 +89,12 @@
              (hc/stable-json a))))))
 
 (deftest test-attrs
-  (let [out (hc/attrs {:value                42
-                       :label                "CPU"
-                       :points               [{:x 1} {:x 2}]
-                       :id                   "g1"
-                       :class                "wide"
-                       :style                "color:red"
+  (let [out (hc/attrs {:value                  42
+                       :label                  "CPU"
+                       :points                 [{:x 1} {:x 2}]
+                       :id                     "g1"
+                       :class                  "wide"
+                       :style                  "color:red"
                        :data-on:gauge-selected "@post('/x')"})]
     (testing "component data attrs are serialized"
       (is (= "42" (:value out)))
@@ -253,7 +253,7 @@
       "A test widget."
       [{:keys [count label]}]
       (event ::clicked [_e]
-        (emit "widget-clicked" {:count count}))
+             (emit "widget-clicked" {:count count}))
       (render
         [:div {:on {:click ::clicked}}
          [:span label " = " count]]))
@@ -287,7 +287,7 @@
         (is (= "Score"   (get (second result) :label)))))
 
     (testing "data-* attrs pass through untouched"
-      (let [result (my-widget {:count 1 :label "x"
+      (let [result (my-widget {:count                  1             :label "x"
                                :data-on:widget-clicked "@post('/x')"})]
         (is (= "@post('/x')" (get (second result) :data-on:widget-clicked)))))
 
@@ -361,12 +361,12 @@
         [{:keys [data]}]
         (render [:div.scaffold])
         (mount [root]
-          (set! (.-chart ctx) root)
-          (emit "ready" {:n (count data)}))
+               (set! (.-chart ctx) root)
+               (emit "ready" {:n (count data)}))
         (update [_root old]
-          (js/console.log old data))
+                (js/console.log old data))
         (unmount [_root]
-          (set! (.-chart ctx) nil)))
+                 (set! (.-chart ctx) nil)))
       (let [js (get-in @hc/registry* ["seamless-chart" :js])]
         (testing "spec carries every lifecycle fn"
           (is (str/includes? js "\"render\": (function"))
