@@ -4,6 +4,7 @@
    Handles rendering hiccup to HTML and formatting Datastar SSE events."
   (:require [clojure.string :as string]
             [dev.onionpancakes.chassis.core :as c]
+            [hyper.component :as component]
             [hyper.context :as context]
             [hyper.routes :as routes]
             [hyper.state :as state]
@@ -119,6 +120,32 @@
 
         :else head-hiccup))))
 
+(defn- head-elements
+  "Normalize a resolved :head value to a vector of elements.
+   Handles nil, a single element ([:style ...]), and a seq/vector of elements."
+  [h]
+  (cond
+    (nil? h)                                    []
+    (and (vector? h) (keyword? (first h)))      [h]
+    :else                                       (vec h)))
+
+(defn- resolve-full-head
+  "Resolve the user :head for a request and append the client-components
+   bundle script tag (when components are registered).  Injected here — in
+   the shared render pipeline — so both initial page loads and SSE head
+   updates carry it, and a component registry change rotates the script URL
+   (fingerprint diffing then hot-swaps the module).  Returns marked head
+   hiccup or nil."
+  [app-state* req]
+  (let [user-head (routes/resolve-head (get @app-state* :head) req)
+        comp-tag  (component/head-script-tag
+                    (get @app-state* :base-path "")
+                    {:squint-core-url (get @app-state* :squint-core-url)})
+        els       (cond-> (head-elements user-head)
+                    comp-tag (conj comp-tag))]
+    (when (seq els)
+      (mark-head-elements els))))
+
 (defn format-head-update
   "Build a self-removing <script> SSE event that imperatively updates
    the document title and diffs user-provided <head> elements.
@@ -164,9 +191,22 @@
                     "if(!newFps[fp])el.remove();"
                     "else delete newFps[fp];"  ;; already in DOM, skip
                     "});"
-                    ;; Append only genuinely new/changed elements
+                    ;; Append only genuinely new/changed elements.  Script
+                    ;; elements must be recreated via createElement — nodes
+                    ;; parsed from innerHTML are flagged non-executable, so a
+                    ;; plain appendChild would silently never run them (e.g.
+                    ;; the client-components bundle after a REPL redefine).
                     "Object.keys(newFps).forEach(function(fp){"
-                    "document.head.appendChild(newFps[fp]);"
+                    "var el=newFps[fp];"
+                    "if(el.tagName==='SCRIPT'){"
+                    "var s=document.createElement('script');"
+                    "for(var j=0;j<el.attributes.length;j++){"
+                    "s.setAttribute(el.attributes[j].name,el.attributes[j].value);"
+                    "}"
+                    "s.textContent=el.textContent;"
+                    "el=s;"
+                    "}"
+                    "document.head.appendChild(el);"
                     "});"))
                 "})();")]
     (str "event: datastar-patch-elements\n"
@@ -321,8 +361,7 @@
                    title-spec   (when (and (seq route-index) route)
                                   (routes/find-route-title route-index (:name route)))
                    title        (routes/resolve-title title-spec req)
-                   head         (some-> (routes/resolve-head (get @app-state* :head) req)
-                                        mark-head-elements)
+                   head         (resolve-full-head app-state* req)
                    declared     @context/*declared-signals*
                    action-ids   @context/*registered-action-ids*
                    reactive-ids @context/*registered-reactive-ids*]

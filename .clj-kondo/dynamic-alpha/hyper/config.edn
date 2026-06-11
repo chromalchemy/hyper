@@ -1,3 +1,16 @@
-{:linters
+{:hooks
+ {:analyze-call {hyper.component/defc hooks.hyper.component/defc}}
+
+ :config-in-call
+ {hyper.component/defc
+  ;; defc bodies are Squint (a CLJS dialect) compiled for the browser:
+  ;; js/* interop and :require aliases (e.g. d3/line) are resolved by the
+  ;; Squint compiler at macro-expansion, and core fns operate on JS data
+  ;; structures — so namespace resolution and type checks are not kondo's
+  ;; to make inside defc.
+  {:linters {:unresolved-namespace {:level :off}
+             :type-mismatch        {:level :off}}}}
+
+ :linters
  {:unresolved-symbol
-  {:exclude [(hyper.core/action [$value $checked $key $form-data])]}}}
+  {:exclude [(hyper.core/action [$value $checked $key $detail $form-data])]}}}

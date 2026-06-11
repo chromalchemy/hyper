@@ -493,6 +493,9 @@
    Options (keyword arguments):
    - :app-state         — Atom for application state (default: fresh atom)
    - :datastar-script   - Override of the default datastar script tag (as Hiccup) or nil to suppress
+   - :squint-core-url   — Override of the squint core.js URL used by the client
+                          components bundle (default: version-matched jsDelivr CDN).
+                          Point at a self-hosted copy for offline/air-gapped deploys.
    - :head              — Hiccup nodes appended to the HTML <head>, or (fn [req] ...) -> hiccup
    - :base-path         — URL path prefix for reverse-proxy deployments where the app is served
                           under a subfolder (e.g. \"/my-app\"). When set, all internal hyper
@@ -561,7 +564,7 @@
      (stop! app)"
   [routes & {:keys [app-state head static-resources static-dir watches
                     datastar-script base-path middleware render-middleware
-                    render-error]
+                    render-error squint-core-url]
              :or   {app-state       (atom (state/init-state))
                     datastar-script server/default-datastar-script}
              :as   opts}]
@@ -573,7 +576,8 @@
                                   :watches           watches
                                   :base-path         base-path
                                   :middleware        middleware
-                                  :render-middleware render-middleware}
+                                  :render-middleware render-middleware
+                                  :squint-core-url   squint-core-url}
                            ;; Only forward when supplied so server defaults apply.
                            render-error (assoc :render-error render-error)
                            ;; `contains?` so an explicit `:not-found nil` (disable) is honored.

@@ -8,6 +8,7 @@
             [dev.onionpancakes.chassis.core :as c]
             [hyper.actions :as actions]
             [hyper.brotli :as br]
+            [hyper.component :as component]
             [hyper.context :as context]
             [hyper.effects :as effects]
             [hyper.reactive :as reactive]
@@ -317,6 +318,10 @@
                                             (doseq [source (->>  [routes-source head]
                                                                  (filter var?))]
                                               (watch/watch-source! app-state* tab-id trigger-render! source)))
+                                          ;; Watch the component registry so REPL redefinition of
+                                          ;; client components hot-swaps the bundle over SSE (the
+                                          ;; head update carries the new content-hashed script URL).
+                                          (watch/watch-source! app-state* tab-id trigger-render! component/registry*)
                                           ;; Set up route-level watches (:watches + Var :get handlers)
                                           (watch/setup-route-watches! app-state* tab-id trigger-render!)
                                           ;; Promote any watches stashed during the initial HTTP render
@@ -337,7 +342,13 @@
 
    Values are JSON-encoded on the client by `hyper.encodeClientParams`, so a
    round-trip through `JSON.stringify` → URL-encode → URL-decode →
-   `json/parse-string` preserves booleans, numbers, objects, etc."
+   `json/parse-string` preserves booleans, numbers, objects, etc.
+
+   Object keys are keywordized so map-shaped params ($form-data, $detail)
+   arrive as idiomatic Clojure maps: {:name \"Alice\"} rather than
+   {\"name\" \"Alice\"}.  Note that keyword *values* do not round-trip —
+   the client side is JSON-typed (Squint has no keyword type), so a
+   keyword emitted from a component arrives as a string."
   [req]
   (let [qp (get req :query-params {})]
     (when (> (count qp) 1)                 ;; more than just action-id
@@ -345,7 +356,7 @@
                    (if (= k "action-id")
                      acc
                      (assoc acc (keyword k)
-                            (try (json/parse-string v)
+                            (try (json/parse-string v true)
                                  (catch Exception _ v)))))
                  {}
                  qp))))
@@ -593,6 +604,26 @@
           result
           (page-response result opts tab-id 404 "Not Found"))))))
 
+(defn- components-js-handler
+  "Serve the assembled client-components ES module bundle.
+
+   The bundle URL carries a content hash in its query string (see
+   hyper.component/head-script-tag), so the response is served with
+   immutable cache headers — a registry change rotates the URL rather
+   than invalidating this response."
+  [app-state*]
+  (fn [_req]
+    (if-let [{:keys [js hash]} (component/bundle
+                                 {:squint-core-url (get @app-state* :squint-core-url)})]
+      {:status  200
+       :headers {"Content-Type"  "text/javascript; charset=utf-8"
+                 "Cache-Control" "public, max-age=31536000, immutable"
+                 "ETag"          (str "\"" hash "\"")}
+       :body    js}
+      {:status  404
+       :headers {"Content-Type" "text/plain"}
+       :body    "No components registered"})))
+
 (defn- navigate-handler
   "Handler for popstate/navigation POST requests.
    Looks up the route for the given path and updates the tab's route + render fn."
@@ -789,7 +820,8 @@
                            (ring/create-default-handler))
          system-routes   [[(str base-path "/hyper/events") {:get (sse-events-handler app-state*)}]
                           [(str base-path "/hyper/actions") {:post (action-handler app-state*)}]
-                          [(str base-path "/hyper/navigate") {:post (navigate-handler app-state*)}]]
+                          [(str base-path "/hyper/navigate") {:post (navigate-handler app-state*)}]
+                          [(str base-path "/hyper/components.js") {:get (components-js-handler app-state*)}]]
          ;; Store the routes source (Var or value) so title resolution can
          ;; always read the latest route metadata, even between router rebuilds.
          ;; Store global :watches so find-route-watches can prepend them to
@@ -804,7 +836,8 @@
                                 :base-path base-path
                                 :render-middleware (vec render-middleware)
                                 :render-error render-error
-                                :not-found not-found)
+                                :not-found not-found
+                                :squint-core-url (:squint-core-url opts))
          initial-routes  (if (var? routes) @routes routes)
          initial-handler (build-ring-handler initial-routes app-state* page-wrapper system-routes default-handler)
          handler         (if (var? routes)

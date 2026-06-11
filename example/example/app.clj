@@ -1,5 +1,6 @@
 (ns example.app
-  (:require [hyper.core :as h]
+  (:require [hyper.component :as hc]
+            [hyper.core :as h]
             [hyper.effects :as effects]
             [hyper.state]))
 
@@ -20,7 +21,9 @@
     " · "
     [:a (h/navigate :signals) "Signals"]
     " · "
-    [:a (h/navigate :effects) "Effects"]]
+    [:a (h/navigate :effects) "Effects"]
+    " · "
+    [:a (h/navigate :components) "Components"]]
    [:h1 title]
    children])
 
@@ -278,6 +281,141 @@
                "Set cookie + run script"])))))
 
 ;; ---------------------------------------------------------------------------
+;; Client components (compiled via embedded Squint)
+;; ---------------------------------------------------------------------------
+
+;; A client-side web component written in a CLJS dialect (Squint), compiled to
+;; JS on the JVM at load time and served at /hyper/components.js — no Node,
+;; no build step.
+;;
+;; - Attributes are the boundary: the server pushes :value/:history etc. as
+;;   serialized attributes; the component re-renders ONLY when an attribute
+;;   string actually changes (watch the "client render @ ..." timestamp stay
+;;   frozen during unrelated server re-renders).
+;; - Events are the channel out: clicking the gauge emits "gauge-selected"
+;;   which the server handles as a normal data-on action via $detail.
+(hc/defc temp-gauge
+  "A client-side temperature gauge with a history sparkline."
+  [{:keys [value max label history]}]
+
+  (event ::selected [_e]
+    (emit "gauge-selected" {:label label :value value}))
+
+  (render
+    (let [pct (js/Math.round (* 100 (/ value max)))]
+      [:div {:style "border:2px solid #888;border-radius:8px;padding:12px;cursor:pointer;user-select:none"
+             :on   {:click ::selected}}
+       [:div {:style "display:flex;justify-content:space-between;align-items:baseline"}
+        [:strong label]
+        [:span (str value "° (" pct "%)")]]
+       [:div {:style "background:#eee;border-radius:4px;height:14px;margin:8px 0;overflow:hidden"}
+        [:div {:style (str "height:100%;width:" pct "%;transition:width .3s;"
+                           "background:" (if (> pct 75) "#d33" "#3a7"))}]]
+       [:div {:style "display:flex;gap:2px;align-items:flex-end;height:30px"}
+        (for [v history]
+          [:div {:style (str "flex:1;background:#9bc;height:"
+                             (js/Math.round (* 30 (/ v max))) "px")}])]
+       [:small {:style "color:#999"}
+        (str "client render @ " (.toLocaleTimeString (js/Date.)))]])))
+
+;; Seamless mode: d3 owns the DOM inside the component, hyper owns the data.
+;; The server pushes :values through the attribute boundary; `update` hands
+;; each change to d3, which animates the delta. The chart instance survives
+;; arbitrary server re-renders — `mount` runs exactly once.
+(hc/defc live-bars
+  "An animated d3 bar chart driven by server state."
+  {:require [["https://esm.sh/d3@7" :as d3]]}
+  [{:keys [values]}]
+
+  (render
+    [:svg {:width 560 :height 180 :style "display:block"}])
+
+  (mount [root]
+    (let [svg  (d3/select (.querySelector root "svg"))
+          draw (fn [vs]
+                 (-> svg
+                     (.selectAll "rect")
+                     (.data vs)
+                     (.join "rect")
+                     (.attr "x" (fn [_ i] (* i 46)))
+                     (.attr "width" 40)
+                     (.transition)
+                     (.duration 500)
+                     (.attr "y" (fn [v] (- 180 (* v 3))))
+                     (.attr "height" (fn [v] (* v 3)))
+                     (.attr "fill" (fn [v] (if (> v 40) "#d33" "#369")))))]
+      (set! (.-draw ctx) draw)
+      (draw values)))
+
+  (update [_root]
+    ((.-draw ctx) values)))
+
+(defn components-page [_]
+  (letfn [(card [title desc & children]
+            [:div.card [:h3 title] [:p.muted desc] children])]
+    (let [temp*     (h/tab-cursor :temp 18)
+          history*  (h/tab-cursor :temp-history [18])
+          selected* (h/tab-cursor :gauge-selected nil)
+          noise*    (h/tab-cursor :noise 0)]
+      (layout
+        "Client Components"
+        [:p "A web component written in a CLJS dialect (Squint), compiled to "
+         "JS on the server — no Node, no build step. Attributes in, events out."]
+
+        (card "Attributes as the boundary"
+              "The server pushes data into attributes; the component renders client-side in shadow DOM."
+              (temp-gauge {:value   @temp*
+                           :max     40
+                           :label   "Server temp"
+                           :history @history*
+                           :data-on:gauge-selected
+                           (h/action {:as "gauge-selected"}
+                                     (reset! (h/tab-cursor :gauge-selected) $detail))})
+              [:p
+               [:button {:data-on:click (h/action {:as "temp-up"}
+                                                  (h/batch
+                                                    (swap! (h/tab-cursor :temp) #(min 40 (+ % 3)))
+                                                    (swap! (h/tab-cursor :temp-history)
+                                                           #(vec (take-last 12 (conj % @(h/tab-cursor :temp)))))))}
+                "Hotter"]
+               " "
+               [:button {:data-on:click (h/action {:as "temp-down"}
+                                                  (h/batch
+                                                    (swap! (h/tab-cursor :temp) #(max 0 (- % 3)))
+                                                    (swap! (h/tab-cursor :temp-history)
+                                                           #(vec (take-last 12 (conj % @(h/tab-cursor :temp)))))))}
+                "Colder"]])
+
+        (card "Events as the channel out"
+              "Click the gauge above — it emits a CustomEvent the server handles via $detail."
+              [:p "Last emitted: " [:strong (if @selected* (pr-str @selected*) "nothing yet")]])
+
+        (card "The change gate"
+              "This button re-renders the whole page server-side, but the gauge's attributes
+               don't change — note its client render timestamp stays frozen."
+              [:button {:data-on:click (h/action {:as "noise"} (swap! (h/tab-cursor :noise) inc))}
+               "Unrelated state change"]
+              [:p "Server renders forced: " [:strong @noise*]])
+
+        (card "Seamless mode — d3 transitions"
+              "The server pushes data; d3 animates the delta. The chart instance is
+               created once (mount) and every change flows through update — it survives
+               all server re-renders, including the change-gate button above."
+              (live-bars {:values @(h/tab-cursor :bars [12 30 22 45 17 38 25 50 9 33 41 20])})
+              [:p
+               [:button {:data-on:click
+                         (h/action {:as "shuffle-bars"}
+                                   (reset! (h/tab-cursor :bars)
+                                           (vec (repeatedly 12 #(+ 5 (rand-int 50))))))}
+                "Randomize"]
+               " "
+               [:button {:data-on:click
+                         (h/action {:as "rotate-bars"}
+                                   (swap! (h/tab-cursor :bars)
+                                          #(vec (concat (rest %) [(first %)]))))}
+                "Rotate"]])))))
+
+;; ---------------------------------------------------------------------------
 ;; Routes
 ;; ---------------------------------------------------------------------------
 
@@ -301,7 +439,11 @@
    ["/effects"
     {:name  :effects
      :title "Effects"
-     :get   #'effects-page}]])
+     :get   #'effects-page}]
+   ["/components"
+    {:name  :components
+     :title "Client Components"
+     :get   #'components-page}]])
 
 ;; ---------------------------------------------------------------------------
 ;; Styles

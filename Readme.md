@@ -190,7 +190,11 @@ Actions can capture client-side DOM values and transmit them to the server using
 | `$value` | `evt.target.value` | Input/select/textarea value |
 | `$checked` | `evt.target.checked` | Checkbox/radio boolean state |
 | `$key` | `evt.key` | Keyboard event key name |
+| `$detail` | `evt.detail` | CustomEvent payload (e.g. from web components) |
 | `$form-data` | All named form fields | Form submission as a map |
+
+Map-shaped params (`$form-data`, `$detail`) arrive with keyword keys —
+`{:name "Alice"}`, not `{"name" "Alice"}`.
 
 Example usage:
 
