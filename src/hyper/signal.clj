@@ -325,3 +325,57 @@
                            {}
                            (or old-signals {}))]
     (merge changed removed)))
+
+(defn- signal-path-vec
+  "Normalize a declared signal :path (keyword or keyword vector) to a
+   vector of keywords for get-in/dissoc-in lookups."
+  [path]
+  (cond
+    (keyword? path) [path]
+    (vector? path)  (vec path)
+    :else           nil))
+
+(defn- dissoc-path
+  "Remove the value at `path` from nested map `m`, pruning any map left
+   empty by the removal so an emptied branch disappears entirely."
+  [m [k & ks]]
+  (if (seq ks)
+    (let [child (dissoc-path (get m k) ks)]
+      (if (and (map? child) (empty? child))
+        (dissoc m k)
+        (assoc m k child)))
+    (dissoc m k)))
+
+(defn drop-ifmissing-covered-patches
+  "Return the signal patches still worth sending after dropping those the
+   body fragment's `data-signals:NAME__ifmissing` declarations already
+   cover on a fresh client.
+
+   The body fragment declares each signal via
+   `data-signals:NAME__ifmissing=DEFAULT`, which initializes the signal to
+   DEFAULT when the client does not already have it.  A patch leaf is kept
+   only when it adds information the declaration cannot supply: the signal
+   was already sent to the client before (present in `sent-signals`), or
+   its value differs from the declared default.  Dropping the rest lets
+   Datastar keep state it materializes from the DOM — e.g. a checkbox group
+   whose array signal Datastar builds from the checkboxes (issue #44).
+
+   Suppression is per declared signal path, so both top-level and nested
+   signals are covered; branches emptied by a drop are pruned.
+
+   - `sig-patches`      map of {kebab-keyword → value} about to be sent
+   - `declared-signals` declared-signal maps for this render
+   - `sent-signals`     the signals map last sent to the client (nil on
+                        the first render)"
+  [sig-patches declared-signals sent-signals]
+  (if (seq sig-patches)
+    (reduce (fn [patches {:keys [path default-val]}]
+              (let [p (signal-path-vec path)]
+                (if (and p
+                         (= default-val (get-in patches p ::not-found))
+                         (= ::not-found (get-in sent-signals p ::not-found)))
+                  (dissoc-path patches p)
+                  patches)))
+            sig-patches
+            declared-signals)
+    sig-patches))

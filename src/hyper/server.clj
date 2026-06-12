@@ -92,8 +92,13 @@
   "Perform a full page render and send the assembled SSE events (head update,
    body fragment, signal patches).  Sweeps stale actions/reactive components
    and wires up watches for new reactive components.
+
+   `last-sent-signals` is the signal snapshot last delivered to the client
+   (nil on the first render); it lets us send only the signal patches that
+   add information beyond the body fragment's `data-signals:NAME__ifmissing`
+   declarations.
    Returns true/nil on success, false when the channel is closed."
-  [app-state* session-id tab-id sig-patches
+  [app-state* session-id tab-id sig-patches last-sent-signals
    enqueue-partial! channel br-out br-stream]
   (when-let [render-result (render/render-tab app-state* session-id tab-id)]
     (if (:status render-result)
@@ -115,6 +120,12 @@
                              sig-attrs (merge sig-attrs))
               wrapped-html (c/html [:div div-attrs (c/raw body-html)])
               body-event   (render/format-datastar-fragment wrapped-html)
+              ;; Keep only patches that add information beyond the body
+              ;; fragment's __ifmissing declarations, so Datastar retains
+              ;; client-side state it builds from the DOM (e.g. checkbox-array
+              ;; signals, issue #44).
+              sig-patches  (signal/drop-ifmissing-covered-patches
+                             sig-patches declared-signals last-sent-signals)
               sig-event    (when (seq sig-patches)
                              (signal/format-patch-signals-event sig-patches))
               sse-payload  (str head-event body-event sig-event)]
@@ -183,6 +194,7 @@
                                           (handle-partial-render app-state* tab-id dirty-ids
                                                                  channel br-out br-stream)
                                           (handle-full-render app-state* session-id tab-id sig-patches
+                                                              last-sent-signals
                                                               enqueue-partial!
                                                               channel br-out br-stream))
                                         (catch Throwable e
