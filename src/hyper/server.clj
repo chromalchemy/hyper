@@ -717,7 +717,8 @@
         router         (ring/router all-routes
                                     {:conflicts nil
                                      :data      {:coercion   malli/coercion
-                                                 :middleware [ring-coercion/coerce-request-middleware]}})]
+                                                 :middleware [ring-coercion/coerce-exceptions-middleware
+                                                              ring-coercion/coerce-request-middleware]}})]
     ;; Store the flattened routes and router in app-state for access during actions/renders/navigation
     (swap! app-state* assoc
            :router router

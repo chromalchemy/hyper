@@ -404,6 +404,40 @@
       (is (contains? route-idx :user-profile))
       (is (= "About Us" (routes/find-route-title route-idx :about))))))
 
+(deftest test-parameter-coercion
+  (testing "Route :parameters coerce raw string params into typed values"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/page" {:name       :page
+                                 :parameters {:query [:map [:n :int]]}
+                                 :get        (fn [req]
+                                               [:div "n=" (get-in req [:hyper/route :query-params :n])])}]]
+          handler    (server/create-handler routes app-state*)
+          good       (handler {:uri "/page" :request-method :get :query-params {"n" "5"}})]
+      (is (= 200 (:status good)))
+      ;; The coerced value is an int (5), not the raw string "5"
+      (is (string/includes? (:body good) "n=5"))))
+
+  (testing "Coercion failure returns HTTP 400 with a malli explanation, not a hang"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/page" {:name       :page
+                                 :parameters {:query [:map [:n :int]]}
+                                 :get        (fn [_req] [:div "ok"])}]]
+          handler    (server/create-handler routes app-state*)
+          bad        (handler {:uri "/page" :request-method :get :query-params {"n" "abc"}})]
+      (is (= 400 (:status bad)))
+      (is (match? {:humanized {:n ["should be an integer"]}}
+                  (:body bad)))))
+
+  (testing "Routes without :parameters keep raw string params"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/page" {:name :page
+                                 :get  (fn [req]
+                                         [:div "n=" (get-in req [:hyper/route :query-params :n])])}]]
+          handler    (server/create-handler routes app-state*)
+          response   (handler {:uri "/page" :request-method :get :query-params {"n" "abc"}})]
+      (is (= 200 (:status response)))
+      (is (string/includes? (:body response) "n=abc")))))
+
 (deftest test-create-handler-with-hyper-disabled
   (testing "render fn can disable endpoint wrapping"
     (let [app-state*  (atom (state/init-state))

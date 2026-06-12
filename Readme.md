@@ -991,6 +991,30 @@ You can also read it from `context/*request*` inside actions or anywhere within
 the request context — the value is always consistent with the tab's current
 route.
 
+### Parameter coercion
+
+Add a `:parameters` spec to a route and Hyper coerces the raw string params into
+typed values (via [reitit](https://github.com/metosin/reitit) + malli) before
+your render function runs. The coerced values show up on `:hyper/route` under
+`:path-params` / `:query-params`:
+
+```clojure
+(def routes
+  [["/user/:id" {:name :user
+                 :parameters {:path  [:map [:id :int]]
+                              :query [:map [:tab :keyword]]}
+                 :get #'user-page}]])
+
+(defn user-page [req]
+  (let [{:keys [id]}  (get-in req [:hyper/route :path-params])   ;; => 42 (int)
+        {:keys [tab]} (get-in req [:hyper/route :query-params])] ;; => :posts (keyword)
+    ...))
+```
+
+If coercion fails (e.g. `/user/abc` against an `:int`), Hyper responds with a
+`400` and a human-readable explanation of what was wrong. Routes without a
+`:parameters` spec keep their raw string params as before.
+
 ### Ring response passthrough
 
 If a route handler returns a Ring response map (a map with `:status`) instead of
