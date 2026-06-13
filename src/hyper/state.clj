@@ -27,7 +27,7 @@
 (deftype Cursor [parent-atom full-path meta-data ^:volatile-mutable validator watches]
   clojure.lang.IRef
   (deref [_]
-    (if-let [{state* :state*} context/*state-overlay*]
+    (if-let [{state* :state*} (context/current-overlay)]
       (get-in @state* full-path)
       (get-in @parent-atom full-path)))
 
@@ -57,35 +57,35 @@
 
   clojure.lang.IAtom
   (swap [_ f]
-    (if-let [{state* :state* paths* :paths*} context/*state-overlay*]
+    (if-let [{state* :state* paths* :paths*} (context/current-overlay)]
       (let [new-val (get-in (swap! state* update-in full-path f) full-path)]
         (swap! paths* conj full-path)
         new-val)
       (get-in (swap! parent-atom update-in full-path f) full-path)))
 
   (swap [_ f arg]
-    (if-let [{state* :state* paths* :paths*} context/*state-overlay*]
+    (if-let [{state* :state* paths* :paths*} (context/current-overlay)]
       (let [new-val (get-in (swap! state* update-in full-path f arg) full-path)]
         (swap! paths* conj full-path)
         new-val)
       (get-in (swap! parent-atom update-in full-path f arg) full-path)))
 
   (swap [_ f arg1 arg2]
-    (if-let [{state* :state* paths* :paths*} context/*state-overlay*]
+    (if-let [{state* :state* paths* :paths*} (context/current-overlay)]
       (let [new-val (get-in (swap! state* update-in full-path f arg1 arg2) full-path)]
         (swap! paths* conj full-path)
         new-val)
       (get-in (swap! parent-atom update-in full-path f arg1 arg2) full-path)))
 
   (swap [_ f arg1 arg2 args]
-    (if-let [{state* :state* paths* :paths*} context/*state-overlay*]
+    (if-let [{state* :state* paths* :paths*} (context/current-overlay)]
       (let [new-val (get-in (apply swap! state* update-in full-path f arg1 arg2 args) full-path)]
         (swap! paths* conj full-path)
         new-val)
       (get-in (apply swap! parent-atom update-in full-path f arg1 arg2 args) full-path)))
 
   (compareAndSet [_ oldv newv]
-    (if-let [{state* :state* paths* :paths*} context/*state-overlay*]
+    (if-let [{state* :state* paths* :paths*} (context/current-overlay)]
       (let [current-val (get-in @state* full-path)]
         (if (= current-val oldv)
           (do (swap! state* assoc-in full-path newv)
@@ -104,7 +104,7 @@
             false)))))
 
   (reset [_ newv]
-    (if-let [{state* :state* paths* :paths*} context/*state-overlay*]
+    (if-let [{state* :state* paths* :paths*} (context/current-overlay)]
       (do (swap! state* assoc-in full-path newv)
           (swap! paths* conj full-path)
           newv)

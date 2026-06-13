@@ -776,6 +776,124 @@
       (is (= 100 @captured)))))
 
 ;; ---------------------------------------------------------------------------
+;; Overlay thread ownership — async work spawned from render/batch
+;;
+;; future/send-off/fibers convey dynamic bindings, so background work
+;; launched inside a render inherits *state-overlay*.  Overlays are owned
+;; by their creating thread: conveyed copies must be ignored so worker
+;; reads/writes hit the live app-state (writes fire watchers → SSE frames),
+;; instead of silently landing in a snapshot that is dead after the flush.
+;; ---------------------------------------------------------------------------
+
+(deftest render-spawned-future-writes-live-test
+  (testing "future launched from render writes to live app-state after render flushes"
+    (let [app-state*     (atom (state/init-state))
+          _              (state/get-or-create-tab! app-state* "s1" "t1")
+          release        (promise)
+          done           (promise)
+          watcher-fired* (atom false)
+          page-fn        (fn [_req]
+                           (future
+                             @release ;; wait until render completed and flushed
+                             (reset! (hy/tab-cursor :worker-result) :done)
+                             (deliver done true))
+                           [:div "page"])]
+      (ht/test-page page-fn {:app-state app-state* :tab-id "t1" :session-id "s1"})
+      ;; Render is done, overlay flushed and dead.  Now let the worker write.
+      (add-watch app-state* :ownership-test (fn [_ _ _ _] (reset! watcher-fired* true)))
+      (deliver release true)
+      (is (true? (deref done 2000 false)) "worker should complete")
+      (is (= :done (get-in @app-state* [:tabs "t1" :data :worker-result]))
+          "worker write must land in live app-state, not the dead render overlay")
+      (is (true? @watcher-fired*)
+          "worker write must fire app-state watchers (drives re-render/SSE)")
+      (remove-watch app-state* :ownership-test))))
+
+(deftest render-spawned-future-reads-live-test
+  (testing "owner thread reads its snapshot; conveyed worker thread reads live state"
+    (let [app-state*  (atom (state/init-state))
+          _           (state/get-or-create-tab! app-state* "s1" "t1")
+          _           (swap! app-state* assoc-in [:tabs "t1" :data :x] 100)
+          owner-saw*  (atom nil)
+          worker-saw* (atom nil)
+          page-fn     (fn [_req]
+                        (let [x* (hy/tab-cursor :x)]
+                          ;; Mutate live state out-of-band after the snapshot
+                          (swap! app-state* assoc-in [:tabs "t1" :data :x] 200)
+                          ;; Conveyed worker bypasses the overlay → sees live value
+                          (reset! worker-saw* (deref (future @(hy/tab-cursor :x)) 2000 ::timeout))
+                          ;; Owner still reads the consistent snapshot
+                          (reset! owner-saw* @x*)
+                          [:div]))]
+      (ht/test-page page-fn {:app-state app-state* :tab-id "t1" :session-id "s1"})
+      (is (= 100 @owner-saw*) "render thread keeps snapshot read-consistency")
+      (is (= 200 @worker-saw*) "worker reads live state, not the conveyed snapshot"))))
+
+(deftest render-spawned-future-writes-during-render-test
+  (testing "worker write during an in-flight render goes live and survives the flush"
+    (let [app-state* (atom (state/init-state))
+          _          (state/get-or-create-tab! app-state* "s1" "t1")
+          mid-render (atom nil)
+          page-fn    (fn [_req]
+                       ;; Owner write — lands in the overlay, flushed at render end
+                       (reset! (hy/tab-cursor :owner-key) :from-owner)
+                       ;; Worker write — different path, goes live immediately
+                       (deref (future (reset! (hy/tab-cursor :worker-key) :from-worker)) 2000 nil)
+                       (reset! mid-render (get-in @app-state* [:tabs "t1" :data :worker-key]))
+                       [:div])]
+      (ht/test-page page-fn {:app-state app-state* :tab-id "t1" :session-id "s1"})
+      (is (= :from-worker @mid-render)
+          "worker write visible in live atom before render completes")
+      (is (= :from-owner (get-in @app-state* [:tabs "t1" :data :owner-key]))
+          "owner overlay write flushed normally")
+      (is (= :from-worker (get-in @app-state* [:tabs "t1" :data :worker-key]))
+          "overlay flush must not clobber the worker's live write"))))
+
+(deftest batch-spawned-future-writes-live-test
+  (testing "future launched inside batch writes directly to the live atom"
+    (let [app-state* (atom (state/init-state))
+          _          (state/get-or-create-tab! app-state* "s1" "t1")
+          mid-batch  (atom nil)]
+      (binding [context/*request* {:hyper/session-id "s1"
+                                   :hyper/tab-id     "t1"
+                                   :hyper/app-state  app-state*}]
+        (hy/batch
+          (reset! (hy/tab-cursor :a) 1)
+          (deref (future (reset! (hy/tab-cursor :from-worker) :live)) 2000 nil)
+          ;; Worker's write is already in the live atom, mid-batch
+          (reset! mid-batch (get-in @app-state* [:tabs "t1" :data :from-worker])))
+        (is (= :live @mid-batch)
+            "worker write visible in live atom before the batch flushes")
+        (is (= 1 (get-in @app-state* [:tabs "t1" :data :a])))
+        (is (= :live (get-in @app-state* [:tabs "t1" :data :from-worker]))
+            "batch flush must preserve the worker's live write")))))
+
+(deftest batch-inside-conveyed-future-test
+  (testing "batch inside a render-spawned future creates its own overlay and flushes live"
+    (let [app-state*  (atom (state/init-state))
+          _           (state/get-or-create-tab! app-state* "s1" "t1")
+          release     (promise)
+          done        (promise)
+          worker-saw* (atom nil)
+          page-fn     (fn [_req]
+                        (future
+                          @release ;; render's overlay is dead by now
+                          (hy/batch
+                            (reset! (hy/tab-cursor :a) 1)
+                            (reset! (hy/tab-cursor :b) 2)
+                            ;; read-your-writes inside the worker's own batch
+                            (reset! worker-saw* @(hy/tab-cursor :a)))
+                          (deliver done true))
+                        [:div])]
+      (ht/test-page page-fn {:app-state app-state* :tab-id "t1" :session-id "s1"})
+      (deliver release true)
+      (is (true? (deref done 2000 false)) "worker should complete")
+      (is (= 1 @worker-saw*) "worker's batch supports read-your-writes")
+      (is (= 1 (get-in @app-state* [:tabs "t1" :data :a])))
+      (is (= 2 (get-in @app-state* [:tabs "t1" :data :b]))
+          "worker's batch flushes to live app-state despite the conveyed dead overlay"))))
+
+;; ---------------------------------------------------------------------------
 ;; Env
 ;; ---------------------------------------------------------------------------
 

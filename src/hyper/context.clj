@@ -36,25 +36,47 @@
 ;; When non-nil, a map with:
 ;;   :state*  — atom holding the shadow state (cursor reads/writes go here)
 ;;   :paths*  — atom #{} of full-paths that were written (for selective flush)
+;;   :owner   — the Thread that created the overlay (see ownership below)
 ;;
 ;; Bound during render (snapshot for read consistency) and inside the
 ;; `batch` macro (deferred writes for atomicity).  Cursors check this var
-;; first: if bound, reads/writes go through the overlay; otherwise they
-;; hit app-state* directly.
+;; first: if bound AND owned by the current thread, reads/writes go through
+;; the overlay; otherwise they hit app-state* directly.
 ;;
 ;; At the boundary end (render complete / batch body returns), written
 ;; paths are flushed to app-state* in a single swap! via `flush-overlay!`.
 ;; nil during action execution (without batch) so that actions see/mutate
 ;; live state and each cursor write fires the watcher immediately.
+;;
+;; Thread ownership: `future`, `send-off`, fibers, etc. convey dynamic
+;; bindings, so background work spawned from a render/batch would inherit
+;; an overlay whose boundary may already have flushed — silently routing
+;; its writes into dead state.  The :owner stamp guards against this; see
+;; `current-overlay`.
 (def ^:dynamic *state-overlay* nil)
+
+(defn current-overlay
+  "Return the bound state overlay, but only when the current thread created
+   it.  An overlay seen on any other thread is a conveyed binding (future /
+   send-off / fiber spawned inside a render or batch) — treat it as absent
+   so cursor reads/writes hit the live app-state directly.
+
+   Future extension: a sanctioned `bound-fn`-style opt-in could let work
+   on another thread deliberately participate in the owner's overlay by
+   adopting its :owner; until then, ownership is strictly single-thread."
+  []
+  (when-let [overlay *state-overlay*]
+    (when (identical? (:owner overlay) (Thread/currentThread))
+      overlay)))
 
 (defn flush-overlay!
   "Flush written paths from the current overlay to the live atom.
    Only touches paths that were actually written during the overlay's
    lifetime, preserving concurrent changes to other paths.
-   No-op when no paths were written."
+   No-op when no paths were written, or when the calling thread does
+   not own the overlay."
   [app-state*]
-  (when-let [{:keys [state* paths*]} *state-overlay*]
+  (when-let [{:keys [state* paths*]} (current-overlay)]
     (let [shadow @state*
           paths  @paths*]
       (when (seq paths)
@@ -94,7 +116,8 @@
    #'*registered-action-ids*   (atom #{})
    #'*registered-reactive-ids* (atom #{})
    #'*state-overlay*           {:state* (atom @app-state*)
-                                :paths* (atom #{})}})
+                                :paths* (atom #{})
+                                :owner  (Thread/currentThread)}})
 
 (defn partial-render-bindings
   "Build the thread-binding map for a partial (reactive component) render.

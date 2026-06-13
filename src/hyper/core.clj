@@ -177,6 +177,10 @@
    Nested batches are transparent — the inner batch executes within the
    existing overlay and the outermost boundary handles the flush.
 
+   A batch inside background work (future, send-off, fiber) spawned from a
+   render or outer batch ignores the conveyed overlay and creates its own,
+   flushing to the live app-state when its body completes.
+
    Example:
      ;; Without batch, the renderer might snapshot between cursor updates
      ;; and show a partial state (e.g. new data with loading still true).
@@ -194,14 +198,16 @@
            (reset! (h/tab-cursor :data) data)
            (reset! (h/tab-cursor :loading?) false))))"
   [& body]
-  `(if context/*state-overlay*
-     ;; Already inside an overlay (render or outer batch) — just execute.
-     ;; Writes accumulate in the existing overlay; outer boundary flushes.
+  `(if (context/current-overlay)
+     ;; Already inside an overlay owned by this thread — just execute;
+     ;; the outer boundary flushes.  A conveyed overlay from another
+     ;; thread does not count (see context/current-overlay).
      (do ~@body)
      ;; Fresh overlay — snapshot current state, execute, flush.
      (let [{app-state*# :app-state*} (context/require-context! "batch")
            overlay#                  {:state* (atom @app-state*#)
-                                      :paths* (atom #{})}]
+                                      :paths* (atom #{})
+                                      :owner  (Thread/currentThread)}]
        (binding [context/*state-overlay* overlay#]
          (let [result# (do ~@body)]
            (context/flush-overlay! app-state*#)
