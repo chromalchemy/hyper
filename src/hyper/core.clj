@@ -448,6 +448,8 @@
    Also defines a server-side render function of the same name, so pages
    call components like ordinary hiccup functions.  Canonical
    documentation: hyper.component/defc."
+  {:style/indent        1
+   :style.cljfmt/indent [[:block 1] [:inner 1]]}
   [& args]
   `(component/defc ~@args))
 

@@ -1436,6 +1436,46 @@ the bundle registry).
 For self-hosted/air-gapped deploys, override the Squint runtime CDN URL
 with the `:squint-core-url` option on `create-handler`.
 
+### Editor indentation
+
+`defc`'s `render`/`event`/`mount`/`update`/`unmount` segments are
+method-body forms, so they should indent two spaces (like `deftype`)
+rather than aligning under the argument vector:
+
+```clojure
+(h/defc foo
+  (render [x]
+    [:h1 x]))        ;; ← body indented 2, not aligned under [x]
+```
+
+Editors learn this differently:
+
+- **clojure-lsp** (Calva, Emacs/lsp-mode, neovim, …) — hyper ships the rule
+  on the classpath. Add one line to your `.lsp/config.edn`:
+
+  ```clojure
+  {:classpath-config-paths ["dynamic-alpha/hyper"]}
+  ```
+
+  clojure-lsp merges hyper's `:cljfmt :extra-indents` automatically.
+
+- **CIDER (Emacs)** — works with no config: `defc` carries `:style/indent`
+  metadata that CIDER reads live from the REPL.
+
+- **Plain `cljfmt` / `lein-cljfmt` / Calva's bundled formatter** — these
+  don't read dependency classpaths, so add the rule to your project
+  `.cljfmt.edn` (`:extra-indents` appends to the defaults):
+
+  ```clojure
+  {:extra-indents
+   {defc                 [[:block 1] [:inner 1]]
+    hyper.core/defc      [[:block 1] [:inner 1]]
+    hyper.component/defc [[:block 1] [:inner 1]]}}
+  ```
+
+  The unqualified entry covers `defc` called via `:refer`; the qualified
+  entries cover `h/defc` / `component/defc`.
+
 ## Batched cursor updates
 
 When an action updates multiple cursors, the renderer could snapshot between

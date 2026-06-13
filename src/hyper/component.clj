@@ -440,6 +440,8 @@
          (let [pct (js/Math.round (* 100 (/ value max)))]
            [:div {:on {:click ::selected}}
             [:span label \": \" pct \"%\"]])))"
+  {:style/indent        1
+   :style.cljfmt/indent [[:block 1] [:inner 1]]}
   [cname & body]
   (let [[docstring body]         (if (string? (first body))
                                    [(first body) (rest body)]
