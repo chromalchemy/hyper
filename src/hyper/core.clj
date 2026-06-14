@@ -95,8 +95,8 @@
                                        app-state*
                                        [:tabs tab-id :route :query-params]
                                        path)]
-     (when (nil? @cursor)
-       (reset! cursor default-value))
+     ;; cas so the default init yields to a concurrent write (see state/Cursor).
+     (compare-and-set! cursor nil default-value)
      cursor)))
 
 (defn watch!
@@ -206,7 +206,7 @@
      ;; Fresh overlay — snapshot current state, execute, flush.
      (let [{app-state*# :app-state*} (context/require-context! "batch")
            overlay#                  {:state* (atom @app-state*#)
-                                      :paths* (atom #{})
+                                      :ops*   (atom [])
                                       :owner  (Thread/currentThread)}]
        (binding [context/*state-overlay* overlay#]
          (let [result# (do ~@body)]

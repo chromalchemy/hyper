@@ -894,6 +894,106 @@
           "worker's batch flushes to live app-state despite the conveyed dead overlay"))))
 
 ;; ---------------------------------------------------------------------------
+;; Op-log overlay — writes recorded as composable ops, not values.  Flush
+;; replays them against live state, so swap!/update merges with concurrent
+;; same-path writes; reset! keeps overwrite semantics.
+;; ---------------------------------------------------------------------------
+
+(deftest overlay-swap-composes-with-concurrent-live-write-test
+  (testing "a render's swap! claim composes with a worker's concurrent live write"
+    ;; Streaming foot-gun: render claims :status on the cursor a worker streams
+    ;; rows into.  Value-replay wiped the rows; op-log merges the claim on top.
+    (let [app-state* (atom (state/init-state))
+          _          (state/get-or-create-tab! app-state* "s1" "t1")
+          page-fn    (fn [_req]
+                       (let [results* (hy/tab-cursor :results)]
+                         ;; Owner stakes its claim on a sub-key (compositional swap)
+                         (swap! results* assoc :status :starting)
+                         ;; Worker streams rows into the SAME cursor on live state
+                         ;; (a conveyed future bypasses the overlay), finishing
+                         ;; before the render returns and flushes.
+                         (deref (future
+                                  (swap! (hy/tab-cursor :results)
+                                         update :rows (fnil into []) [:row1 :row2]))
+                                2000 nil)
+                         [:div]))]
+      (ht/test-page page-fn {:app-state app-state* :tab-id "t1" :session-id "s1"})
+      (let [results (get-in @app-state* [:tabs "t1" :data :results])]
+        (is (= :starting (:status results))
+            "render's claim is applied")
+        (is (= [:row1 :row2] (:rows results))
+            "worker's streamed rows survive the render flush (no clobber)")))))
+
+(deftest overlay-reset-overwrites-concurrent-write-test
+  (testing "reset! keeps overwrite semantics: a whole-value reset replays absolutely"
+    ;; Two whole-cursor resets are a genuine conflict; the render's reset wins.
+    (let [app-state* (atom (state/init-state))
+          _          (state/get-or-create-tab! app-state* "s1" "t1")
+          page-fn    (fn [_req]
+                       (let [results* (hy/tab-cursor :results)]
+                         (reset! results* {:status :starting})
+                         (deref (future (reset! (hy/tab-cursor :results) {:rows [:row1]}))
+                                2000 nil)
+                         [:div]))]
+      (ht/test-page page-fn {:app-state app-state* :tab-id "t1" :session-id "s1"})
+      (is (= {:status :starting} (get-in @app-state* [:tabs "t1" :data :results]))
+          "render's reset op replays as an absolute write, overwriting the worker"))))
+
+(deftest overlay-read-your-writes-test
+  (testing "@cursor after a swap! returns the written value within the overlay"
+    (let [app-state* (atom (state/init-state))
+          _          (state/get-or-create-tab! app-state* "s1" "t1")
+          seen       (atom nil)
+          page-fn    (fn [_req]
+                       (let [s* (hy/tab-cursor :s)]
+                         (swap! s* assoc :rows [:a :b :c])
+                         ;; read-your-writes: shadow reflects the write immediately
+                         (reset! seen (:rows @s*))
+                         [:p (str (:rows @s*))]))]
+      (let [result (ht/test-page page-fn {:app-state  app-state*
+                                          :tab-id     "t1"
+                                          :session-id "s1"})]
+        (is (= [:a :b :c] @seen)
+            "the body sees its own write synchronously via the shadow")
+        (is (string/includes? (:body-html result) "[:a :b :c]")
+            "the rendered HTML reflects the written value")
+        (is (= [:a :b :c] (get-in @app-state* [:tabs "t1" :data :s :rows]))
+            "the write is committed to live state after flush")))))
+
+(deftest batch-swap-composes-with-live-write-test
+  (testing "batch swap! ops compose with a concurrent worker's live write to the same path"
+    (let [app-state* (atom (state/init-state))
+          _          (state/get-or-create-tab! app-state* "s1" "t1")]
+      (binding [context/*request* {:hyper/session-id "s1"
+                                   :hyper/tab-id     "t1"
+                                   :hyper/app-state  app-state*}]
+        (hy/batch
+          (swap! (hy/tab-cursor :results) assoc :status :done)
+          ;; worker appends rows to the same cursor on live, mid-batch
+          (deref (future (swap! (hy/tab-cursor :results)
+                                update :rows (fnil conj []) :r1))
+                 2000 nil))
+        (let [results (get-in @app-state* [:tabs "t1" :data :results])]
+          (is (= :done (:status results)))
+          (is (= [:r1] (:rows results))
+              "batch flush replays ops, preserving the worker's rows"))))))
+
+(deftest default-init-does-not-clobber-concurrent-write-test
+  (testing "first-render default init yields to a concurrent worker write (cas op)"
+    (let [app-state* (atom (state/init-state))
+          _          (state/get-or-create-tab! app-state* "s1" "t1")
+          page-fn    (fn [_req]
+                       ;; Worker initializes :count on live before the default
+                       ;; init's cas op flushes.
+                       (deref (future (reset! (hy/tab-cursor :count) 41)) 2000 nil)
+                       ;; Render asks for the cursor with a default of 0.
+                       (let [c* (hy/tab-cursor :count 0)]
+                         [:div (str @c*)]))]
+      (ht/test-page page-fn {:app-state app-state* :tab-id "t1" :session-id "s1"})
+      (is (= 41 (get-in @app-state* [:tabs "t1" :data :count]))
+          "default init must not overwrite the worker's value"))))
+
+;; ---------------------------------------------------------------------------
 ;; Env
 ;; ---------------------------------------------------------------------------
 

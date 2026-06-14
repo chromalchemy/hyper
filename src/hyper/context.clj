@@ -34,19 +34,20 @@
 ;; State overlay for cursor read/write indirection.
 ;;
 ;; When non-nil, a map with:
-;;   :state*  — atom holding the shadow state (cursor reads/writes go here)
-;;   :paths*  — atom #{} of full-paths that were written (for selective flush)
+;;   :state*  — shadow atom serving cursor reads / read-your-writes
+;;   :ops*    — atom [] of ordered mutations (not values):
+;;                {:kind :update :path p :f g}
+;;                {:kind :reset  :path p :value v}
+;;                {:kind :cas    :path p :old o :new n}
 ;;   :owner   — the Thread that created the overlay (see ownership below)
 ;;
-;; Bound during render (snapshot for read consistency) and inside the
-;; `batch` macro (deferred writes for atomicity).  Cursors check this var
-;; first: if bound AND owned by the current thread, reads/writes go through
-;; the overlay; otherwise they hit app-state* directly.
-;;
-;; At the boundary end (render complete / batch body returns), written
-;; paths are flushed to app-state* in a single swap! via `flush-overlay!`.
-;; nil during action execution (without batch) so that actions see/mutate
-;; live state and each cursor write fires the watcher immediately.
+;; Bound during render (read consistency) and inside `batch` (atomicity).
+;; Cursors use the overlay when it's bound AND owned by the current thread;
+;; otherwise they hit app-state* directly.  At the boundary the op-log is
+;; replayed onto the live atom via `flush-overlay!` — replaying operations
+;; (not absolute values) lets a swap!/update-style write compose with a
+;; concurrent same-path write instead of clobbering it; reset! still
+;; overwrites by design.  nil during action execution (without batch).
 ;;
 ;; Thread ownership: `future`, `send-off`, fibers, etc. convey dynamic
 ;; bindings, so background work spawned from a render/batch would inherit
@@ -69,22 +70,32 @@
     (when (identical? (:owner overlay) (Thread/currentThread))
       overlay)))
 
+(defn apply-ops
+  "Replay an ordered op-log against a state value, returning the new state.
+   :update applies its fn to the current value (composing with concurrent
+   writes), :reset overwrites the path, :cas writes only when the value
+   still equals the expected old.  Pure — runs inside flush-overlay!'s
+   swap!, so op fns must be side-effect free, as with clojure.core/swap!."
+  [state ops]
+  (reduce (fn [s {:keys [kind path] :as op}]
+            (case kind
+              :update (update-in s path (:f op))
+              :reset  (assoc-in s path (:value op))
+              :cas    (if (= (get-in s path) (:old op))
+                        (assoc-in s path (:new op))
+                        s)))
+          state
+          ops))
+
 (defn flush-overlay!
-  "Flush written paths from the current overlay to the live atom.
-   Only touches paths that were actually written during the overlay's
-   lifetime, preserving concurrent changes to other paths.
-   No-op when no paths were written, or when the calling thread does
-   not own the overlay."
+  "Replay the current overlay's op-log onto the live atom in a single swap!.
+   No-op when nothing was recorded, or the calling thread doesn't own the
+   overlay."
   [app-state*]
-  (when-let [{:keys [state* paths*]} (current-overlay)]
-    (let [shadow @state*
-          paths  @paths*]
-      (when (seq paths)
-        (swap! app-state* (fn [live]
-                            (reduce (fn [s p]
-                                      (assoc-in s p (get-in shadow p)))
-                                    live
-                                    paths)))))))
+  (when-let [{:keys [ops*]} (current-overlay)]
+    (let [ops @ops*]
+      (when (seq ops)
+        (swap! app-state* apply-ops ops)))))
 
 ;; The :as name of the currently executing action, or nil when outside
 ;; an action context or when the action was not given an :as name.
@@ -116,7 +127,7 @@
    #'*registered-action-ids*   (atom #{})
    #'*registered-reactive-ids* (atom #{})
    #'*state-overlay*           {:state* (atom @app-state*)
-                                :paths* (atom #{})
+                                :ops*   (atom [])
                                 :owner  (Thread/currentThread)}})
 
 (defn partial-render-bindings

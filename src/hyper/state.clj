@@ -56,40 +56,47 @@
     _this)
 
   clojure.lang.IAtom
+  ;; With an owned overlay, each mutation is applied to the shadow :state*
+  ;; (for read-your-writes) and appended to :ops* as a composable operation
+  ;; replayed against live state at flush.  Without an overlay, writes hit
+  ;; the live parent-atom directly like a plain atom.
   (swap [_ f]
-    (if-let [{state* :state* paths* :paths*} (context/current-overlay)]
+    (if-let [{state* :state* ops* :ops*} (context/current-overlay)]
       (let [new-val (get-in (swap! state* update-in full-path f) full-path)]
-        (swap! paths* conj full-path)
+        (swap! ops* conj {:kind :update :path full-path :f f})
         new-val)
       (get-in (swap! parent-atom update-in full-path f) full-path)))
 
   (swap [_ f arg]
-    (if-let [{state* :state* paths* :paths*} (context/current-overlay)]
-      (let [new-val (get-in (swap! state* update-in full-path f arg) full-path)]
-        (swap! paths* conj full-path)
+    (if-let [{state* :state* ops* :ops*} (context/current-overlay)]
+      (let [g       (fn [v] (f v arg))
+            new-val (get-in (swap! state* update-in full-path g) full-path)]
+        (swap! ops* conj {:kind :update :path full-path :f g})
         new-val)
       (get-in (swap! parent-atom update-in full-path f arg) full-path)))
 
   (swap [_ f arg1 arg2]
-    (if-let [{state* :state* paths* :paths*} (context/current-overlay)]
-      (let [new-val (get-in (swap! state* update-in full-path f arg1 arg2) full-path)]
-        (swap! paths* conj full-path)
+    (if-let [{state* :state* ops* :ops*} (context/current-overlay)]
+      (let [g       (fn [v] (f v arg1 arg2))
+            new-val (get-in (swap! state* update-in full-path g) full-path)]
+        (swap! ops* conj {:kind :update :path full-path :f g})
         new-val)
       (get-in (swap! parent-atom update-in full-path f arg1 arg2) full-path)))
 
   (swap [_ f arg1 arg2 args]
-    (if-let [{state* :state* paths* :paths*} (context/current-overlay)]
-      (let [new-val (get-in (apply swap! state* update-in full-path f arg1 arg2 args) full-path)]
-        (swap! paths* conj full-path)
+    (if-let [{state* :state* ops* :ops*} (context/current-overlay)]
+      (let [g       (fn [v] (apply f v arg1 arg2 args))
+            new-val (get-in (swap! state* update-in full-path g) full-path)]
+        (swap! ops* conj {:kind :update :path full-path :f g})
         new-val)
       (get-in (apply swap! parent-atom update-in full-path f arg1 arg2 args) full-path)))
 
   (compareAndSet [_ oldv newv]
-    (if-let [{state* :state* paths* :paths*} (context/current-overlay)]
+    (if-let [{state* :state* ops* :ops*} (context/current-overlay)]
       (let [current-val (get-in @state* full-path)]
         (if (= current-val oldv)
           (do (swap! state* assoc-in full-path newv)
-              (swap! paths* conj full-path)
+              (swap! ops* conj {:kind :cas :path full-path :old oldv :new newv})
               true)
           false))
       (loop []
@@ -104,9 +111,9 @@
             false)))))
 
   (reset [_ newv]
-    (if-let [{state* :state* paths* :paths*} (context/current-overlay)]
+    (if-let [{state* :state* ops* :ops*} (context/current-overlay)]
       (do (swap! state* assoc-in full-path newv)
-          (swap! paths* conj full-path)
+          (swap! ops* conj {:kind :reset :path full-path :value newv})
           newv)
       (do (swap! parent-atom assoc-in full-path newv)
           newv)))
@@ -135,8 +142,9 @@
    (create-cursor app-state* [:sessions session-id :data] path))
   ([app-state* session-id path default-value]
    (let [cursor (create-cursor app-state* [:sessions session-id :data] path)]
-     (when (nil? @cursor)
-       (reset! cursor default-value))
+     ;; cas (not read-then-reset) so a default init yields to a concurrent
+     ;; write at flush rather than clobbering it.
+     (compare-and-set! cursor nil default-value)
      cursor)))
 
 (defn tab-cursor
@@ -146,8 +154,7 @@
    (create-cursor app-state* [:tabs tab-id :data] path))
   ([app-state* tab-id path default-value]
    (let [cursor (create-cursor app-state* [:tabs tab-id :data] path)]
-     (when (nil? @cursor)
-       (reset! cursor default-value))
+     (compare-and-set! cursor nil default-value)
      cursor)))
 
 (defn global-cursor
@@ -158,8 +165,7 @@
    (create-cursor app-state* [:global] path))
   ([app-state* path default-value]
    (let [cursor (create-cursor app-state* [:global] path)]
-     (when (nil? @cursor)
-       (reset! cursor default-value))
+     (compare-and-set! cursor nil default-value)
      cursor)))
 
 (defn init-state
