@@ -408,9 +408,9 @@
   (testing "Route :parameters coerce raw string params into typed values"
     (let [app-state* (atom (state/init-state))
           routes     [["/page" {:name       :page
-                                 :parameters {:query [:map [:n :int]]}
-                                 :get        (fn [req]
-                                               [:div "n=" (get-in req [:hyper/route :query-params :n])])}]]
+                                :parameters {:query [:map [:n :int]]}
+                                :get        (fn [req]
+                                              [:div "n=" (get-in req [:hyper/route :query-params :n])])}]]
           handler    (server/create-handler routes app-state*)
           good       (handler {:uri "/page" :request-method :get :query-params {"n" "5"}})]
       (is (= 200 (:status good)))
@@ -420,8 +420,8 @@
   (testing "Coercion failure returns HTTP 400 with a malli explanation, not a hang"
     (let [app-state* (atom (state/init-state))
           routes     [["/page" {:name       :page
-                                 :parameters {:query [:map [:n :int]]}
-                                 :get        (fn [_req] [:div "ok"])}]]
+                                :parameters {:query [:map [:n :int]]}
+                                :get        (fn [_req] [:div "ok"])}]]
           handler    (server/create-handler routes app-state*)
           bad        (handler {:uri "/page" :request-method :get :query-params {"n" "abc"}})]
       (is (= 400 (:status bad)))
@@ -431,8 +431,8 @@
   (testing "Routes without :parameters keep raw string params"
     (let [app-state* (atom (state/init-state))
           routes     [["/page" {:name :page
-                                 :get  (fn [req]
-                                         [:div "n=" (get-in req [:hyper/route :query-params :n])])}]]
+                                :get  (fn [req]
+                                        [:div "n=" (get-in req [:hyper/route :query-params :n])])}]]
           handler    (server/create-handler routes app-state*)
           response   (handler {:uri "/page" :request-method :get :query-params {"n" "abc"}})]
       (is (= 200 (:status response)))

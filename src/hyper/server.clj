@@ -12,6 +12,7 @@
             [hyper.component.bundle :as component.bundle]
             [hyper.context :as context]
             [hyper.effects :as effects]
+            [hyper.lifecycle :as lifecycle]
             [hyper.reactive :as reactive]
             [hyper.render :as render]
             [hyper.render.error :as render.error]
@@ -19,6 +20,7 @@
             [hyper.routes :as routes]
             [hyper.signal :as signal]
             [hyper.state :as state]
+            [hyper.subview :as subview]
             [hyper.utils :as utils]
             [hyper.watch :as watch]
             [org.httpkit.server :as http-kit]
@@ -99,7 +101,7 @@
    declarations.
    Returns true/nil on success, false when the channel is closed."
   [app-state* session-id tab-id sig-patches last-sent-signals
-   enqueue-partial! channel br-out br-stream]
+   trigger-render! enqueue-partial! channel br-out br-stream]
   (when-let [render-result (render/render-tab app-state* session-id tab-id)]
     (if (:status render-result)
       ;; Ring response passthrough (e.g. redirect from render middleware)
@@ -107,12 +109,14 @@
       ;; Normal render — assemble and send SSE payload
       (let [{:keys [title head-html body-html url
                     declared-signals registered-action-ids
-                    registered-reactive-ids]}              render-result]
-        ;; Sweep stale actions + reactive components
+                    registered-subview-ids]}               render-result]
+        ;; Sweep stale actions + render-scoped subviews (reactive regions)
         (actions/sweep-stale-tab-actions! app-state* tab-id registered-action-ids)
-        (reactive/sweep-stale-components! app-state* tab-id registered-reactive-ids)
-        ;; Set up watches for new/changed reactive components
-        (reactive/setup-new-component-watches! app-state* tab-id enqueue-partial!)
+        (subview/sweep-stale! app-state* tab-id registered-subview-ids)
+        ;; Wire watches for new subviews — reactive regions (partial) and any
+        ;; not-yet-wired user watches (full), e.g. registered during the
+        ;; initial HTTP render before this SSE renderer existed.
+        (subview/setup-new-watches! app-state* tab-id trigger-render! enqueue-partial!)
         (let [head-event   (render/format-head-update title head-html)
               sig-attrs    (signal/format-signal-attrs declared-signals)
               div-attrs    (cond-> {:id "hyper-app"}
@@ -166,7 +170,8 @@
                            compress? (assoc "Content-Encoding" "br"))
         throttle-ms      (long (or (get @app-state* :render-throttle-ms)
                                    default-render-throttle-ms))
-        enqueue-partial! #(rq/enqueue-partial! render-queue %)]
+        enqueue-partial! #(rq/enqueue-partial! render-queue %)
+        trigger-render!  #(rq/enqueue-full-render! render-queue)]
     (try
       ;; Send the connected event as the initial SSE response (headers + body).
       (let [connected-msg (render/format-connected-event tab-id)
@@ -195,7 +200,7 @@
                                                                  channel br-out br-stream)
                                           (handle-full-render app-state* session-id tab-id sig-patches
                                                               last-sent-signals
-                                                              enqueue-partial!
+                                                              trigger-render! enqueue-partial!
                                                               channel br-out br-stream))
                                         (catch Throwable e
                                           (t/error! {:id   :hyper.error/renderer
@@ -294,9 +299,11 @@
   "Clean up all resources for a tab: watchers, reactive components, renderer thread, actions, and state."
   [app-state* tab-id]
   (watch/remove-watchers! app-state* tab-id)
-  (watch/remove-external-watches! app-state* tab-id)
-  (watch/teardown-route-watches! app-state* tab-id)
+  ;; teardown-all-components! (-> subview/teardown-all!) tears down every
+  ;; subview for the tab, including framework :tab watches and user/route
+  ;; :mount watches.
   (reactive/teardown-all-components! app-state* tab-id)
+  (lifecycle/teardown-page-view! app-state* tab-id)
   (when-let [stop! (get-in @app-state* [:tabs tab-id :renderer :stop!])]
     (stop!))
   (actions/cleanup-tab-actions! app-state* tab-id)
@@ -325,20 +332,17 @@
                                           (swap! app-state* assoc-in [:tabs tab-id :renderer] renderer)
 
                                           (watch/setup-watchers! app-state* session-id tab-id trigger-render!)
-                                          ;; Auto-watch any Var sources (routes, head) so re-defs
-                                          ;; trigger re-renders for all connected tabs
+                                          ;; Framework watches as :tab-scoped subviews — set up once
+                                          ;; at connect, survive navigation, torn down on disconnect:
+                                          ;; - routes/head Vars: re-defs trigger re-renders for all tabs
+                                          ;; - component registry: REPL redefinition hot-swaps the
+                                          ;;   client-components bundle over SSE (the head update carries
+                                          ;;   the new content-hashed script URL).
                                           (let [{:keys [routes-source head]} @app-state*]
-                                            (doseq [source (->>  [routes-source head]
-                                                                 (filter var?))]
-                                              (watch/watch-source! app-state* tab-id trigger-render! source)))
-                                          ;; Watch the component registry so REPL redefinition of
-                                          ;; client components hot-swaps the bundle over SSE (the
-                                          ;; head update carries the new content-hashed script URL).
-                                          (watch/watch-source! app-state* tab-id trigger-render! component/registry*)
-                                          ;; Set up route-level watches (:watches + Var :get handlers)
-                                          (watch/setup-route-watches! app-state* tab-id trigger-render!)
-                                          ;; Promote any watches stashed during the initial HTTP render
-                                          (watch/promote-pending-watches! app-state* tab-id trigger-render!)))
+                                            (doseq [source (conj (filterv var? [routes-source head])
+                                                                 component/registry*)]
+                                              (let [sid (subview/register-watch! app-state* tab-id source :tab)]
+                                                (subview/wire-subview! app-state* tab-id sid trigger-render! nil))))))
 
                             :on-close (fn [_channel _status]
                                         (t/log! {:level :info
@@ -818,9 +822,10 @@
    Hyper will wrap them to provide full HTML responses and SSE connections."
   ([routes app-state*]
    (create-handler routes app-state* {:datastar-script (default-datastar-script)}))
-  ([routes app-state* {:keys [watches head base-path middleware render-middleware render-error not-found]
+  ([routes app-state* {:keys [watches head base-path middleware render-middleware render-error not-found render-guard]
                        :or   {render-error render.error/minimal
-                              not-found    render.error/not-found}
+                              not-found    render.error/not-found
+                              render-guard :warn}
                        :as   opts}]
    (let [base-path       (or base-path "")
          opts            (assoc opts :base-path base-path)
@@ -850,6 +855,7 @@
                                 :base-path base-path
                                 :render-middleware (vec render-middleware)
                                 :render-error render-error
+                                :render-guard render-guard
                                 :not-found not-found
                                 :squint-core-url (:squint-core-url opts))
          initial-routes  (if (var? routes) @routes routes)

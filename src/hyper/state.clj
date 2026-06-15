@@ -61,6 +61,7 @@
   ;; replayed against live state at flush.  Without an overlay, writes hit
   ;; the live parent-atom directly like a plain atom.
   (swap [_ f]
+    (context/guard-effect! :cursor-mutation (str "swap! " full-path))
     (if-let [{state* :state* ops* :ops*} (context/current-overlay)]
       (let [new-val (get-in (swap! state* update-in full-path f) full-path)]
         (swap! ops* conj {:kind :update :path full-path :f f})
@@ -68,6 +69,7 @@
       (get-in (swap! parent-atom update-in full-path f) full-path)))
 
   (swap [_ f arg]
+    (context/guard-effect! :cursor-mutation (str "swap! " full-path))
     (if-let [{state* :state* ops* :ops*} (context/current-overlay)]
       (let [g       (fn [v] (f v arg))
             new-val (get-in (swap! state* update-in full-path g) full-path)]
@@ -76,6 +78,7 @@
       (get-in (swap! parent-atom update-in full-path f arg) full-path)))
 
   (swap [_ f arg1 arg2]
+    (context/guard-effect! :cursor-mutation (str "swap! " full-path))
     (if-let [{state* :state* ops* :ops*} (context/current-overlay)]
       (let [g       (fn [v] (f v arg1 arg2))
             new-val (get-in (swap! state* update-in full-path g) full-path)]
@@ -84,6 +87,7 @@
       (get-in (swap! parent-atom update-in full-path f arg1 arg2) full-path)))
 
   (swap [_ f arg1 arg2 args]
+    (context/guard-effect! :cursor-mutation (str "swap! " full-path))
     (if-let [{state* :state* ops* :ops*} (context/current-overlay)]
       (let [g       (fn [v] (apply f v arg1 arg2 args))
             new-val (get-in (swap! state* update-in full-path g) full-path)]
@@ -111,6 +115,7 @@
             false)))))
 
   (reset [_ newv]
+    (context/guard-effect! :cursor-mutation (str "reset! " full-path))
     (if-let [{state* :state* ops* :ops*} (context/current-overlay)]
       (do (swap! state* assoc-in full-path newv)
           (swap! ops* conj {:kind :reset :path full-path :value newv})

@@ -949,16 +949,16 @@
                          (swap! s* assoc :rows [:a :b :c])
                          ;; read-your-writes: shadow reflects the write immediately
                          (reset! seen (:rows @s*))
-                         [:p (str (:rows @s*))]))]
-      (let [result (ht/test-page page-fn {:app-state  app-state*
-                                          :tab-id     "t1"
-                                          :session-id "s1"})]
-        (is (= [:a :b :c] @seen)
-            "the body sees its own write synchronously via the shadow")
-        (is (string/includes? (:body-html result) "[:a :b :c]")
-            "the rendered HTML reflects the written value")
-        (is (= [:a :b :c] (get-in @app-state* [:tabs "t1" :data :s :rows]))
-            "the write is committed to live state after flush")))))
+                         [:p (str (:rows @s*))]))
+          result     (ht/test-page page-fn {:app-state  app-state*
+                                            :tab-id     "t1"
+                                            :session-id "s1"})]
+      (is (= [:a :b :c] @seen)
+          "the body sees its own write synchronously via the shadow")
+      (is (string/includes? (:body-html result) "[:a :b :c]")
+          "the rendered HTML reflects the written value")
+      (is (= [:a :b :c] (get-in @app-state* [:tabs "t1" :data :s :rows]))
+          "the write is committed to live state after flush"))))
 
 (deftest batch-swap-composes-with-live-write-test
   (testing "batch swap! ops compose with a concurrent worker's live write to the same path"

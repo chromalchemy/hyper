@@ -298,7 +298,7 @@
   [{:keys [value max label history]}]
 
   (event ::selected [_e]
-         (emit "gauge-selected" {:label label :value value}))
+    (emit "gauge-selected" {:label label :value value}))
 
   (render
     (let [pct (js/Math.round (* 100 (/ value max)))]
@@ -330,24 +330,24 @@
     [:svg {:width 560 :height 180 :style "display:block"}])
 
   (mount [root]
-         (let [svg  (d3/select (.querySelector root "svg"))
-               draw (fn [vs]
-                      (-> svg
-                          (.selectAll "rect")
-                          (.data vs)
-                          (.join "rect")
-                          (.attr "x" (fn [_ i] (* i 46)))
-                          (.attr "width" 40)
-                          (.transition)
-                          (.duration 500)
-                          (.attr "y" (fn [v] (- 180 (* v 3))))
-                          (.attr "height" (fn [v] (* v 3)))
-                          (.attr "fill" (fn [v] (if (> v 40) "#d33" "#369")))))]
-           (set! (.-draw ctx) draw)
-           (draw values)))
+    (let [svg  (d3/select (.querySelector root "svg"))
+          draw (fn [vs]
+                 (-> svg
+                     (.selectAll "rect")
+                     (.data vs)
+                     (.join "rect")
+                     (.attr "x" (fn [_ i] (* i 46)))
+                     (.attr "width" 40)
+                     (.transition)
+                     (.duration 500)
+                     (.attr "y" (fn [v] (- 180 (* v 3))))
+                     (.attr "height" (fn [v] (* v 3)))
+                     (.attr "fill" (fn [v] (if (> v 40) "#d33" "#369")))))]
+      (set! (.-draw ctx) draw)
+      (draw values)))
 
   (update [_root]
-          ((.-draw ctx) values)))
+    ((.-draw ctx) values)))
 
 (defn components-page [_]
   (letfn [(card [title desc & children]

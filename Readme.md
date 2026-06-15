@@ -1069,6 +1069,94 @@ You can suppress hyper wrapping an endpoint altogether by marking it as `:hyper/
                    :get #'about-page}]])
 ```
 
+## View lifecycle: form-1 / form-2 / form-3
+
+A page handler climbs a small ladder, chosen by one question: **what does this
+view own?** The vocabulary is the same at every rung — the *shape of the return
+value* tells Hyper which rung you're on.
+
+| rung | owns | handler returns |
+| --- | --- | --- |
+| **form-1** | nothing | hiccup — `(fn [req] [:div …])` |
+| **form-2** | framework-managed subscriptions (auto-cleaned) | a *setup* closure that returns the render fn |
+| **form-3** | an external resource needing explicit teardown | a `View` (via `h/view`) |
+
+### form-1 — pure
+
+The default. A pure function of state to hiccup. Owns nothing, cleans up
+nothing.
+
+```clojure
+(defn counter [req]
+  (let [n* (h/tab-cursor :n 0)]
+    [:div "n=" @n*]))
+```
+
+### form-2 — setup closure
+
+When a view needs *effects* to set up — a `watch!`, a worker, a one-time claim —
+return a closure. The **outer** fn runs once per mount (effects allowed); the
+**inner** fn it returns is your pure render, run on every re-render:
+
+```clojure
+(defn dashboard [req]
+  (h/watch! db-results*)              ;; setup — runs once per mount
+  (let [results* (h/tab-cursor :results)]
+    (fn [req]                         ;; render — runs every render, pure
+      [:ul (for [r @results*]
+             [:li (:name r)])])))
+```
+
+The subscriptions you register in setup are framework-managed: `watch!`/route
+`:watches` are reference-counted and torn down automatically when the tab
+disconnects or navigates away. form-2 needs no teardown of its own.
+
+### form-3 — `h/view`
+
+When a view owns a *resource that is not a `Watchable`* and must be released —
+a connection, a cursor, a file handle — return a `View`. Its `:mount` allocates
+and **returns** the resource; Hyper threads that value immutably into `:render`
+and `:unmount`:
+
+```clojure
+(defn report-page [req]
+  (h/view
+    {:mount   (fn []          (db/open-cursor (h/env :db) :reports))
+     :render  (fn [cursor req] [:ul (for [r (db/take! cursor 50)]
+                                      [:li (:title r)])])
+     :unmount (fn [cursor]     (db/close-cursor cursor))}))
+```
+
+`:render` is required; `:mount`/`:unmount` are optional. The view (re)mounts
+when the page first renders or the route handler identity changes (navigation,
+or a Var redefinition during REPL development); a superseded view is unmounted
+first. There is deliberately **no** mutable per-view slot — the server always
+re-renders declaratively, so a resource opened at mount, read during renders,
+and closed at unmount is just a value threaded through the lifecycle.
+
+Reach for form-3 sparingly. Frequent need for it usually means a resource
+should be modeled as a [`Watchable`](#the-watchable-protocol) (folding back into
+form-2) or owned by the system layer (`:hyper/env` + Integrant/Component) and
+merely *subscribed* by the view.
+
+### The render purity guard
+
+Because effects belong in form-2 setup or a form-3 `:mount`, the **render phase
+is pure**. Hyper watches for violations — a cursor `reset!`/`swap!`, a
+`h/watch!`, etc. during render — and reports them. `compare-and-set!` (used by
+the cursor/signal *default-value* arg) is exempt, since default-init is
+declarative, not a mutation.
+
+Configure via `:render-guard` on `create-handler`:
+
+- `:warn` (default) — log a warning; the effect still runs.
+- `:error` — throw; surface the violation as a hard failure.
+- `:off` — disable the guard.
+
+```clojure
+(h/create-handler #'routes :render-guard :error)
+```
+
 ## Watches
 
 Under the hood, Hyper maintains a persistent SSE connection per tab. When state
@@ -1079,22 +1167,28 @@ external sources you need to tell Hyper what to watch.
 
 ### `watch!`
 
-Call `watch!` from your render function to observe any external source. When it
-changes, Hyper re-renders and pushes an update to the client:
+Call `watch!` to observe any external source. When it changes, Hyper re-renders
+and pushes an update to the client. `watch!` is an *effect*, so it belongs in a
+[form-2](#form-2--setup-closure) setup closure — registered once per mount:
 
 ```clojure
 (def db-results* (atom []))
 
 (defn dashboard [req]
-  (h/watch! db-results*)
-  [:div
-   [:h1 "Results"]
-   [:ul (for [r @db-results*]
-          [:li (:name r)])]])
+  (h/watch! db-results*)          ;; setup — runs once per mount
+  (fn [req]                       ;; render — pure
+    [:div
+     [:h1 "Results"]
+     [:ul (for [r @db-results*]
+            [:li (:name r)])]]))
 ```
 
-`watch!` is idempotent — safe to call on every render. Watches are automatically
-cleaned up when the tab disconnects.
+Watches are reference-counted and automatically cleaned up when the tab
+disconnects or navigates away.
+
+> Calling `watch!` directly in a form-1 render body still works (it is
+> idempotent), but trips the [render purity guard](#the-render-purity-guard) —
+> prefer the form-2 setup closure shown above.
 
 ### The `Watchable` protocol
 

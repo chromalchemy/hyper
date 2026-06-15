@@ -6,8 +6,10 @@
             [dev.onionpancakes.chassis.core :as c]
             [hyper.component.bundle :as component.bundle]
             [hyper.context :as context]
+            [hyper.lifecycle :as lifecycle]
             [hyper.routes :as routes]
             [hyper.state :as state]
+            [hyper.subview :as subview]
             [hyper.utils :as utils]
             [taoensso.telemere :as t]))
 
@@ -43,6 +45,21 @@
   [app-state* tab-id render-fn]
   (swap! app-state* assoc-in [:tabs tab-id :render-fn] render-fn)
   nil)
+
+(defn- register-route-watches!
+  "Register the current route's framework watches as mount-scoped, full-render
+   subviews so they route through the unified subview engine: global :watches,
+   the route's :watches metadata, and the auto-watched :get Var (live reload).
+
+   Runs every full render — idempotent and keyed by source identity, so the
+   watches are wired by `subview/setup-new-watches!` and torn down on page-view
+   remount (navigation) / tab disconnect, exactly like user `h/watch!`."
+  [app-state* tab-id route-index route]
+  (when-let [route-name (:name route)]
+    (doseq [source (routes/find-route-watches route-index
+                                              (get @app-state* :global-watches)
+                                              route-name)]
+      (subview/register-watch! app-state* tab-id source))))
 
 (defn get-render-fn
   "Get the render function for a tab."
@@ -341,10 +358,14 @@
                          true    (dissoc :reitit.core/match))]
        (push-thread-bindings (context/render-bindings req app-state*))
        (try
+         ;; Register framework route-level watches (global :watches, route
+         ;; :watches, auto-watched :get Var) as mount-scoped subviews.
+         (register-route-watches! app-state* tab-id route-index route)
          (let [mw-chain        (resolve-render-middleware app-state* route-index route)
-               wrapped-fn      (apply-render-middleware render-fn mw-chain)
+               wrap-mw         #(apply-render-middleware % mw-chain)
                render-error-fn (get @app-state* :render-error)
-               raw-body        (safe-render wrapped-fn req render-error-fn)]
+               raw-body        (lifecycle/render-page app-state* tab-id render-fn req
+                                                      render-error-fn wrap-mw)]
            ;; Ring response passthrough - render-fn returned a redirect,
            ;; error, or other non-hiccup response; pass it through as-is.
            (if (and (map? raw-body) (:status raw-body))
@@ -354,27 +375,27 @@
              ;; register actions during realization.  We must read
              ;; *registered-action-ids* AFTER serialization so the
              ;; accumulator captures every action the render produced.
-             (let [body         (unwrap-body raw-body)
-                   body-html    (if (vector? body)
-                                  (c/html body)
-                                  (apply str (map c/html body)))
-                   title-spec   (when (and (seq route-index) route)
-                                  (routes/find-route-title route-index (:name route)))
-                   title        (routes/resolve-title title-spec req)
-                   head         (resolve-full-head app-state* req)
-                   declared     @context/*declared-signals*
-                   action-ids   @context/*registered-action-ids*
-                   reactive-ids @context/*registered-reactive-ids*]
+             (let [body        (unwrap-body raw-body)
+                   body-html   (if (vector? body)
+                                 (c/html body)
+                                 (apply str (map c/html body)))
+                   title-spec  (when (and (seq route-index) route)
+                                 (routes/find-route-title route-index (:name route)))
+                   title       (routes/resolve-title title-spec req)
+                   head        (resolve-full-head app-state* req)
+                   declared    @context/*declared-signals*
+                   action-ids  @context/*registered-action-ids*
+                   subview-ids @context/*registered-subview-ids*]
                ;; Flush default-value inits and any other cursor writes
                ;; from the overlay to the live atom in a single swap.
                (context/flush-overlay! app-state*)
-               {:title                   title
-                :head-html               (some-> head c/html)
-                :body-html               body-html
-                :url                     url
-                :declared-signals        declared
-                :registered-action-ids   action-ids
-                :registered-reactive-ids reactive-ids})))
+               {:title                  title
+                :head-html              (some-> head c/html)
+                :body-html              body-html
+                :url                    url
+                :declared-signals       declared
+                :registered-action-ids  action-ids
+                :registered-subview-ids subview-ids})))
          (finally
            (pop-thread-bindings)))))))
 

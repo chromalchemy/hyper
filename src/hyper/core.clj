@@ -13,14 +13,15 @@
             [hyper.component :as component]
             [hyper.context :as context :refer [*request* *action-idx*]]
             [hyper.expr]
+            [hyper.lifecycle :as lifecycle]
             [hyper.reactive :as reactive]
             [hyper.render :as render]
             [hyper.routes :as routes]
             [hyper.server :as server]
             [hyper.signal :as signal]
             [hyper.state :as state]
+            [hyper.subview :as subview]
             [hyper.utils :as utils]
-            [hyper.watch :as watch]
             [reitit.core :as reitit]))
 
 (defn global-cursor
@@ -116,12 +117,19 @@
      ;; Watch any Watchable source
      (watch! my-event-stream)"
   [source]
+  (context/guard-effect! :watch "h/watch!")
   (let [{:keys [tab-id app-state*]} (context/require-context! "watch!")
+        ;; A user watch is a mount-scoped, full-render subview: registered once
+        ;; per mount (form-2 setup) or idempotently each render (form-1 body),
+        ;; keyed by source identity for dedup.  Torn down on navigation
+        ;; (page-view remount) and tab disconnect — never by the per-render sweep.
+        sid                         (subview/register-watch! app-state* tab-id source)
         trigger-render!             (get-in @app-state* [:tabs tab-id :renderer :trigger-render!])]
-    (if trigger-render!
-      (watch/watch-source! app-state* tab-id trigger-render! source)
-      ;; No SSE renderer yet (initial HTTP render) — stash for later promotion
-      (watch/stash-pending-watch! app-state* tab-id source))))
+    ;; Wire immediately when an SSE renderer already exists; otherwise the
+    ;; first full render's setup-new-watches! wires it (initial HTTP render).
+    (when trigger-render!
+      (subview/wire-subview! app-state* tab-id sid trigger-render! nil))
+    nil))
 
 (defn env
   "Get the request environment, or a specific key from it.
@@ -249,6 +257,50 @@
          deps#                                     ~deps
          render-fn#                                (fn [] ~@body)]
      (reactive/render-component app-state*# tab-id# component-id# deps# render-fn#)))
+
+;; ---------------------------------------------------------------------------
+;; View lifecycle (form-3)
+;; ---------------------------------------------------------------------------
+
+(defn view
+  "Declare a form-3 view that owns an external resource needing explicit
+   teardown (a connection, a file handle, a subscription that is not a
+   Watchable, etc.).
+
+   A page handler returns a `view` instead of hiccup when it must allocate
+   something at mount and release it at unmount.  The framework threads the
+   resource immutably through the lifecycle — there is no mutable per-view
+   slot, because the server always re-renders declaratively.
+
+   Spec keys:
+   - :render  (required) `(fn [resource req] -> hiccup)`.  `resource` is the
+              value returned by `:mount` (nil when there is no `:mount`).
+              Called on every render; must be pure.
+   - :mount   (optional) `(fn [] -> resource)`.  Runs once when the view
+              mounts; its return value is the resource.
+   - :unmount (optional) `(fn [resource] -> any)`.  Runs once when the view
+              unmounts (navigation away, handler redefinition, or tab
+              disconnect).
+
+   The view (re)mounts when the page first renders or the route handler
+   identity changes; a superseded view is unmounted first.
+
+   Prefer the simpler rungs of the ladder when you can: a pure `(fn [req] ->
+   hiccup)` (form-1) when the view owns nothing, or a setup closure
+   `(fn [req] (h/watch! …) (fn [req] hiccup))` (form-2) when it owns only
+   framework-managed subscriptions.  Reach for `view` only for a genuine
+   external resource — frequent need for it is a sign a resource should be
+   modeled as Watchable or owned by the system layer (:hyper/env) instead.
+
+   Example:
+     (defn report-page [req]
+       (h/view
+         {:mount   (fn []          (db/open-cursor (h/env :db) :reports))
+          :render  (fn [cursor req] [:ul (for [r (db/take! cursor 50)]
+                                           [:li (:title r)])])
+          :unmount (fn [cursor]     (db/close-cursor cursor))}))"
+  [spec]
+  (lifecycle/view spec))
 
 ;; ---------------------------------------------------------------------------
 ;; Signals
@@ -598,7 +650,7 @@
      (stop! app)"
   [routes & {:keys [app-state head static-resources static-dir watches
                     datastar-script base-path middleware render-middleware
-                    render-error squint-core-url]
+                    render-error squint-core-url render-guard]
              :or   {app-state       (atom (state/init-state))
                     datastar-script server/default-datastar-script}
              :as   opts}]
@@ -614,6 +666,7 @@
                                   :squint-core-url   squint-core-url}
                            ;; Only forward when supplied so server defaults apply.
                            render-error (assoc :render-error render-error)
+                           render-guard (assoc :render-guard render-guard)
                            ;; `contains?` so an explicit `:not-found nil` (disable) is honored.
                            (contains? opts :not-found) (assoc :not-found (:not-found opts)))))
 

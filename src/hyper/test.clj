@@ -28,10 +28,12 @@
   (:require [dev.onionpancakes.chassis.core :as c]
             [hyper.context :as context]
             [hyper.effects :as effects]
+            [hyper.lifecycle :as lifecycle]
             [hyper.reactive :as reactive]
             [hyper.render :as render]
             [hyper.render.error :as render.error]
-            [hyper.state :as state]))
+            [hyper.state :as state]
+            [hyper.subview :as subview]))
 
 (def ^:private default-session-id "test-session")
 (def ^:private default-tab-id "test-tab")
@@ -50,10 +52,11 @@
 
 (defn- collect-watches
   "Collect the external sources watched via h/watch! during render.
-   During an initial render (no SSE), watches are stashed as pending."
+   User watches are mount-scoped, full-render subviews (see hyper.subview);
+   in a test render there is no SSE renderer, so they are registered but not
+   yet wired — the sources are still recoverable from the registry."
   [app-state* tab-id]
-  (let [pending (get-in @app-state* [:tabs tab-id :pending-watches])]
-    (vec (vals (or pending {})))))
+  (subview/watched-sources app-state* tab-id))
 
 (defn- cursors-snapshot
   "Take a snapshot of cursor values for a session/tab."
@@ -141,24 +144,28 @@
        ;; Bind context vars and render
        (push-thread-bindings (context/render-bindings req app-state*))
        (try
-         (let [mw-handler      (render/apply-render-middleware handler (:render-middleware opts))
+         (let [wrap-mw         #(render/apply-render-middleware % (:render-middleware opts))
                render-error-fn (or (get @app-state* :render-error) render.error/minimal)
-               body            (render/safe-render mw-handler req render-error-fn)
+               ;; Route through the same form-1/2/3 dispatch as render-tab so
+               ;; test-page exercises form-2 (fn) and form-3 (View) handlers
+               ;; and the render purity guard, while preserving the result map.
+               body            (lifecycle/render-page app-state* tab-id handler req
+                                                      render-error-fn wrap-mw)
                ;; Ring response passthrough
                ring?           (and (map? body) (:status body))]
            (if ring?
              body
-             (let [declared     @context/*declared-signals*
-                   body-html    (c/html body)
-                   reactive-ids @context/*registered-reactive-ids*
-                   signals      (reduce (fn [acc {:keys [path] :as entry}]
-                                          (assoc acc path (dissoc entry :path)))
-                                        {}
-                                        declared)]
+             (let [declared    @context/*declared-signals*
+                   body-html   (c/html body)
+                   subview-ids @context/*registered-subview-ids*
+                   signals     (reduce (fn [acc {:keys [path] :as entry}]
+                                         (assoc acc path (dissoc entry :path)))
+                                       {}
+                                       declared)]
                ;; Flush default-value inits from overlay to live atom
                (context/flush-overlay! app-state*)
-               ;; Sweep stale reactive components (same as server.clj)
-               (reactive/sweep-stale-components! app-state* tab-id reactive-ids)
+               ;; Sweep stale subviews (reactive regions) — same as server.clj
+               (reactive/sweep-stale-components! app-state* tab-id subview-ids)
                {:body        body
                 :body-html   body-html
                 :title       nil

@@ -2,7 +2,8 @@
   "Request context and dynamic vars for hyper applications.
 
    Lives in a low-level namespace so that both render.clj and core.clj
-   can reference these vars without circular dependencies.")
+   can reference these vars without circular dependencies."
+  (:require [taoensso.telemere :as t]))
 
 ;; Dynamic var to hold current request context
 (def ^:dynamic *request* nil)
@@ -109,37 +110,56 @@
 ;;     (delete-user! id))
 (def ^:dynamic *action-name* nil)
 
-;; Accumulator for reactive component IDs registered during a render pass.
-;; Bound to (atom #{}) before each full render so that the reactive macro
-;; can track which components are live.  After render, stale components
-;; (present in the previous cycle but absent from this one) are swept —
-;; their watches are removed and deps released.
-(def ^:dynamic *registered-reactive-ids* nil)
+;; Accumulator for subview IDs registered during a render pass (reactive
+;; regions and, in future, other managed sub-regions).  Bound to (atom #{})
+;; before each full render so the subview registry can track which subviews
+;; are live.  After render, stale subviews (present in the previous cycle but
+;; absent from this one) are swept — their watches are removed, dep refcounts
+;; released, and any :unmount run.
+(def ^:dynamic *registered-subview-ids* nil)
+
+;; Render purity guard (see the full commentary near the guard fns below).
+;; Defined here so the render-binding builders can reference it.
+(def ^:dynamic *render-guard* nil)
+
+(defn make-guard
+  "Create a fresh render-guard atom at the given level (:warn, :error, or
+   :off).  Starts in :deferred mode."
+  [level]
+  (atom {:mode :deferred :level (or level :warn) :events []}))
 
 (defn render-bindings
   "Build the thread-binding map for a full render context.
    Includes a state overlay snapshot so cursor reads/writes are isolated.
    Returns a map suitable for `push-thread-bindings`."
   [req app-state*]
-  {#'*request*                 req
-   #'*action-idx*              (atom 0)
-   #'*declared-signals*        (atom [])
-   #'*registered-action-ids*   (atom #{})
-   #'*registered-reactive-ids* (atom #{})
-   #'*state-overlay*           {:state* (atom @app-state*)
-                                :ops*   (atom [])
-                                :owner  (Thread/currentThread)}})
+  {#'*request*                req
+   #'*action-idx*             (atom 0)
+   #'*declared-signals*       (atom [])
+   #'*registered-action-ids*  (atom #{})
+   #'*registered-subview-ids* (atom #{})
+   #'*render-guard*           (make-guard (get @app-state* :render-guard :warn))
+   #'*state-overlay*          {:state* (atom @app-state*)
+                               :ops*   (atom [])
+                               :owner  (Thread/currentThread)}})
 
 (defn partial-render-bindings
   "Build the thread-binding map for a partial (reactive component) render.
    No state overlay — reads/writes go directly to the live atom."
   [req]
-  {#'*request*                 req
-   #'*action-idx*              (atom 0)
-   #'*declared-signals*        (atom [])
-   #'*registered-action-ids*   (atom #{})
-   #'*registered-reactive-ids* (atom #{})
-   #'*state-overlay*           nil})
+  {#'*request*                req
+   #'*action-idx*             (atom 0)
+   #'*declared-signals*       (atom [])
+   #'*registered-action-ids*  (atom #{})
+   #'*registered-subview-ids* (atom #{})
+   ;; Partial reactive renders have no setup phase — the body is a pure
+   ;; render fn, so the guard is active immediately.
+   #'*render-guard*           (let [app-state* (:hyper/app-state req)
+                                    level      (when app-state*
+                                                 (get @app-state* :render-guard :warn))]
+                                (doto (make-guard level)
+                                  (swap! assoc :mode :active)))
+   #'*state-overlay*          nil})
 
 (defn require-context!
   "Extract and validate the request context from *request*.
@@ -157,3 +177,88 @@
      :tab-id     tab-id
      :app-state* app-state*
      :router     (:hyper/router *request*)}))
+
+;; ---------------------------------------------------------------------------
+;; Render purity guard
+;; ---------------------------------------------------------------------------
+;;
+;; Under the form-1/2/3 ladder, a render fn is a pure function of state:
+;; effects (cursor mutation, watch!, async workers) belong in form-2 setup
+;; or a form-3 :mount, NEVER in the render phase.  This guard makes that
+;; boundary observable — it warns (or, when configured, throws) when an
+;; effect runs while a render is in progress.
+;;
+;; *render-guard* is nil outside of rendering (actions, setup closures,
+;; form-3 mount/unmount, background workers) so effects there are silent.
+;; During a render it is bound to a guard atom:
+;;
+;;   {:mode   :deferred | :active   ;; see below
+;;    :level  :warn | :error | :off ;; what an offending effect does
+;;    :events [ {:kind .. :detail ..} ... ]}
+;;
+;; The page handler is called once with mode :deferred because we cannot yet
+;; tell form-1 (pure body — effects should warn) from a form-2 setup closure
+;; (effects are legal) until we see the return value.  Offending effects are
+;; buffered into :events during this phase.  Once the form is known the
+;; dispatcher either discards the buffer (form-2/3 — setup was legal) via
+;; `guard-discard!`, or flushes it as warnings (form-1) via
+;; `guard-flush-and-activate!`.  Both transition the mode to :active, under
+;; which any further effect (the render body, lazy hiccup realization, a
+;; form-2/3 render fn) is judged immediately.
+;;
+;; (*render-guard* and make-guard are defined earlier in this file so the
+;; render-binding builders can reference them.)
+
+(defn- guard-message [{:keys [kind detail]}]
+  (str "Effect during render: " (name (or kind :effect))
+       (when detail (str " (" detail ")"))
+       ". Render functions must be pure — move effects (cursor writes, "
+       "watch!, workers) into a form-2 setup closure or a form-3 :mount."))
+
+(defn- emit-guard-event!
+  "Emit a single buffered/active guard event according to level."
+  [level event]
+  (case level
+    :off  nil
+    :error (throw (ex-info (guard-message event)
+                           (assoc event :hyper/render-guard true)))
+    ;; default :warn
+    (t/log! {:level :warn
+             :id    :hyper.warn/effect-in-render
+             :data  event
+             :msg   (guard-message event)})))
+
+(defn guard-effect!
+  "Report an effect (cursor mutation, watch!, …) to the active render guard.
+   `kind` is a keyword (e.g. :cursor-mutation, :watch); `detail` is an
+   optional string/value for the message.  No-op when no guard is bound or
+   the guard level is :off.  In :deferred mode the event is buffered; in
+   :active mode it is emitted immediately (warn) or throws (error)."
+  ([kind] (guard-effect! kind nil))
+  ([kind detail]
+   (when-let [g *render-guard*]
+     (let [{:keys [mode level]} @g]
+       (when (not= level :off)
+         (let [event {:kind kind :detail detail}]
+           (if (= mode :deferred)
+             (swap! g update :events conj event)
+             (emit-guard-event! level event))))))))
+
+(defn guard-discard!
+  "form-2/3 resolution: the page handler call was a legal setup/construction
+   phase, so drop any buffered effects and switch the guard to :active so the
+   render fn itself is judged."
+  []
+  (when-let [g *render-guard*]
+    (swap! g assoc :mode :active :events [])))
+
+(defn guard-flush-and-activate!
+  "form-1 resolution: the page handler call WAS the render body, so emit any
+   buffered effects (warn, or throw on the first when :error) and switch the
+   guard to :active for lazy hiccup realization."
+  []
+  (when-let [g *render-guard*]
+    (let [{:keys [level events]} @g]
+      (swap! g assoc :mode :active :events [])
+      (doseq [event events]
+        (emit-guard-event! level event)))))

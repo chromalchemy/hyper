@@ -253,7 +253,7 @@
       "A test widget."
       [{:keys [count label]}]
       (event ::clicked [_e]
-             (emit "widget-clicked" {:count count}))
+        (emit "widget-clicked" {:count count}))
       (render
         [:div {:on {:click ::clicked}}
          [:span label " = " count]]))
@@ -361,12 +361,12 @@
         [{:keys [data]}]
         (render [:div.scaffold])
         (mount [root]
-               (set! (.-chart ctx) root)
-               (emit "ready" {:n (count data)}))
+          (set! (.-chart ctx) root)
+          (emit "ready" {:n (count data)}))
         (update [_root old]
-                (js/console.log old data))
+          (js/console.log old data))
         (unmount [_root]
-                 (set! (.-chart ctx) nil)))
+          (set! (.-chart ctx) nil)))
       (let [js (get-in @hc/registry* ["seamless-chart" :js])]
         (testing "spec carries every lifecycle fn"
           (is (str/includes? js "\"render\": (function"))
