@@ -25,7 +25,8 @@
             [dev.onionpancakes.chassis.core :as c]
             [hyper.context :as context]
             [hyper.protocols :as proto]
-            [hyper.watch :as watch]))
+            [hyper.watch :as watch]
+            [taoensso.telemere :as t]))
 
 ;; ---------------------------------------------------------------------------
 ;; Registry access
@@ -268,6 +269,56 @@
                (not (contains? (get-in @app-state* [:tabs tab-id :subview-watches]) sid)))
       (setup-subview-watches! app-state* tab-id sid deps (or on-change :partial)
                               trigger-render! enqueue-partial!))))
+
+;; ---------------------------------------------------------------------------
+;; Worker subviews (h/spawn!)
+;; ---------------------------------------------------------------------------
+
+(defn spawn-worker!
+  "Register (idempotently) a mount-scoped background-worker subview keyed by
+   `sid`.  On first registration spawns a virtual thread that runs
+   `worker-fn` with `*request*` rebound to this tab's context, stores the
+   `Thread` as the subview `:resource`, and installs an `:unmount` that
+   interrupts it.
+
+   The worker runs *off* the render path on a fresh virtual thread, so:
+   - `Thread/startVirtualThread` does NOT convey Clojure dynamic bindings —
+     hence `*request*` is rebound manually (like the `action` macro) so
+     cursor reads/writes resolve to this tab;
+   - `*render-guard*` is therefore absent on the worker, so cursor writes
+     (the whole point of a worker) are permitted;
+   - `*state-overlay*` is absent too, so writes hit the live app-state.
+
+   Mount-scoped: it survives the per-render sweep and is torn down only on
+   page-view remount (navigation / handler redefinition) or tab disconnect,
+   at which point `:unmount` interrupts the thread.
+
+   Idempotent: a form-1 render body re-invokes `h/spawn!` on every render, so
+   only the first occurrence (when `sid` is absent) actually spawns; later
+   renders are a no-op."
+  [app-state* tab-id sid session-id router worker-fn]
+  (when-let [acc context/*registered-subview-ids*]
+    (swap! acc conj sid))
+  (when-not (get-subview app-state* tab-id sid)
+    (let [env    (get-in @app-state* [:tabs tab-id :env])
+          req    {:hyper/session-id session-id
+                  :hyper/tab-id     tab-id
+                  :hyper/app-state  app-state*
+                  :hyper/router     router
+                  :hyper/env        env}
+          thread (Thread/startVirtualThread
+                   (fn []
+                     (binding [context/*request* req]
+                       (try
+                         (worker-fn)
+                         (catch InterruptedException _ nil)
+                         (catch Throwable e
+                           (t/error! {:id :hyper.error/spawn-worker} e))))))]
+      (register-subview! app-state* tab-id sid
+                         {:scope    :mount
+                          :resource thread
+                          :unmount  (fn [^Thread t] (when t (.interrupt t)))})
+      sid)))
 
 (defn watched-sources
   "The distinct external sources watched via mount-scoped, full-render

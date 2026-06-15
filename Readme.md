@@ -1157,6 +1157,45 @@ Configure via `:render-guard` on `create-handler`:
 (h/create-handler #'routes :render-guard :error)
 ```
 
+### Background workers — `h/spawn!`
+
+When a view needs a long-lived background process — a poller, a queue
+consumer, a clock — call `h/spawn!`. It runs a zero-arg function once on a
+virtual thread that Hyper owns and **interrupts on unmount** (navigation away,
+a Var redefinition, or tab disconnect). A worker is fire-and-forget: it returns
+nothing useful and communicates by **writing state** (cursors), which drives the
+usual declarative re-render.
+
+```clojure
+(defn ticker-page [req]
+  (let [now* (h/tab-cursor :now)]
+    (fn []                                ;; setup — runs once per mount
+      (h/spawn!
+        (fn []
+          (loop []
+            (reset! now* (System/currentTimeMillis))
+            (Thread/sleep 1000)
+            (recur))))                    ;; interrupted on unmount
+      (fn [req] [:p "Now: " @now*]))))    ;; render — pure
+```
+
+The worker runs **off the render path**, so cursor writes are permitted (unlike
+a render body). `*request*` is rebound for the worker, so `tab-cursor`,
+`session-cursor`, `global-cursor`, and `env` work inside it exactly as in a
+handler. A loop should be interruptible — block on `Thread/sleep`, a
+`BlockingQueue`, etc. — so the unmount interrupt can unwind it; catch
+`InterruptedException` if you need to clean up on the way out.
+
+`spawn!` is **mount-scoped** and keyed by call order, so a form-1 body that
+calls it on every render still spawns exactly one worker. Prefer calling it from
+a [form-2](#form-2--setup-closure) setup closure, where "start this worker when
+the view mounts" reads clearly — and where it doesn't trip the [render purity
+guard](#the-render-purity-guard).
+
+> Reach for `spawn!` only when you genuinely need a long-lived loop or blocking
+> consumer tied to the view. For one-shot data loading with a placeholder,
+> prefer [`async`](#async--render-time-data-loading).
+
 ## Watches
 
 Under the hood, Hyper maintains a persistent SSE connection per tab. When state

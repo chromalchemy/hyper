@@ -131,6 +131,47 @@
       (subview/wire-subview! app-state* tab-id sid trigger-render! nil))
     nil))
 
+(defn spawn!
+  "Spawn a background virtual-thread worker bound to the current view's
+   lifecycle.  `worker-fn` is a zero-arg fn run once on a fresh virtual
+   thread; the framework owns the thread handle and **interrupts it on
+   unmount** (navigation away, route-handler redefinition, or tab
+   disconnect).  Returns nil — a worker is fire-and-forget and communicates
+   by writing state (cursors), which drives the usual declarative re-render.
+
+   The worker runs *off* the render path, so cursor writes are permitted
+   (unlike a render body).  `*request*` is rebound for the worker, so the
+   same `tab-cursor`/`session-cursor`/`global-cursor`/`env` calls work
+   inside it as in a handler.
+
+   Mount-scoped and keyed by call order (like `reactive`), so a form-1 body
+   that calls `spawn!` on every render still spawns exactly one worker.
+   Prefer calling it from a **form-2 setup closure** (runs once per mount),
+   where its intent — \"start this worker when the view mounts\" — is clearest:
+
+     (defn ticker-page [req]
+       (let [now* (h/tab-cursor :now)]
+         (fn []                              ;; setup — runs once per mount
+           (h/spawn!
+             (fn []
+               (loop []
+                 (reset! now* (System/currentTimeMillis))
+                 (Thread/sleep 1000)
+                 (recur))))                  ;; interrupted on unmount
+           (fn [req] [:p \"Now: \" @now*]))))  ;; render — pure
+
+   For background work, prefer modeling results as state the worker writes;
+   reach for `spawn!` only when you genuinely need a long-lived loop or
+   blocking consumer tied to the view.  For one-shot data loading with a
+   placeholder, prefer `async`."
+  [worker-fn]
+  (context/guard-effect! :spawn "h/spawn!")
+  (let [{:keys [session-id tab-id app-state* router]} (context/require-context! "spawn!")
+        idx                                           (if *action-idx* (swap! *action-idx* inc) 0)
+        sid                                           (str "s_" tab-id "_" idx)]
+    (subview/spawn-worker! app-state* tab-id sid session-id router worker-fn)
+    nil))
+
 (defn env
   "Get the request environment, or a specific key from it.
 
