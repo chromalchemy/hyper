@@ -5,8 +5,11 @@
    non-empty body — and rewrites the call into an analyzable `let` so
    clj-kondo's normal linting applies: the dep symbols resolve and count as
    used, and the body is linted in place with the surrounding lexical scope
-   (so a nested `reactive` and any closed-over locals analyze normally)."
-  (:require [clj-kondo.hooks-api :as api]))
+   (so a nested `reactive` and any closed-over locals analyze normally).
+
+   It also flags effects in the render body (see hooks.hyper.lint)."
+  (:require [clj-kondo.hooks-api :as api]
+            [hooks.hyper.lint :as lint]))
 
 (defn- finding!
   [node level message type]
@@ -28,6 +31,7 @@
       (finding! node :error
                 "h/reactive requires a body"
                 :hyper.reactive/missing-body))
+    (lint/check-render-effects! body)
     (let [new-node (api/list-node
                     (list*
                      (api/token-node 'let)

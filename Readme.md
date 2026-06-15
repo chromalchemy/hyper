@@ -1464,6 +1464,15 @@ status set** (`:loading`, `:ready`, `:error`, `:reloading`) — a `case` branch 
     :done   ...))           ;; ⚠ :done is outside async's status set
 ```
 
+It also scans the render body for effects — `h/watch!`, `h/spawn!`, and state
+mutations (`swap!`/`reset!`) — and warns when one appears in render flow,
+pointing them at a form-2 setup closure or an action. The `reactive` hook shares
+this scan. Mutations inside `action`/`expr` (event and client contexts) and the
+`async` fetch (which runs on a worker thread) are render-legal and pass; this
+edit-time check complements the runtime [render purity
+guard](#the-render-purity-guard), which covers every render body, including page
+handlers the linter cannot identify statically.
+
 ## Client Components (Web Components)
 
 Most hyper UIs need no client-side code at all — but some islands genuinely

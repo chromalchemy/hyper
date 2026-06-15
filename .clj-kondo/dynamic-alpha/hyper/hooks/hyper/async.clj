@@ -17,7 +17,8 @@
       local, or `(= status :kw)`, that tests a keyword h/async never produces
       (the only statuses are :loading, :ready, :error, :reloading)."
   (:require [clj-kondo.hooks-api :as api]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [hooks.hyper.lint :as lint]))
 
 (def ^:private valid-statuses #{:loading :ready :error :reloading})
 
@@ -70,6 +71,8 @@
                      kw " (statuses are "
                      (str/join ", " (sort valid-statuses)) ")")
                 :hyper.async/impossible-status))))
+
+;; (render-body purity scanning lives in hooks.hyper.lint)
 
 (defn- check-case-test!
   "A `case` test value is a keyword, or a list of keywords for multiple matches."
@@ -140,6 +143,9 @@
 
     ;; --- impossible-status detection ---
     (check-status-comparisons! (status-local binding) render-body)
+
+    ;; --- render-body purity (the fetch runs off-render, so it is not scanned) ---
+    (lint/check-render-effects! render-body)
 
     ;; --- analyzable rewrite ---
     (let [new-node (api/list-node
