@@ -136,13 +136,12 @@
    lifecycle.  `worker-fn` is a zero-arg fn run once on a fresh virtual
    thread; the framework owns the thread handle and **interrupts it on
    unmount** (navigation away, route-handler redefinition, or tab
-   disconnect).  Returns nil — a worker is fire-and-forget and communicates
-   by writing state (cursors), which drives the usual declarative re-render.
+   disconnect).  Returns nil; a worker is fire-and-forget and communicates by
+   writing state (cursors), which drives the usual declarative re-render.
 
-   The worker runs *off* the render path, so cursor writes are permitted
-   (unlike a render body).  `*request*` is rebound for the worker, so the
-   same `tab-cursor`/`session-cursor`/`global-cursor`/`env` calls work
-   inside it as in a handler.
+   The worker runs on its own thread with `*request*` rebound, so cursor writes
+   land and the same `tab-cursor`/`session-cursor`/`global-cursor`/`env` calls
+   work inside it as in a handler.
 
    Mount-scoped and keyed by call order (like `reactive`), so a form-1 body
    that calls `spawn!` on every render still spawns exactly one worker.
@@ -298,6 +297,67 @@
          deps#                                     ~deps
          render-fn#                                (fn [] ~@body)]
      (reactive/render-component app-state*# tab-id# component-id# deps# render-fn#)))
+
+(defmacro async
+  "Render-time data loading with a placeholder.  Spawns the `fetch` on a
+   background virtual thread, renders a placeholder immediately, and re-renders
+   *just this region* when the value lands — no manual loading-state plumbing.
+
+   Shape (a sibling of `reactive`):
+
+     (h/async [deps] fetch-expr binding & render-body)
+
+   - `deps`        a vector of Watchable sources (like `reactive`).  `[]` means
+                   fetch once per mount; otherwise a change to a dep refetches
+                   (stale-while-revalidate — see `:reloading` below).
+   - `fetch-expr`  a single expression evaluated on a background worker thread
+                   while the placeholder renders (wrap multiple forms in `do`).
+                   Blocking I/O is fine (it is a virtual thread).
+   - `binding`     a destructuring form bound to the status map.
+   - `render-body` hiccup rendered from the status; must return a single rooted
+                   element (as with `reactive`) so the region id can be injected.
+
+   The status map is `{:status :result :error}` where `:status` is one of:
+   - `:loading`   — first load in flight; `:result` is nil.
+   - `:ready`     — `:result` holds the fetched value (a nil result is
+                    `{:status :ready :result nil}`).
+   - `:error`     — `:error` holds the throwable; `:result` keeps the prior
+                    value (if any) so you can show stale data with an error.
+   - `:reloading` — a dep changed and a refetch is in flight; `:result` still
+                    holds the previous value (stale-while-revalidate).
+
+   Example:
+
+     (defn rows-page [req]
+       (let [user-id* (h/path-cursor :user 0)]
+         (h/async [user-id*]
+           (db/fetch-rows @user-id*)
+           {:keys [status result error]}
+           (case status
+             :ready     (render-rows result)
+             :error     [:p \"Failed: \" (ex-message error)]
+             :reloading [:div.stale (render-rows result)]
+             [:p \"Loading…\"]))))
+
+   `async` is a *declaration*: rendering it registers a region and starts the
+   fetch on a worker thread, so it belongs in the render body like `reactive`.
+   The region is torn down (and any in-flight fetch interrupted) when it
+   disappears from the view tree, on navigation, or on tab disconnect.
+
+   Prefer `async` for leaf / region-local data that wants its own loading state
+   co-located with its render.  For page-level data you want before first paint
+   or shared across regions, load it in a form-2 setup closure into a cursor."
+  [deps fetch-expr binding & render-body]
+  `(let [{tab-id#     :tab-id
+          app-state*# :app-state*
+          session-id# :session-id
+          router#     :router}    (context/require-context! "async")
+         idx#                     (if context/*action-idx* (swap! context/*action-idx* inc) 0)
+         component-id#            (str "async_" tab-id# "_" idx#)]
+     (subview/render-async! app-state*# tab-id# session-id# router# component-id#
+                            ~deps
+                            (fn [] ~fetch-expr)
+                            (fn [~binding] ~@render-body))))
 
 ;; ---------------------------------------------------------------------------
 ;; View lifecycle (form-3)

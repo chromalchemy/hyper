@@ -1,6 +1,7 @@
 {:hooks
  {:analyze-call {hyper.component/defc hooks.hyper.component/defc
-                 hyper.core/defc      hooks.hyper.component/defc}}
+                 hyper.core/defc      hooks.hyper.component/defc
+                 hyper.core/async     hooks.hyper.async/async}}
 
  :config-in-call
  {hyper.component/defc

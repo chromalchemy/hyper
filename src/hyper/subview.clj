@@ -281,13 +281,13 @@
    `Thread` as the subview `:resource`, and installs an `:unmount` that
    interrupts it.
 
-   The worker runs *off* the render path on a fresh virtual thread, so:
-   - `Thread/startVirtualThread` does NOT convey Clojure dynamic bindings —
-     hence `*request*` is rebound manually (like the `action` macro) so
-     cursor reads/writes resolve to this tab;
-   - `*render-guard*` is therefore absent on the worker, so cursor writes
-     (the whole point of a worker) are permitted;
-   - `*state-overlay*` is absent too, so writes hit the live app-state.
+   The worker runs on a fresh virtual thread, which starts with its own
+   thread-locals, so:
+   - `*request*` is rebound explicitly (like the `action` macro) so cursor
+     reads/writes resolve to this tab;
+   - the render guard sees a clean thread, so the worker may write cursors
+     freely (the whole point of a worker);
+   - cursor writes hit the live app-state directly.
 
    Mount-scoped: it survives the per-render sweep and is torn down only on
    page-view remount (navigation / handler redefinition) or tab disconnect,
@@ -319,6 +319,129 @@
                           :resource thread
                           :unmount  (fn [^Thread t] (when t (.interrupt t)))})
       sid)))
+
+;; ---------------------------------------------------------------------------
+;; Async render-time data loading (h/async)
+;; ---------------------------------------------------------------------------
+;;
+;; `h/async` is a render-time data loader = a `spawn!`-style worker + a backing
+;; status *cell* (a plain atom) + a `reactive` region that depends on the cell.
+;;
+;; Coordination state lives at [:tabs id :async component-id]:
+;;   {:cell <atom {:status ... :result ... :error ...}>
+;;    :dep-vals <snapshot of user deps>
+;;    :thread   <the in-flight fetch VirtualThread, or nil>}
+;;
+;; The watched re-render paths are :data/:route/:signals/:global (see
+;; hyper.watch/setup-watchers!); the `:async` store lives outside them, so
+;; writing it during a render is invisible to the re-render trigger — like the
+;; :subviews store.  The cell itself is watched (a dep of the region subview),
+;; so a worker writing it drives a targeted partial re-render.
+
+(defn- start-async-fetch!
+  "Spawn a `*request*`-rebound virtual thread that runs `fetch-fn` and writes
+   the outcome into `cell` ({:status :ready :result v} on success;
+   {:status :error :error e :result <prior>} on failure — prior result is kept
+   so a UI can show stale data alongside an error).  An interrupt (supersede /
+   teardown) leaves the cell untouched: the new fetch or teardown owns it.
+   Records the thread in the async store so a later refetch/teardown can
+   interrupt it."
+  [app-state* tab-id session-id router store-path cell fetch-fn]
+  (let [env    (get-in @app-state* [:tabs tab-id :env])
+        req    {:hyper/session-id session-id
+                :hyper/tab-id     tab-id
+                :hyper/app-state  app-state*
+                :hyper/router     router
+                :hyper/env        env}
+        thread (Thread/startVirtualThread
+                 (fn []
+                   (binding [context/*request* req]
+                     (try
+                       (let [v (fetch-fn)]
+                         (reset! cell {:status :ready :result v}))
+                       (catch InterruptedException _ nil)
+                       (catch Throwable e
+                         (swap! cell (fn [s] {:status :error :error e :result (:result s)}))
+                         (t/error! {:id :hyper.error/async-fetch} e))))))]
+    (swap! app-state* assoc-in (conj (vec store-path) :thread) thread)))
+
+(defn- coordinate-async!
+  "Ensure the async coordination store at `store-path` is current for this
+   render and return the status `cell`.
+
+   - First sighting: create the cell ({:status :loading}), snapshot deps, and
+     spawn the fetch.
+   - User deps changed since last render: stale-while-revalidate — mark the
+     cell {:status :reloading :result <prior>}, interrupt the in-flight fetch,
+     re-snapshot deps, and spawn a fresh fetch.
+   - Otherwise: reuse the existing cell (no refetch)."
+  [app-state* tab-id session-id router store-path user-deps fetch-fn]
+  (let [existing (get-in @app-state* store-path)
+        cur-vals (mapv deref user-deps)]
+    (cond
+      (nil? existing)
+      (let [cell (atom {:status :loading})]
+        (swap! app-state* assoc-in store-path {:cell cell :dep-vals cur-vals :thread nil})
+        (start-async-fetch! app-state* tab-id session-id router store-path cell fetch-fn)
+        cell)
+
+      (not= cur-vals (:dep-vals existing))
+      (let [cell (:cell existing)]
+        (swap! cell (fn [s] {:status :reloading :result (:result s)}))
+        (when-let [^Thread old (:thread existing)] (.interrupt old))
+        (swap! app-state* assoc-in store-path (assoc existing :dep-vals cur-vals))
+        (start-async-fetch! app-state* tab-id session-id router store-path cell fetch-fn)
+        cell)
+
+      :else
+      (:cell existing))))
+
+(defn render-async!
+  "Render an `h/async` region during a full page render.
+
+   Coordinates the backing fetch (see `coordinate-async!`), renders the body
+   via `(render-fn @cell)` where `@cell` is the status map
+   `{:status :loading|:reloading|:ready|:error :result … :error …}`, injects
+   the component id for targeted partial fragments, caches the HTML, and
+   registers a render-scoped, partial-on-change subview whose deps are
+   `[cell & user-deps]`:
+
+   - a write to `cell` (the worker finishing) re-renders only this region;
+   - a change to a user dep re-runs the body, whose coordination step detects
+     the change and refetches (stale-while-revalidate).
+
+   `:unmount` (run when the region is swept — it disappeared from the view
+   tree — or on disconnect) interrupts any in-flight fetch and drops the
+   coordination store.  The render body must return a single rooted hiccup
+   element (as with `reactive`), so the id can be injected.  Returns the
+   hiccup."
+  [app-state* tab-id session-id router component-id user-deps fetch-fn render-fn]
+  (let [store-path       [:tabs tab-id :async component-id]
+        cell             (coordinate-async! app-state* tab-id session-id router
+                                            store-path user-deps fetch-fn)
+        deps             (into [cell] user-deps)
+        body             (render-fn @cell)
+        [html-id hiccup] (inject-id body component-id)
+        html             (c/html hiccup)
+        ;; The stored render-fn re-coordinates (so a partial re-render from a
+        ;; user-dep change still refetches) then renders the current status.
+        thunk            (fn []
+                           (let [cell (coordinate-async! app-state* tab-id session-id router
+                                                         store-path user-deps fetch-fn)]
+                             (render-fn @cell)))]
+    (register-subview! app-state* tab-id component-id
+                       {:render-fn   thunk
+                        :deps        deps
+                        :dep-vals    (mapv deref deps)
+                        :cached-html html
+                        :html-id     html-id
+                        :on-change   :partial
+                        :scope       :render
+                        :unmount     (fn [_]
+                                       (let [{:keys [^Thread thread]} (get-in @app-state* store-path)]
+                                         (when thread (.interrupt thread)))
+                                       (swap! app-state* update-in [:tabs tab-id :async] dissoc component-id))})
+    hiccup))
 
 (defn watched-sources
   "The distinct external sources watched via mount-scoped, full-render

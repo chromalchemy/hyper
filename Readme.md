@@ -1162,9 +1162,9 @@ Configure via `:render-guard` on `create-handler`:
 When a view needs a long-lived background process — a poller, a queue
 consumer, a clock — call `h/spawn!`. It runs a zero-arg function once on a
 virtual thread that Hyper owns and **interrupts on unmount** (navigation away,
-a Var redefinition, or tab disconnect). A worker is fire-and-forget: it returns
-nothing useful and communicates by **writing state** (cursors), which drives the
-usual declarative re-render.
+a Var redefinition, or tab disconnect). A worker is fire-and-forget — it
+communicates by **writing state** (cursors), which drives the usual declarative
+re-render.
 
 ```clojure
 (defn ticker-page [req]
@@ -1179,18 +1179,16 @@ usual declarative re-render.
       (fn [req] [:p "Now: " @now*]))))    ;; render — pure
 ```
 
-The worker runs **off the render path**, so cursor writes are permitted (unlike
-a render body). `*request*` is rebound for the worker, so `tab-cursor`,
+The worker runs on its own thread with `*request*` bound, so `tab-cursor`,
 `session-cursor`, `global-cursor`, and `env` work inside it exactly as in a
-handler. A loop should be interruptible — block on `Thread/sleep`, a
-`BlockingQueue`, etc. — so the unmount interrupt can unwind it; catch
-`InterruptedException` if you need to clean up on the way out.
+handler, and it may write cursors freely. Keep the loop interruptible — block on
+`Thread/sleep`, a `BlockingQueue`, etc. — so the unmount interrupt unwinds it;
+catch `InterruptedException` to clean up on the way out.
 
 `spawn!` is **mount-scoped** and keyed by call order, so a form-1 body that
-calls it on every render still spawns exactly one worker. Prefer calling it from
-a [form-2](#form-2--setup-closure) setup closure, where "start this worker when
-the view mounts" reads clearly — and where it doesn't trip the [render purity
-guard](#the-render-purity-guard).
+calls it on every render spawns exactly one worker. A
+[form-2](#form-2--setup-closure) setup closure is its natural home — "start this
+worker when the view mounts" — keeping the render body a pure function of state.
 
 > Reach for `spawn!` only when you genuinely need a long-lived loop or blocking
 > consumer tied to the view. For one-shot data loading with a placeholder,
@@ -1384,6 +1382,86 @@ into functions:
     [:div
      [:h1 "Dashboard"]
      (live-clock clock*)]))
+```
+
+## `async` — render-time data loading
+
+`async` loads data in the background and renders a placeholder until it lands —
+then re-renders **just that region** with the result. It's the ergonomic pairing
+of a [`spawn!`](#background-workers--hspawn) worker, a backing status value, and
+a [`reactive`](#reactive-components) region, with no manual loading-state plumbing.
+
+```clojure
+(defn rows-page [req]
+  (let [user-id* (h/path-cursor :user 0)]
+    (h/async [user-id*]
+      (db/fetch-rows @user-id*)                ;; runs off-render on a worker thread
+      {:keys [status result error]}
+      (case status
+        :ready     (render-rows result)
+        :error     [:p "Failed: " (ex-message error)]
+        :reloading [:div.stale (render-rows result)]
+        [:p "Loading…"]))))
+```
+
+`async` reads its deps inline and returns hiccup, so it sits directly in the
+render body wherever the data is shown.
+
+The shape is a sibling of `reactive`:
+
+```
+(h/async [deps] fetch-expr binding & render-body)
+```
+
+- **`deps`** — a vector of `Watchable` sources. `[]` fetches once per mount;
+  otherwise a change to a dep refetches (see `:reloading`).
+- **`fetch-expr`** — a single expression evaluated on a background virtual
+  thread while the placeholder renders (wrap multiple forms in `do`). Blocking
+  I/O is fine — it's a virtual thread.
+- **`binding`** — destructures the status map.
+- **`render-body`** — hiccup rendered from the status; must return a single
+  rooted element (as with `reactive`), so the region id can be injected.
+
+### The status map
+
+`async` hands your body a map `{:status :result :error}`:
+
+| `:status`    | meaning                                                              |
+|--------------|---------------------------------------------------------------------|
+| `:loading`   | first load in flight; `:result` is nil                              |
+| `:ready`     | `:result` holds the value; a nil result is `{:status :ready :result nil}` |
+| `:error`     | `:error` holds the throwable; `:result` keeps the prior value       |
+| `:reloading` | a dep changed and a refetch is in flight; `:result` still holds the previous value (stale-while-revalidate) |
+
+### Lifecycle and purity
+
+`async` is a *declaration*: rendering it registers a region and starts the fetch
+on a worker thread, so it belongs in the render body just as
+[`reactive`](#reactive-components) does — see the [render purity
+guard](#the-render-purity-guard). The placeholder→result transition is a state
+change driving a targeted re-render. The region is torn down — and any in-flight
+fetch interrupted — when it leaves the view tree, on navigation, or on tab
+disconnect.
+
+> Prefer `async` for **leaf / region-local** data that wants its own loading
+> state co-located with its render. For **page-level** data you want before
+> first paint or shared across regions, load it in a form-2 setup closure into a
+> cursor instead.
+
+### Lint support
+
+A clj-kondo hook validates `async` at edit time: it checks the call shape
+(deps vector, a fetch expression, a binding form, a non-empty render body),
+makes the destructured `status`/`result`/`error` bindings visible to normal
+linting (including unused-binding), and **flags `:status` branches outside the
+status set** (`:loading`, `:ready`, `:error`, `:reloading`) — a `case` branch or
+`(= status …)` testing any other keyword:
+
+```clojure
+(h/async [] (fetch) {:keys [status]}
+  (case status
+    :ready  (render result)
+    :done   ...))           ;; ⚠ :done is outside async's status set
 ```
 
 ## Client Components (Web Components)
