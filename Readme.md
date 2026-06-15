@@ -127,6 +127,11 @@ The optional second argument sets a default value when the key is nil.
 | `tab-cursor` | No | No | No (in-memory) |
 | `path-cursor` | No | No | ✅ (URL query params) |
 
+`tab-cursor` state is in-memory and does not survive a full page reload, but it
+**does** survive a transient connection drop: a brief disconnect detaches the tab
+and a reconnect within the grace window restores it untouched. See
+[Reconnection and the disconnect grace window](#reconnection-and-the-disconnect-grace-window).
+
 Mutating any cursor triggers a re-render for every tab that depends on that
 scope — global changes re-render all tabs, session changes re-render tabs in
 that session, and so on.
@@ -1220,8 +1225,10 @@ and pushes an update to the client. `watch!` is an *effect*, so it belongs in a
             [:li (:name r)])]]))
 ```
 
-Watches are reference-counted and automatically cleaned up when the tab
-disconnects or navigates away.
+Watches are reference-counted and automatically cleaned up when the tab is torn
+down (navigation away, or a disconnect that is not reconnected within the
+[grace window](#reconnection-and-the-disconnect-grace-window)). A transient
+disconnect leaves watches in place, so a reconnect does not re-run their setup.
 
 > Calling `watch!` directly in a form-1 render body still works (it is
 > idempotent), but trips the [render purity guard](#the-render-purity-guard) —
@@ -1850,6 +1857,49 @@ tab is hidden and reopening it when visible — pass `:open-when-hidden? false`:
 Hyper's built-in `/hyper/events` endpoint automatically sends SSE-friendly
 headers, including `Cache-Control: no-cache, no-transform` and
 `X-Accel-Buffering: no`, to improve compatibility with reverse proxies.
+
+### Reconnection and the disconnect grace window
+
+Real connections drop: wifi blips, cellular handoffs, proxy idle timeouts, a
+laptop going to sleep, or a hidden tab under `:open-when-hidden? false`. When the
+SSE connection drops, Hyper does **not** immediately tear the tab down. Instead it
+*detaches* — it stops the renderer and closes the channel, but keeps the tab's
+state alive for a grace window:
+
+- **tab-cursor state** and **signals** are preserved
+- **watches**, **reactive components**, and **form-3 resources** stay mounted
+  (no `:unmount`/re-`:mount` churn — your DB cursors and connections are not
+  reopened)
+- **`spawn!` background workers** keep running (they are not interrupted)
+
+Datastar reconnects automatically to the same tab, and Hyper **re-attaches** a
+fresh renderer to the still-living tab. The reconnect is reconciled with a single
+full render, so the DOM catches up to current state in one step — there is no
+missed-event replay to worry about, because every render is a complete snapshot.
+
+The practical effect: a transient disconnect is **invisible**. The user keeps
+their unsaved form input, the open modal, the running upload; nothing flickers or
+resets.
+
+Only if the tab fails to reconnect within the grace window is it fully torn down
+(watches removed, `form-3`/`watch!` resources disposed, workers interrupted, state
+dropped) — exactly the old behavior, just deferred.
+
+Configure the window with `:disconnect-grace-ms` (default **180000**, i.e. 3
+minutes):
+
+```clojure
+(def handler
+  (h/create-handler
+    #'routes
+    :disconnect-grace-ms (* 5 60 1000)))   ;; keep detached tabs for 5 minutes
+```
+
+A shorter window frees server resources sooner after a tab is truly gone; a longer
+window tolerates longer outages before resetting. Note that this covers
+*transient disconnects* of a still-loaded page — a full page **reload** still
+starts a fresh tab (as the [cursor table](#cursors) describes), and `tab-cursor`
+state is in-memory, so it does not survive a server restart.
 
 ## Brotli compression
 

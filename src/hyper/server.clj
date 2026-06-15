@@ -52,6 +52,44 @@
   "Minimum interval between renders for a single tab (~60fps)."
   16)
 
+(def ^:private default-disconnect-grace-ms
+  "How long a tab's state, subviews, watchers, and background workers are kept
+   alive after its SSE connection drops, so a reconnect within the window
+   re-attaches a fresh renderer instead of rebuilding from scratch.  Default
+   3 minutes."
+  (* 3 60 1000))
+
+;; ---------------------------------------------------------------------------
+;; Stable per-tab render triggers
+;; ---------------------------------------------------------------------------
+;;
+;; Watchers (the app-state watcher) and subview watches capture a render
+;; trigger when they are installed.  To survive a reconnect — where the old
+;; renderer (and its render queue) is replaced by a new one — these triggers
+;; must NOT close over a specific queue.  Instead they indirect through
+;; app-state to the *current* renderer's queue, so a watch installed during
+;; one connection drives whatever renderer is attached now.  When no renderer
+;; is attached (during the disconnect grace window) the trigger is a no-op;
+;; accumulated state is reflected by the full render the next renderer runs on
+;; re-attach.
+
+(defn- tab-trigger-render!
+  "A stable zero-arg full-render trigger for a tab: enqueues onto whichever
+   renderer is currently attached, or no-ops when detached."
+  [app-state* tab-id]
+  (fn []
+    (when-let [q (get-in @app-state* [:tabs tab-id :renderer :render-queue])]
+      (rq/enqueue-full-render! q))))
+
+(defn- tab-trigger-partial!
+  "A stable one-arg partial-render trigger for a tab: enqueues a targeted
+   re-render for `component-id` onto the currently attached renderer, or
+   no-ops when detached."
+  [app-state* tab-id]
+  (fn [component-id]
+    (when-let [q (get-in @app-state* [:tabs tab-id :renderer :render-queue])]
+      (rq/enqueue-partial! q component-id))))
+
 (defn- send-sse!
   "Compress (when br-stream is non-nil) and send an SSE payload over the channel.
    Returns true when sent, false when the channel is closed."
@@ -170,8 +208,11 @@
                            compress? (assoc "Content-Encoding" "br"))
         throttle-ms      (long (or (get @app-state* :render-throttle-ms)
                                    default-render-throttle-ms))
-        enqueue-partial! #(rq/enqueue-partial! render-queue %)
-        trigger-render!  #(rq/enqueue-full-render! render-queue)]
+        ;; Stable triggers (indirect through app-state) so subview watches
+        ;; wired during this connection keep driving the renderer that is
+        ;; attached after a reconnect.
+        enqueue-partial! (tab-trigger-partial! app-state* tab-id)
+        trigger-render!  (tab-trigger-render! app-state* tab-id)]
     (try
       ;; Send the connected event as the initial SSE response (headers + body).
       (let [connected-msg (render/format-connected-event tab-id)
@@ -231,34 +272,44 @@
                  :msg   "Tab renderer closed"})))))
 
 (defn- -start-renderer!
-  "Start a per-tab renderer on a virtual thread.
+  "Start a per-tab renderer on a virtual thread and store its handle under
+   `[:tabs tab-id :renderer]` BEFORE the loop runs, so the stable render
+   triggers can resolve its queue immediately.
 
-   Returns a map with:
-   - :trigger-render!  — zero-arg fn; call to signal a full re-render
-   - :trigger-partial! — one-arg fn; call with component-id for partial re-render
-   - :enqueue-scripts! — one-arg fn; call with seq of JS strings to execute
-   - :stop!            — zero-arg fn; enqueues a :shutdown event to stop the renderer
-   - :render-queue     — the underlying LinkedBlockingQueue (for testing)"
-  [app-state* session-id tab-id channel compress?]
-  (let [render-queue     (rq/make-queue)
-        trigger-render!  #(rq/enqueue-full-render! render-queue)
-        trigger-partial! #(rq/enqueue-partial! render-queue %)
-        enqueue-scripts! #(rq/enqueue-scripts! render-queue %)
-        stop!            #(rq/enqueue-shutdown! render-queue)
-        thread           (-> (Thread/ofVirtual)
-                             (.name (str "hyper-renderer-" tab-id))
-                             (.start ^Runnable
-                               #(-renderer-loop! app-state* session-id tab-id
-                                                 channel compress?
-                                                 render-queue)))]
-    ;; Enqueue the initial full render to kick things off
-    (rq/enqueue-full-render! render-queue)
-    {:trigger-render!  trigger-render!
-     :trigger-partial! trigger-partial!
-     :enqueue-scripts! enqueue-scripts!
-     :stop!            stop!
-     :thread           thread
-     :render-queue     render-queue}))
+   `conn-id` uniquely identifies this SSE connection; `:on-close` uses it to
+   tell a genuine disconnect apart from a stale half-open connection that a
+   newer one has already replaced.
+
+   The renderer handle is a map with:
+   - :trigger-render!  — stable zero-arg fn; signal a full re-render
+   - :trigger-partial! — stable one-arg fn; component-id for partial re-render
+   - :enqueue-scripts! — one-arg fn; seq of JS strings to execute
+   - :stop!            — zero-arg fn; enqueues a :shutdown event to stop the loop
+   - :render-queue     — the underlying LinkedBlockingQueue
+   - :conn-id          — this connection's identity
+   - :thread           — the renderer virtual thread"
+  [app-state* session-id tab-id channel compress? conn-id]
+  (let [render-queue (rq/make-queue)
+        renderer     {:trigger-render!  (tab-trigger-render! app-state* tab-id)
+                      :trigger-partial! (tab-trigger-partial! app-state* tab-id)
+                      :enqueue-scripts! #(rq/enqueue-scripts! render-queue %)
+                      :stop!            #(rq/enqueue-shutdown! render-queue)
+                      :render-queue     render-queue
+                      :conn-id          conn-id}]
+    ;; Publish the renderer (with its queue) before starting the loop so the
+    ;; stable triggers and the loop's own setup-new-watches! wiring resolve it.
+    (swap! app-state* assoc-in [:tabs tab-id :renderer] renderer)
+    (let [thread   (-> (Thread/ofVirtual)
+                       (.name (str "hyper-renderer-" tab-id))
+                       (.start ^Runnable
+                         #(-renderer-loop! app-state* session-id tab-id
+                                           channel compress?
+                                           render-queue)))
+          renderer (assoc renderer :thread thread)]
+      ;; Enqueue the initial full render to kick things off
+      (rq/enqueue-full-render! render-queue)
+      (swap! app-state* assoc-in [:tabs tab-id :renderer] renderer)
+      renderer)))
 
 (defn wrap-hyper-context
   "Middleware that adds session-id and tab-id to the request."
@@ -310,6 +361,72 @@
   (state/cleanup-tab! app-state* tab-id)
   nil)
 
+(defn detach-tab!
+  "Disconnect a tab's renderer/channel while preserving everything else.
+
+   Called when an SSE connection drops.  Unlike `cleanup-tab!`, this is a
+   *graceful* disconnect: the renderer loop is stopped (its channel is closed)
+   but the tab's cursor state, signals, subviews, watchers, and background
+   workers are left intact so a reconnect within the grace window can
+   re-attach a fresh renderer.  A `:disconnected-at` timestamp arms the reaper.
+
+   No-op when the tab no longer exists."
+  [app-state* tab-id]
+  (when (contains? (:tabs @app-state*) tab-id)
+    (when-let [stop! (get-in @app-state* [:tabs tab-id :renderer :stop!])]
+      (stop!))
+    (swap! app-state* (fn [state]
+                        (-> state
+                            (update-in [:tabs tab-id] dissoc :renderer)
+                            (assoc-in [:tabs tab-id :disconnected-at]
+                                      (System/currentTimeMillis))))))
+  nil)
+
+(defn reap-disconnected-tabs!
+  "Fully tear down every tab whose disconnect grace window has elapsed.
+
+   A tab is eligible when it carries a `:disconnected-at` stamp older than the
+   configured `:disconnect-grace-ms` (default 3 minutes).  Reconnecting clears
+   the stamp, so a tab that came back is never reaped.  `now` is the current
+   epoch-millis (injectable for testing)."
+  [app-state* now]
+  (let [grace-ms (long (get @app-state* :disconnect-grace-ms
+                            default-disconnect-grace-ms))]
+    (doseq [[tab-id tab] (:tabs @app-state*)
+            :let         [disconnected-at (:disconnected-at tab)]
+            :when        (and disconnected-at
+                              (>= (- now disconnected-at) grace-ms))]
+      (t/log! {:level :info
+               :id    :hyper.event/tab-reap
+               :data  {:hyper/tab-id tab-id}
+               :msg   "Reaping disconnected tab after grace period"})
+      (cleanup-tab! app-state* tab-id))
+    nil))
+
+(defn- start-reaper!
+  "Start a background virtual thread that periodically reaps tabs whose
+   disconnect grace window has elapsed.  Returns a handle with a :stop! fn."
+  [app-state*]
+  (let [grace-ms (long (get @app-state* :disconnect-grace-ms
+                            default-disconnect-grace-ms))
+        interval (-> grace-ms (quot 4) (max 500) (min 30000))
+        running? (atom true)
+        thread   (Thread/startVirtualThread
+                   (fn []
+                     (while @running?
+                       (try
+                         (Thread/sleep (long interval))
+                         (reap-disconnected-tabs! app-state* (System/currentTimeMillis))
+                         (catch InterruptedException _
+                           (reset! running? false))
+                         (catch Throwable e
+                           (t/error! {:id  :hyper.error/reaper
+                                      :msg "Error reaping disconnected tabs"}
+                                     e))))))]
+    {:stop! (fn []
+              (reset! running? false)
+              (.interrupt ^Thread thread))}))
+
 (defn sse-events-handler
   "Handler for SSE event stream.
    Starts a per-tab renderer thread that owns the channel and optional
@@ -318,38 +435,70 @@
   (fn [req]
     (let [session-id (:hyper/session-id req)
           tab-id     (:hyper/tab-id req)
-          compress?  (br/accepts-br? req)]
+          compress?  (br/accepts-br? req)
+          ;; Identity for THIS SSE connection — shared by :on-open and
+          ;; :on-close so a stale half-open connection can't detach a tab
+          ;; whose renderer a newer connection already took over.
+          conn-id    (str (random-uuid))]
 
       (http-kit/as-channel req
                            {:on-open  (fn [channel]
-                                        (state/get-or-create-tab! app-state* session-id tab-id)
+                                        (let [;; A tab whose SSE watchers were already set up is a
+                                              ;; reconnect: its state/subviews/workers survived the
+                                              ;; disconnect grace window, so we only re-attach a
+                                              ;; renderer rather than rebuild reactivity.
+                                              reconnect? (boolean
+                                                           (get-in @app-state* [:tabs tab-id :connection-initialized?]))]
+                                          (state/get-or-create-tab! app-state* session-id tab-id)
+                                          ;; Take over from any stale/half-open renderer still
+                                          ;; attached (a new connection opened before the old one's
+                                          ;; :on-close fired).
+                                          (when-let [stop! (get-in @app-state* [:tabs tab-id :renderer :stop!])]
+                                            (stop!))
 
-                                        ;; Start the renderer — it sends the connected event
-                                        ;; and then blocks until triggered.
-                                        (let [{:keys [trigger-render!] :as renderer}
-                                              (-start-renderer! app-state* session-id tab-id
-                                                                channel compress?)]
-                                          (swap! app-state* assoc-in [:tabs tab-id :renderer] renderer)
+                                          ;; Start the renderer — it publishes itself under
+                                          ;; [:tabs tab-id :renderer], sends the connected event,
+                                          ;; and then blocks until triggered.
+                                          (let [{:keys [trigger-render!]}
+                                                (-start-renderer! app-state* session-id tab-id
+                                                                  channel compress? conn-id)]
+                                            ;; Clear any pending disconnect — we're attached again.
+                                            (swap! app-state* update-in [:tabs tab-id] dissoc :disconnected-at)
 
-                                          (watch/setup-watchers! app-state* session-id tab-id trigger-render!)
-                                          ;; Framework watches as :tab-scoped subviews — set up once
-                                          ;; at connect, survive navigation, torn down on disconnect:
-                                          ;; - routes/head Vars: re-defs trigger re-renders for all tabs
-                                          ;; - component registry: REPL redefinition hot-swaps the
-                                          ;;   client-components bundle over SSE (the head update carries
-                                          ;;   the new content-hashed script URL).
-                                          (let [{:keys [routes-source head]} @app-state*]
-                                            (doseq [source (conj (filterv var? [routes-source head])
-                                                                 component/registry*)]
-                                              (let [sid (subview/register-watch! app-state* tab-id source :tab)]
-                                                (subview/wire-subview! app-state* tab-id sid trigger-render! nil))))))
+                                            (if reconnect?
+                                              (t/log! {:level :info
+                                                       :id    :hyper.event/tab-reconnect
+                                                       :data  {:hyper/tab-id tab-id}
+                                                       :msg   "Tab reconnected within grace window"})
+                                              ;; First connection for this tab: wire reactivity once.
+                                              ;; Stable triggers (resolved from app-state) keep these
+                                              ;; watches driving whatever renderer is attached later.
+                                              (do
+                                                (swap! app-state* assoc-in [:tabs tab-id :connection-initialized?] true)
+                                                (watch/setup-watchers! app-state* session-id tab-id trigger-render!)
+                                                ;; Framework watches as :tab-scoped subviews — set up
+                                                ;; once at connect, survive navigation, torn down on
+                                                ;; full disconnect:
+                                                ;; - routes/head Vars: re-defs trigger re-renders for all tabs
+                                                ;; - component registry: REPL redefinition hot-swaps the
+                                                ;;   client-components bundle over SSE (the head update carries
+                                                ;;   the new content-hashed script URL).
+                                                (let [{:keys [routes-source head]} @app-state*]
+                                                  (doseq [source (conj (filterv var? [routes-source head])
+                                                                       component/registry*)]
+                                                    (let [sid (subview/register-watch! app-state* tab-id source :tab)]
+                                                      (subview/wire-subview! app-state* tab-id sid trigger-render! nil)))))))))
 
                             :on-close (fn [_channel _status]
-                                        (t/log! {:level :info
-                                                 :id    :hyper.event/tab-disconnect
-                                                 :data  {:hyper/tab-id tab-id}
-                                                 :msg   "Tab disconnected"})
-                                        (cleanup-tab! app-state* tab-id))}))))
+                                        ;; Only the connection that is currently attached may detach
+                                        ;; the tab — a stale half-open connection whose renderer was
+                                        ;; already replaced by a newer one must not tear it down.
+                                        (when (= conn-id (get-in @app-state* [:tabs tab-id :renderer :conn-id]))
+                                          (t/log! {:level :info
+                                                   :id    :hyper.event/tab-disconnect
+                                                   :data  {:hyper/tab-id tab-id}
+                                                   :msg   "Tab disconnected — starting grace window"})
+                                          (detach-tab! app-state* tab-id)))}))))
 
 (defn- parse-client-query-params
   "Extract client params from URL query parameters, JSON-decoding each
@@ -817,15 +966,25 @@
                         up redefinitions.  Defaults to
                         `hyper.render.error/not-found`; pass `nil` to disable
                         and fall back to reitit's plain-text 404.
+   - :disconnect-grace-ms
+                        How long (ms) a tab's state, signals, subviews,
+                        watchers, and background workers are kept alive after
+                        its SSE connection drops.  A reconnect within this
+                        window seamlessly re-attaches a fresh renderer with no
+                        state loss and no mount/unmount churn; only after it
+                        elapses is the tab fully torn down.  Defaults to
+                        180000 (3 minutes).
 
    Routes should use :get handlers that return hiccup (Chassis vectors).
    Hyper will wrap them to provide full HTML responses and SSE connections."
   ([routes app-state*]
    (create-handler routes app-state* {:datastar-script (default-datastar-script)}))
-  ([routes app-state* {:keys [watches head base-path middleware render-middleware render-error not-found render-guard]
-                       :or   {render-error render.error/minimal
-                              not-found    render.error/not-found
-                              render-guard :warn}
+  ([routes app-state* {:keys [watches head base-path middleware render-middleware render-error not-found render-guard
+                              disconnect-grace-ms]
+                       :or   {render-error        render.error/minimal
+                              not-found           render.error/not-found
+                              render-guard        :warn
+                              disconnect-grace-ms default-disconnect-grace-ms}
                        :as   opts}]
    (let [base-path       (or base-path "")
          opts            (assoc opts :base-path base-path)
@@ -857,6 +1016,7 @@
                                 :render-error render-error
                                 :render-guard render-guard
                                 :not-found not-found
+                                :disconnect-grace-ms disconnect-grace-ms
                                 :squint-core-url (:squint-core-url opts))
          initial-routes  (if (var? routes) @routes routes)
          initial-handler (build-ring-handler initial-routes app-state* page-wrapper system-routes default-handler)
@@ -897,11 +1057,14 @@
 
 (defn- -do-stop
   "Stop the HTTP server and clean up all tab resources.
-   Tears down all watchers, renderer threads, SSE channels, and actions."
+   Tears down the reaper, all watchers, renderer threads, SSE channels, and actions."
   [server app-state*]
   (when server
     (server :timeout 100))
   (when app-state*
+    (when-let [reaper (:reaper @app-state*)]
+      ((:stop! reaper))
+      (swap! app-state* dissoc :reaper))
     (let [tab-ids (keys (:tabs @app-state*))]
       (doseq [tab-id tab-ids]
         (cleanup-tab! app-state* tab-id))
@@ -921,6 +1084,10 @@
   [handler {:keys [port] :or {port 3000}}]
   (let [server     (http-kit/run-server handler {:port port})
         app-state* (::app-state (meta handler))]
+    ;; Start the disconnect-grace reaper so tabs detached past their grace
+    ;; window are fully torn down.
+    (when app-state*
+      (swap! app-state* assoc :reaper (start-reaper! app-state*)))
     (t/log! {:level :info
              :id    :hyper.event/server-start
              :data  {:hyper/port port}
