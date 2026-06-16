@@ -503,3 +503,10 @@
             "Reading stashed env must not warn")
         (is (= {:db :test-db} @captured)
             "Stashed tab env should be propagated into the re-render request")))))
+
+(deftest test-format-heartbeat
+  (testing "heartbeat is an SSE comment line (ignored by conformant parsers)"
+    (let [hb (render/format-heartbeat)]
+      (is (string? hb))
+      (is (.startsWith hb ":") "SSE comment lines start with ':'")
+      (is (.endsWith hb "\n\n") "SSE messages end with a blank line"))))

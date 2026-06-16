@@ -1858,6 +1858,31 @@ Hyper's built-in `/hyper/events` endpoint automatically sends SSE-friendly
 headers, including `Cache-Control: no-cache, no-transform` and
 `X-Accel-Buffering: no`, to improve compatibility with reverse proxies.
 
+### Heartbeat keepalive
+
+An otherwise-idle SSE connection (no state changes for a while) sends a periodic
+keepalive — a tiny SSE comment line that every conformant parser, Datastar
+included, ignores. It does two jobs:
+
+- **Survives reverse-proxy idle timeouts.** Many proxies (nginx, load balancers,
+  CDNs) cull connections idle for ~30–60s. The keepalive keeps the stream warm so
+  a quiet page doesn't get disconnected and reconnected on a loop.
+- **Surfaces dead/half-open connections.** When a client vanishes without a clean
+  close (laptop sleep, NAT timeout), the server may not notice until it next tries
+  to write. The keepalive *is* that write — so a broken channel is detected and
+  closed, which starts the [grace window](#reconnection-and-the-disconnect-grace-window)
+  instead of leaving the tab pinned as "connected" indefinitely.
+
+The interval is configurable with `:heartbeat-ms` (default **25000**, i.e. 25s —
+comfortably under common proxy timeouts); pass `nil` or `0` to disable:
+
+```clojure
+(def handler
+  (h/create-handler
+    #'routes
+    :heartbeat-ms 15000))   ;; ping idle connections every 15s
+```
+
 ### Reconnection and the disconnect grace window
 
 Real connections drop: wifi blips, cellular handoffs, proxy idle timeouts, a

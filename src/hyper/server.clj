@@ -59,6 +59,13 @@
    3 minutes."
   (* 3 60 1000))
 
+(def ^:private default-heartbeat-ms
+  "How often an idle SSE connection emits a keepalive comment.  Kept under the
+   ~30-60s idle timeout common to reverse proxies so connections aren't culled
+   mid-stream; also surfaces dead/half-open channels on the next write.  Default
+   25 seconds."
+  25000)
+
 ;; ---------------------------------------------------------------------------
 ;; Stable per-tab render triggers
 ;; ---------------------------------------------------------------------------
@@ -208,6 +215,10 @@
                            compress? (assoc "Content-Encoding" "br"))
         throttle-ms      (long (or (get @app-state* :render-throttle-ms)
                                    default-render-throttle-ms))
+        ;; Heartbeat keepalive interval (ms).  nil / non-positive disables it,
+        ;; restoring the plain blocking drain.
+        heartbeat-ms     (let [hb (get @app-state* :heartbeat-ms default-heartbeat-ms)]
+                           (when (and hb (pos? (long hb))) (long hb)))
         ;; Stable triggers (indirect through app-state) so subview watches
         ;; wired during this connection keep driving the renderer that is
         ;; attached after a reconnect.
@@ -227,8 +238,23 @@
           ;; Main render loop — tracks the last-sent signal snapshot so
           ;; we only emit datastar-patch-signals for actual changes.
           (loop [last-sent-signals nil]
-            (let [{:keys [shutdown? full-render? dirty-ids scripts]} (rq/drain! render-queue)]
-              (when-not shutdown?
+            (let [{:keys [idle? shutdown? full-render? dirty-ids scripts]}
+                  (if heartbeat-ms
+                    (rq/drain! render-queue heartbeat-ms)
+                    (rq/drain! render-queue))]
+              (cond
+                shutdown? nil
+
+                ;; No events within the heartbeat window — send a keepalive.
+                ;; The write keeps idle connections warm through proxies and
+                ;; surfaces a dead/half-open channel (send-sse! returns false),
+                ;; which exits the loop -> on-close -> detach -> grace window.
+                idle?
+                (let [sent? (send-sse! channel br-out br-stream (render/format-heartbeat))]
+                  (when-not (false? sent?)
+                    (recur last-sent-signals)))
+
+                :else
                 (let [current-signals (get-in @app-state* [:tabs tab-id :signals])
                       sig-patches     (when (and current-signals
                                                  (not= current-signals last-sent-signals))
@@ -987,17 +1013,24 @@
                         state loss and no mount/unmount churn; only after it
                         elapses is the tab fully torn down.  Defaults to
                         180000 (3 minutes).
+   - :heartbeat-ms      How often (ms) an idle SSE connection emits a keepalive
+                        comment.  Keeps connections warm through reverse-proxy
+                        idle timeouts and surfaces dead/half-open channels on
+                        the next write (so the disconnect grace window can
+                        start).  Defaults to 25000 (25s); pass nil or 0 to
+                        disable.
 
    Routes should use :get handlers that return hiccup (Chassis vectors).
    Hyper will wrap them to provide full HTML responses and SSE connections."
   ([routes app-state*]
    (create-handler routes app-state* {:datastar-script (default-datastar-script)}))
   ([routes app-state* {:keys [watches head base-path middleware render-middleware render-error not-found render-guard
-                              disconnect-grace-ms]
+                              disconnect-grace-ms heartbeat-ms]
                        :or   {render-error        render.error/minimal
                               not-found           render.error/not-found
                               render-guard        :warn
-                              disconnect-grace-ms default-disconnect-grace-ms}
+                              disconnect-grace-ms default-disconnect-grace-ms
+                              heartbeat-ms        default-heartbeat-ms}
                        :as   opts}]
    (let [base-path       (or base-path "")
          opts            (assoc opts :base-path base-path)
@@ -1030,6 +1063,7 @@
                                 :render-guard render-guard
                                 :not-found not-found
                                 :disconnect-grace-ms disconnect-grace-ms
+                                :heartbeat-ms heartbeat-ms
                                 :open-when-hidden? (get opts :open-when-hidden? true)
                                 :squint-core-url (:squint-core-url opts))
          initial-routes  (if (var? routes) @routes routes)

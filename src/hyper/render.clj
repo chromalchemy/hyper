@@ -404,3 +404,12 @@
   [tab-id]
   (str "event: connected\n"
        "data: {\"tab-id\":\"" tab-id "\"}\n\n"))
+
+(defn format-heartbeat
+  "Format an SSE keepalive as a comment line.  Lines beginning with ':' are
+   comments per the SSE spec and are ignored by every conformant parser
+   (including Datastar), so this carries no payload — its only job is to keep
+   the stream warm through idle-timeout proxies and to surface a dead/half-open
+   channel the next time the renderer writes."
+  []
+  ": hb\n\n")

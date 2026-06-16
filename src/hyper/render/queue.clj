@@ -12,7 +12,7 @@
    This eliminates all shared mutable state between producer and consumer
    threads — the queue IS the coordination primitive."
   (:import [java.util ArrayList]
-           [java.util.concurrent LinkedBlockingQueue]))
+           [java.util.concurrent LinkedBlockingQueue TimeUnit]))
 
 ;; ---------------------------------------------------------------------------
 ;; Construction
@@ -56,6 +56,30 @@
 ;; Consumer API (blocking, single-consumer)
 ;; ---------------------------------------------------------------------------
 
+(defn- categorize
+  "Reduce a drained buffer of events into the categorized result map."
+  [^ArrayList buf]
+  (let [n (.size buf)]
+    (loop [i        0
+           shutdown false
+           full?    false
+           ids      (transient #{})
+           scripts  (transient [])]
+      (if (< i n)
+        (let [evt (.get buf i)]
+          (case (:type evt)
+            :shutdown    (recur (inc i) true     full? ids                              scripts)
+            :full-render (recur (inc i) shutdown true  ids                              scripts)
+            :partial     (recur (inc i) shutdown full? (conj! ids (:component-id evt))  scripts)
+            :script      (recur (inc i) shutdown full? ids                              (conj! scripts (:js evt)))
+            ;; Unknown event types are silently skipped
+            (recur (inc i) shutdown full? ids scripts)))
+        {:idle?        false
+         :shutdown?    shutdown
+         :full-render? full?
+         :dirty-ids    (persistent! ids)
+         :scripts      (persistent! scripts)}))))
+
 (defn drain!
   "Block until at least one event is available, then drain all pending events.
 
@@ -65,29 +89,26 @@
       :dirty-ids   #{...}    — set of component IDs needing partial render
       :scripts     [...]}    — vector of JS strings in FIFO order
 
+   When `timeout-ms` is given, blocks at most that long for the first event;
+   if none arrives the result is flagged `:idle? true` (used to drive the
+   heartbeat keepalive).  The blocking single-arity never returns `:idle?`.
+
    This is the only function that removes events from the queue.
    Designed for single-consumer use (the renderer fiber)."
-  [^LinkedBlockingQueue q]
-  (let [first-event (.take q)
-        buf         (ArrayList.)]
-    (.add buf first-event)
-    (.drainTo q buf)
-    (let [n (.size buf)]
-      (loop [i        0
-             shutdown false
-             full?    false
-             ids      (transient #{})
-             scripts  (transient [])]
-        (if (< i n)
-          (let [evt (.get buf i)]
-            (case (:type evt)
-              :shutdown    (recur (inc i) true     full? ids                              scripts)
-              :full-render (recur (inc i) shutdown true  ids                              scripts)
-              :partial     (recur (inc i) shutdown full? (conj! ids (:component-id evt))  scripts)
-              :script      (recur (inc i) shutdown full? ids                              (conj! scripts (:js evt)))
-              ;; Unknown event types are silently skipped
-              (recur (inc i) shutdown full? ids scripts)))
-          {:shutdown?    shutdown
-           :full-render? full?
-           :dirty-ids    (persistent! ids)
-           :scripts      (persistent! scripts)})))))
+  ([^LinkedBlockingQueue q]
+   (let [buf (ArrayList.)]
+     (.add buf (.take q))
+     (.drainTo q buf)
+     (categorize buf)))
+  ([^LinkedBlockingQueue q timeout-ms]
+   (let [first-event (.poll q (long timeout-ms) TimeUnit/MILLISECONDS)]
+     (if (nil? first-event)
+       {:idle?        true
+        :shutdown?    false
+        :full-render? false
+        :dirty-ids    #{}
+        :scripts      []}
+       (let [buf (ArrayList.)]
+         (.add buf first-event)
+         (.drainTo q buf)
+         (categorize buf))))))

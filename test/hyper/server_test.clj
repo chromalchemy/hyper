@@ -855,7 +855,7 @@
 
       (rendering app-state* session-id tab-id
                  (reset! (h/tab-cursor :n 0) 1))
-      (is (= {:full-render? true :shutdown? false :dirty-ids #{} :scripts []}
+      (is (= {:idle? false :full-render? true :shutdown? false :dirty-ids #{} :scripts []}
              (rq/drain! q1))
           "connection-1 queue received the render")
 
@@ -866,7 +866,7 @@
 
         (rendering app-state* session-id tab-id
                    (reset! (h/tab-cursor :n 1) 2))
-        (is (= {:full-render? true :shutdown? false :dirty-ids #{} :scripts []}
+        (is (= {:idle? false :full-render? true :shutdown? false :dirty-ids #{} :scripts []}
                (rq/drain! q2))
             "connection-2 queue received the render via the same watcher"))
       (watch/remove-watchers! app-state* tab-id))))
@@ -946,3 +946,48 @@
       (is (string/includes? body "data-signals:_hyper-connected__ifmissing"))
       (is (string/includes? body "data-on:datastar-fetch"))
       (is (string/includes? body "evt.detail.el === el")))))
+
+;; ===========================================================================
+;; Heartbeat keepalive
+;; ===========================================================================
+
+(deftest test-heartbeat-ms-option
+  (testing "defaults to 25s"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home :get (fn [_req] [:div "Home"])}]]
+          _handler   (server/create-handler routes app-state*)]
+      (is (= 25000 (:heartbeat-ms @app-state*)))))
+
+  (testing "honors an explicit interval"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home :get (fn [_req] [:div "Home"])}]]
+          _handler   (server/create-handler routes app-state* {:heartbeat-ms 5000})]
+      (is (= 5000 (:heartbeat-ms @app-state*)))))
+
+  (testing "nil disables it"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home :get (fn [_req] [:div "Home"])}]]
+          _handler   (server/create-handler routes app-state* {:heartbeat-ms nil})]
+      (is (nil? (:heartbeat-ms @app-state*))))))
+
+(deftest test-heartbeat-sent-when-idle
+  (testing "an idle renderer loop emits keepalive comments, and a closed
+            channel (send! -> false) exits the loop"
+    (let [app-state* (atom (assoc (state/init-state) :heartbeat-ms 20))
+          q          (rq/make-queue)
+          sends      (atom [])
+          done       (promise)]
+      (with-redefs [http-kit/send! (fn [_ch payload _close?]
+                                     (swap! sends conj payload)
+                                     true)]
+        (let [_fut (future
+                     (#'server/-renderer-loop! app-state* "s" "t" ::ch false q)
+                     (deliver done true))]
+          (Thread/sleep 120)
+          ;; stop the loop
+          (rq/enqueue-shutdown! q)
+          (is (true? (deref done 1000 :timeout)) "loop exited on shutdown")
+          ;; at least one heartbeat comment was sent (string payloads only;
+          ;; the first send is the connected-event response map)
+          (is (some #(and (string? %) (string/starts-with? % ":")) @sends)
+              "a keepalive comment was emitted while idle"))))))
