@@ -812,19 +812,30 @@
 (defn- components-js-handler
   "Serve the assembled client-components ES module bundle.
 
-   The bundle URL carries a content hash in its query string (see
-   hyper.component.bundle/head-script-tag), so the response is served with
-   immutable cache headers — a registry change rotates the URL rather
-   than invalidating this response."
+   The bundle URL carries the current content hash in its query string
+   (`?v=<hash>`, see hyper.component.bundle/head-script-tag), so a registry
+   change rotates the URL rather than invalidating a cached response.
+
+   This endpoint always serves the *current* bundle, so it only promises
+   `immutable` caching when the requested `?v=` matches the hash actually
+   being served.  Honouring `immutable` for a stale `?v=` would poison the
+   browser cache — it would store the new content under the old, immutable
+   URL forever, so a later URL reuse (e.g. reverting an edit) would serve
+   that stale entry until a hard refresh.  A mismatched (or missing) `?v=`
+   is therefore served `no-cache` so the browser always revalidates."
   [app-state*]
-  (fn [_req]
+  (fn [req]
     (if-let [{:keys [js hash]} (component.bundle/bundle
                                  {:squint-core-url (get @app-state* :squint-core-url)})]
-      {:status  200
-       :headers {"Content-Type"  "text/javascript; charset=utf-8"
-                 "Cache-Control" "public, max-age=31536000, immutable"
-                 "ETag"          (str "\"" hash "\"")}
-       :body    js}
+      (let [requested (get-in req [:query-params "v"])
+            matched?  (= requested hash)]
+        {:status  200
+         :headers {"Content-Type"  "text/javascript; charset=utf-8"
+                   "Cache-Control" (if matched?
+                                     "public, max-age=31536000, immutable"
+                                     "no-cache")
+                   "ETag"          (str "\"" hash "\"")}
+         :body    js})
       {:status  404
        :headers {"Content-Type" "text/plain"}
        :body    "No components registered"})))

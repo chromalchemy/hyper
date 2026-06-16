@@ -3,6 +3,8 @@
             [clojure.string :as string]
             [clojure.test :refer [deftest is testing]]
             [hyper.actions :as actions]
+            [hyper.component :as component]
+            [hyper.component.bundle :as bundle]
             [hyper.context :as context]
             [hyper.core :as h]
             [hyper.render :as render]
@@ -991,3 +993,45 @@
           ;; the first send is the connected-event response map)
           (is (some #(and (string? %) (string/starts-with? % ":")) @sends)
               "a keepalive comment was emitted while idle"))))))
+
+(deftest test-components-js-handler-cache-headers
+  (testing "components.js is only served immutable when ?v matches the
+            current bundle hash, so a stale ?v can never poison the cache"
+    (let [saved @component/registry*]
+      (try
+        (reset! component/registry* {})
+        (component/register-component! "x-widget" {:attrs [] :render "(fn [_ _] [:i])"})
+        (let [app-state* (atom {})
+              handler    (#'server/components-js-handler app-state*)
+              hash       (:hash (bundle/bundle))]
+          (testing "matching ?v -> immutable (true content-addressed cache)"
+            (let [resp (handler {:query-params {"v" hash}})]
+              (is (= 200 (:status resp)))
+              (is (= "public, max-age=31536000, immutable"
+                     (get-in resp [:headers "Cache-Control"])))
+              (is (= (str "\"" hash "\"") (get-in resp [:headers "ETag"])))
+              (is (string? (:body resp)))))
+          (testing "stale ?v -> no-cache (no immutable promise for old URL)"
+            (let [resp (handler {:query-params {"v" "0000000000000000"}})]
+              (is (= 200 (:status resp)))
+              (is (= "no-cache" (get-in resp [:headers "Cache-Control"])))
+              ;; still serves the *current* bundle + its real hash
+              (is (= (str "\"" hash "\"") (get-in resp [:headers "ETag"])))))
+          (testing "missing ?v -> no-cache"
+            (let [resp (handler {})]
+              (is (= 200 (:status resp)))
+              (is (= "no-cache" (get-in resp [:headers "Cache-Control"]))))))
+        (finally
+          (reset! component/registry* saved))))))
+
+(deftest test-components-js-handler-no-components
+  (testing "404 when no components are registered"
+    (let [saved @component/registry*]
+      (try
+        (reset! component/registry* {})
+        (let [app-state* (atom {})
+              handler    (#'server/components-js-handler app-state*)
+              resp       (handler {:query-params {"v" "anything"}})]
+          (is (= 404 (:status resp))))
+        (finally
+          (reset! component/registry* saved))))))
