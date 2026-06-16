@@ -685,6 +685,15 @@
 })();
 "))])
 
+(defn sse-connect-expr
+  "The Datastar `@get` expression that opens (or re-opens) this tab's SSE
+   connection.  Shared by the initial `<body>` `data-init` and `h/reconnect`
+   so the two can never drift in endpoint, base-path, or fetch options."
+  [base-path tab-id open-when-hidden?]
+  (str "@get('" base-path "/hyper/events?tab-id=" tab-id "'"
+       (when open-when-hidden? ", {openWhenHidden: true}")
+       ")"))
+
 (defn- page-response
   "Assemble a full HTML document Ring response from a render-tab result.
 
@@ -709,9 +718,13 @@
                                                                   datastar-script
                                                                   (when head-html (c/raw head-html))]
                                                                  [:body
-                                                                  {:data-init (str "@get('" base-path "/hyper/events?tab-id=" tab-id "'"
-                                                                                   (when open-when-hidden? ", {openWhenHidden: true}")
-                                                                                   ")")}
+                                                                  (merge
+                                                                    {:data-init (sse-connect-expr base-path tab-id open-when-hidden?)}
+                                                                    ;; Declare + maintain the client-only connection signals
+                                                                    ;; ($_hyperConnected / $_hyperConnection) from Datastar's
+                                                                    ;; fetch lifecycle.  Lives on <body> so it persists across
+                                                                    ;; SSE re-renders (only #hyper-app and <head> are morphed).
+                                                                    (signal/connection-attrs))
                                                                   [:div div-attrs (c/raw body-html)]
                                                                   (hyper-scripts tab-id base-path)]]])]
     {:status  status
@@ -1017,6 +1030,7 @@
                                 :render-guard render-guard
                                 :not-found not-found
                                 :disconnect-grace-ms disconnect-grace-ms
+                                :open-when-hidden? (get opts :open-when-hidden? true)
                                 :squint-core-url (:squint-core-url opts))
          initial-routes  (if (var? routes) @routes routes)
          initial-handler (build-ring-handler initial-routes app-state* page-wrapper system-routes default-handler)

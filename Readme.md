@@ -1901,6 +1901,87 @@ window tolerates longer outages before resetting. Note that this covers
 starts a fresh tab (as the [cursor table](#cursors) describes), and `tab-cursor`
 state is in-memory, so it does not survive a server restart.
 
+### Connection status signals
+
+While the grace window keeps reconnection *invisible* most of the time, sometimes
+you want to *show* connection state — a "Reconnecting…" banner, a dimmed UI, a
+"connection lost" message. Hyper exposes two built-in signals for this:
+
+- **`h/connected?*`** — a boolean: `true` while the SSE connection is healthy,
+  `false` while disconnected or reconnecting. Covers the common case.
+- **`h/connection*`** — a keyword token for richer UX, one of
+  `h/connection-states`: `:connecting`, `:open`, `:reconnecting`, `:error`,
+  `:closed`.
+
+Both are **client-only signals** maintained entirely in the browser from
+Datastar's connection lifecycle — the server can't report on a connection that's
+down, so there's nothing to wire up and no per-page setup. Just deref them in
+your views:
+
+```clojure
+;; Simple — show a banner whenever the connection isn't healthy
+(defn app [req]
+  [:div
+   [:div.banner {:data-show (h/expr (not @h/connected?*))}
+    "Reconnecting…"]
+   (page-content req)])
+
+;; Richer — distinguish reconnecting from a terminal failure
+[:div
+ [:span {:data-show (h/expr (= @h/connection* :reconnecting))} "Reconnecting…"]
+ [:span {:data-show (h/expr (= @h/connection* :error))}        "Connection lost"]
+ ;; dim the whole app while not connected
+ [:main {:data-class (h/expr {:offline (not @h/connected?*)})}
+  (page-content req)]]
+```
+
+Compare `connection*` against **keyword tokens** — they compile to the same
+client-side string the signal actually holds, so `(= @h/connection* :reconnecting)`
+is both idiomatic and correct. (Raw strings work too:
+`"$_hyperConnection === 'reconnecting'"`.)
+
+Because they are client-only, these signals behave like any
+[local signal](#local-signal): deref in **render**/`expr` yields the Datastar
+expression (`$_hyperConnected` / `$_hyperConnection`); deref in an **action**
+throws, since connection state isn't readable server-side. You'll generally only
+read them in `data-show`/`data-class`/`data-text` and `expr`.
+
+> **About the error state:** browser SSE errors are opaque, so `:error` (and the
+> messaging around it) is *your* copy keyed on the token — not a server-provided
+> error string. The server can't send error detail while the connection is down.
+> `:error` is reached only when Datastar's retries are exhausted; a transient
+> blip surfaces as `:reconnecting`.
+
+### Triggering a reconnect — `h/reconnect`
+
+Datastar auto-retries network errors, but it does **not** auto-retry the
+end-of-stream cases — exhausted retries (`:error`) or a graceful close
+(`:closed`). For those, `h/reconnect` gives you a recovery action to bind to an
+event, typically a "Retry" button shown alongside the `:error` state:
+
+```clojure
+[:div {:data-show (h/expr (= @h/connection* :error))}
+ "Connection lost. "
+ [:button {:data-on:click (h/reconnect)} "Retry"]]
+```
+
+`h/reconnect` returns the Datastar `@get` expression that re-opens this tab's
+SSE connection (reusing the exact endpoint, `:base-path`, and `:open-when-hidden?`
+the page booted with, so the two can't drift). It must be called in render
+context.
+
+It performs a **soft** reconnect: because the tab-id is unchanged, it
+re-attaches to the still-living tab within the
+[grace window](#reconnection-and-the-disconnect-grace-window) — cursor state,
+signals, and background workers are preserved. This is the key difference from a
+full page reload (`window.location.reload()`), which starts a fresh tab and
+discards all tab-local state. Reach for a reload only as a nuclear fallback (e.g.
+after a server redeploy where client code may have changed).
+
+> If the grace window has already elapsed, the tab has been fully torn down, so
+> reconnecting starts a fresh tab — the connection comes back, but tab-local
+> state does not. Word any "Retry" copy accordingly.
+
 ## Brotli compression
 
 Hyper uses [brotli4j](https://github.com/hyperxpro/Brotli4j) to compress both

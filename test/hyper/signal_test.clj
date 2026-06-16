@@ -406,3 +406,43 @@
     (testing "empty/nil patches pass through unchanged"
       (is (= {} (signal/drop-ifmissing-covered-patches {} declared nil)))
       (is (nil? (signal/drop-ifmissing-covered-patches nil declared nil))))))
+
+;; ---------------------------------------------------------------------------
+;; Connection status signals (static, client-only)
+;; ---------------------------------------------------------------------------
+
+(deftest connection-render-deref-test
+  (testing "in render context, connection signals deref to their $-expression"
+    (is (= "$_hyperConnected" @signal/connected?*))
+    (is (= "$_hyperConnection" @signal/connection*))))
+
+(deftest connection-action-deref-throws-test
+  (testing "in action context, connection signals throw (client-only)"
+    (binding [context/*signals* {}]
+      (is (thrown? clojure.lang.ExceptionInfo @signal/connected?*))
+      (is (thrown? clojure.lang.ExceptionInfo @signal/connection*)))))
+
+(deftest connection-states-test
+  (testing "the documented token set"
+    (is (= #{:connecting :open :reconnecting :error :closed}
+           signal/connection-states))))
+
+(deftest connection-attrs-test
+  (testing "connection-attrs declares both signals and the lifecycle handler"
+    (let [attrs (signal/connection-attrs)]
+      (is (= "'connecting'"
+             (get attrs (keyword "data-signals:_hyper-connection__ifmissing"))))
+      (is (= "true"
+             (get attrs (keyword "data-signals:_hyper-connected__ifmissing"))))
+      (let [js (get attrs (keyword "data-on:datastar-fetch"))]
+        ;; isolates the SSE connection from action POSTs
+        (is (clojure.string/includes? js "evt.detail.el === el"))
+        ;; healthy stream
+        (is (clojure.string/includes?
+              js "evt.detail.type === 'started' ? ($_hyperConnection = 'open', $_hyperConnected = true)"))
+        ;; transient drop
+        (is (clojure.string/includes?
+              js "'retrying' ? ($_hyperConnection = 'reconnecting', $_hyperConnected = false)"))
+        ;; terminal failure
+        (is (clojure.string/includes?
+              js "'retries-failed' ? ($_hyperConnection = 'error', $_hyperConnected = false)"))))))

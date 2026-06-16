@@ -216,6 +216,17 @@
 (defn- deref-form? [form]
   (and (seq? form) (= deref-sym (first form))))
 
+(defn- signal-var?
+  "True when `sym` resolves (in the caller's ns at macro-expansion) to a Var
+   whose value is a signal object — e.g. a static signal held in a top-level
+   def like `hyper.signal/connected?*`.  This lets `->expr` splice deref of
+   such vars (`@connected?*`) the same way it splices deref of signal locals,
+   so they compile to a `$ref` rather than a broken `squint_core.deref(...)`."
+  [sym]
+  (and (symbol? sym)
+       (when-let [v (try (resolve sym) (catch Exception _ nil))]
+         (and (var? v) (signal/any-signal? (deref v))))))
+
 (defn- add-placeholder!
   "Register expr for runtime splicing; returns the placeholder symbol.
    mode is :value (signals -> $ref, other values -> JS literal) or
@@ -248,8 +259,10 @@
                     ph                  (add-placeholder! pairs* target :signal)]
                 (list 'set! ph (xf (list* f ph (map xf args)))))
 
-              ;; @local -> $ref / literal splice
-              (and (deref-form? node) (clj? (second node)))
+              ;; @local or @signal-var -> $ref / literal splice
+              (and (deref-form? node)
+                   (or (clj? (second node))
+                       (signal-var? (second node))))
               (add-placeholder! pairs* (second node) :value)
 
               ;; (:kw m) — keyword calls are Clojure, not client-side

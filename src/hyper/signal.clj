@@ -262,6 +262,95 @@
     signal))
 
 ;; ---------------------------------------------------------------------------
+;; Connection status (static, client-only signals)
+;; ---------------------------------------------------------------------------
+;;
+;; Connection state is fundamentally CLIENT-maintained: the server cannot push
+;; "you are disconnected" over the very connection that is down, and on
+;; reconnect the snapshot render already reflects truth.  So these are static
+;; `LocalSignal`s (underscore-prefixed, client-only) whose values are kept in
+;; sync by Datastar's fetch lifecycle events on the page `<body>` — never by
+;; the server.  They are constructed directly (NOT via `create-local-signal`),
+;; so they do not register into the per-render `*declared-signals*`
+;; accumulator: declaration + maintenance happens once in the page scaffolding
+;; (see `connection-attrs`), not per element per render.
+;;
+;; During render, `@connection*` / `@connected?*` yield their Datastar
+;; expression strings (`"$_hyperConnection"` / `"$_hyperConnected"`), suitable
+;; for `data-show`, `expr`, etc.  In an action they throw, like any local
+;; signal — connection state is not server-readable.
+
+(def connection-states
+  "The set of connection status tokens `connection*` can hold.
+
+   - :connecting   — first connection attempt in progress (initial paint)
+   - :open         — connected and streaming
+   - :reconnecting — dropped; Datastar is retrying
+   - :error        — retries exhausted / terminal failure
+   - :closed       — intentionally closed (e.g. a hidden tab under
+                     `:open-when-hidden? false`)"
+  #{:connecting :open :reconnecting :error :closed})
+
+(def connection*
+  "Static client-only signal holding the current SSE connection status as a
+   keyword token (one of `connection-states`).  Client-maintained from
+   Datastar's fetch lifecycle.
+
+   Compare it with keyword tokens in render/expr — keywords compile to the
+   same JS string the wire uses:
+
+     [:span {:data-show (h/expr (= @h/connection* :reconnecting))} \"Reconnecting…\"]"
+  (->LocalSignal "_hyperConnection" "_hyper-connection" :connecting))
+
+(def connected?*
+  "Static client-only boolean signal: true while the SSE connection is healthy.
+   Sugar for the common case; equivalent to `(= @connection* :open)`.
+
+     [:div {:data-show (h/expr (not @h/connected?*))} \"Offline\"]"
+  (->LocalSignal "_hyperConnected" "_hyper-connected" true))
+
+;; datastar-fetch event detail.type -> connection token (wire string).
+;; `started` means the SSE request opened; the retry/error/finished family
+;; means the stream is no longer healthy.  Only `retries-failed` is terminal
+;; (Datastar's default `retry: auto` keeps retrying network errors), so a
+;; transient blip shows :reconnecting and only a genuine give-up shows :error.
+(def ^:private fetch-type->token
+  {"started"        "open"
+   "retrying"       "reconnecting"
+   "error"          "reconnecting"
+   "retries-failed" "error"
+   "finished"       "reconnecting"})
+
+(defn- connection-tracking-js
+  "The Datastar `data-on:datastar-fetch` expression that maps the SSE
+   connection's fetch lifecycle to the connection signals.  Filtered to the
+   element that initiated the SSE `@get` (`evt.detail.el === el`) so action
+   POSTs do not perturb it."
+  []
+  (let [branches (map (fn [[event-type token]]
+                        (format "evt.detail.type === '%s' ? ($_hyperConnection = '%s', $_hyperConnected = %s)"
+                                event-type token (if (= token "open") "true" "false")))
+                      fetch-type->token)]
+    (str "evt.detail.el === el && (" (str/join " : " branches) " : null)")))
+
+(defn connection-attrs
+  "Hiccup attribute map for the page `<body>` that declares the client-only
+   connection signals (with their defaults) and wires Datastar's fetch
+   lifecycle to keep them current.  Returns a map merged into the body attrs
+   by the page scaffolding."
+  []
+  (let [conn-html (.-html-name ^LocalSignal connection*)
+        cd-html   (.-html-name ^LocalSignal connected?*)]
+    {(keyword (str "data-signals:" conn-html "__ifmissing"))
+     (clj->js-literal (name (.-default-val ^LocalSignal connection*)))
+
+     (keyword (str "data-signals:" cd-html "__ifmissing"))
+     (clj->js-literal (.-default-val ^LocalSignal connected?*))
+
+     (keyword "data-on:datastar-fetch")
+     (connection-tracking-js)}))
+
+;; ---------------------------------------------------------------------------
 ;; Signal parsing (from Datastar request bodies)
 ;; ---------------------------------------------------------------------------
 

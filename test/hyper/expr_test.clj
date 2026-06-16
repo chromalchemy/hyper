@@ -143,3 +143,22 @@
       (is (seq? expansion))
       (is (= 'hyper.expr/substitute (first expansion)))
       (is (string? (second expansion)) "template compiled at expansion, not per call"))))
+
+;; ---------------------------------------------------------------------------
+;; Deref of static signal vars (e.g. the connection signals)
+;; ---------------------------------------------------------------------------
+
+(deftest test-deref-signal-var
+  (testing "deref of a top-level var holding a signal splices to a $ref"
+    (is (= "(!($_hyperConnected))"
+           (->expr (not @signal/connected?*))))
+    (is (= "($_hyperConnection) === (\"reconnecting\")"
+           (->expr (= @signal/connection* :reconnecting)))))
+
+  (testing "keyword and string tokens compile identically"
+    (is (= (->expr (= @signal/connection* :open))
+           (->expr (= @signal/connection* "open")))))
+
+  (testing "deref of a non-signal var is left to the client (no splice)"
+    (is (str/includes? (->expr (not @some-undefined-thing))
+                       "squint_core.deref"))))

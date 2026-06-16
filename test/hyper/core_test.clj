@@ -5,6 +5,7 @@
             [hyper.core :as hy]
             [hyper.render :as render]
             [hyper.render.error :as render.error]
+            [hyper.signal :as signal]
             [hyper.state :as state]
             [hyper.test :as ht]
             [reitit.ring :as ring]))
@@ -1119,3 +1120,31 @@
       ;; :feature-flags should be gone — full replace, not merge
       (is (= {:db :db :user {:name "Bob"}}
              (get-in @app-state* [:tabs tab-id :env]))))))
+
+(deftest test-connection-signal-reexports
+  (testing "core re-exports the connection signals and token set from hyper.signal"
+    (is (identical? signal/connected?* hy/connected?*))
+    (is (identical? signal/connection* hy/connection*))
+    (is (= signal/connection-states hy/connection-states))))
+
+(deftest test-reconnect
+  (testing "reconnect returns the SSE @get expression for this tab"
+    (let [app-state* (atom (assoc (state/init-state)
+                                  :base-path "" :open-when-hidden? true))]
+      (binding [context/*request* {:hyper/session-id "s1"
+                                   :hyper/tab-id     "tab_abc"
+                                   :hyper/app-state  app-state*}]
+        (is (= "@get('/hyper/events?tab-id=tab_abc', {openWhenHidden: true})"
+               (hy/reconnect))))))
+
+  (testing "reconnect honors :base-path and :open-when-hidden? false"
+    (let [app-state* (atom (assoc (state/init-state)
+                                  :base-path "/app" :open-when-hidden? false))]
+      (binding [context/*request* {:hyper/session-id "s1"
+                                   :hyper/tab-id     "tab_xyz"
+                                   :hyper/app-state  app-state*}]
+        (is (= "@get('/app/hyper/events?tab-id=tab_xyz')"
+               (hy/reconnect))))))
+
+  (testing "reconnect throws outside request context"
+    (is (thrown? Exception (hy/reconnect)))))

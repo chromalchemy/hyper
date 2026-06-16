@@ -460,6 +460,57 @@
    (signal/create-local-signal path default-value)))
 
 ;; ---------------------------------------------------------------------------
+;; Connection status signals (client-only, maintained by Datastar)
+;; ---------------------------------------------------------------------------
+
+(def connected?*
+  "Static client-only boolean signal — true while the SSE connection is
+   healthy, false while disconnected/reconnecting.  Maintained entirely
+   client-side from Datastar's connection lifecycle (the server cannot report
+   on a connection that is down).
+
+   Deref in render/`expr` yields its Datastar expression; deref in an action
+   throws (connection state is not server-readable).
+
+     [:div {:data-show (h/expr (not @h/connected?*))} \"Reconnecting…\"]"
+  signal/connected?*)
+
+(def connection*
+  "Static client-only signal holding the SSE connection status as a keyword
+   token from `connection-states` (`:connecting`, `:open`, `:reconnecting`,
+   `:error`, `:closed`).  Use it for richer connection UX; compare against
+   keyword tokens (they compile to the wire string):
+
+     [:span {:data-show (h/expr (= @h/connection* :reconnecting))} \"Reconnecting…\"]
+     [:span {:data-show (h/expr (= @h/connection* :error))}        \"Connection lost\"]"
+  signal/connection*)
+
+(def connection-states
+  "The set of keyword tokens `connection*` may hold."
+  signal/connection-states)
+
+(defn reconnect
+  "Return a Datastar expression that re-opens this tab's SSE connection, for
+   binding to an event attribute — e.g. a \"Retry\" button shown when
+   `connection*` is `:error`:
+
+     [:button {:data-on:click (h/reconnect)} \"Retry\"]
+
+   This is a *soft* reconnect: it re-attaches to the still-living tab (within
+   the disconnect grace window), so cursor state, signals, and workers are
+   preserved — unlike a full page reload, which starts a fresh tab.  Useful for
+   the connection states Datastar does not auto-retry (`:error` / `:closed`).
+
+   Reuses the exact same `@get` the page booted with (endpoint, base-path, and
+   `openWhenHidden`), so the two can't drift.  Must be called in render
+   context."
+  []
+  (let [{:keys [tab-id app-state*]} (context/require-context! "reconnect")
+        base-path                   (get @app-state* :base-path "")
+        owh?                        (get @app-state* :open-when-hidden? true)]
+    (server/sse-connect-expr base-path tab-id owh?)))
+
+;; ---------------------------------------------------------------------------
 ;; Client param support for actions
 ;; ---------------------------------------------------------------------------
 
