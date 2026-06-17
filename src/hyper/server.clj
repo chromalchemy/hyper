@@ -7,9 +7,9 @@
             [compact-uuids.core :as uuid]
             [dev.onionpancakes.chassis.core :as c]
             [hyper.actions :as actions]
-            [hyper.brotli :as br]
             [hyper.component :as component]
             [hyper.component.bundle :as component.bundle]
+            [hyper.compress :as gz]
             [hyper.context :as context]
             [hyper.effects :as effects]
             [hyper.lifecycle :as lifecycle]
@@ -98,34 +98,34 @@
       (rq/enqueue-partial! q component-id))))
 
 (defn- send-sse!
-  "Compress (when br-stream is non-nil) and send an SSE payload over the channel.
+  "Compress (when gz-stream is non-nil) and send an SSE payload over the channel.
    Returns true when sent, false when the channel is closed."
-  [channel br-out br-stream sse-payload]
-  (let [payload (if br-stream
-                  (br/compress-stream br-out br-stream sse-payload)
+  [channel gz-out gz-stream sse-payload]
+  (let [payload (if gz-stream
+                  (gz/compress-stream gz-out gz-stream sse-payload)
                   sse-payload)]
     (boolean (http-kit/send! channel payload false))))
 
 (defn- handle-partial-render
   "Render only the dirty reactive components and send targeted fragments.
    Returns true/nil on success, false when the channel is closed."
-  [app-state* tab-id dirty-ids channel br-out br-stream]
+  [app-state* tab-id dirty-ids channel gz-out gz-stream]
   (let [fragments (keep (fn [component-id]
                           (reactive/partial-render app-state* tab-id component-id))
                         dirty-ids)]
     (when (seq fragments)
-      (send-sse! channel br-out br-stream
+      (send-sse! channel gz-out gz-stream
                  (render/format-datastar-fragments fragments)))))
 
 (defn- handle-ring-redirect
   "Convert a 3xx Ring redirect response into a client-side window.location
    redirect over SSE.  Throws for non-redirect Ring responses."
-  [render-result tab-id channel br-out br-stream]
+  [render-result tab-id channel gz-out gz-stream]
   (let [status   (:status render-result)
         location (get-in render-result [:headers "Location"])]
     (if (and (<= 300 status 399) location)
       (let [js (str "window.location.href='" (utils/escape-js-string location) "'")]
-        (send-sse! channel br-out br-stream
+        (send-sse! channel gz-out gz-stream
                    (effects/format-execute-script-event js)))
       (throw (ex-info
                (str "Render middleware returned a Ring response over SSE that cannot "
@@ -146,11 +146,11 @@
    declarations.
    Returns true/nil on success, false when the channel is closed."
   [app-state* session-id tab-id sig-patches last-sent-signals
-   trigger-render! enqueue-partial! channel br-out br-stream]
+   trigger-render! enqueue-partial! channel gz-out gz-stream]
   (when-let [render-result (render/render-tab app-state* session-id tab-id)]
     (if (:status render-result)
       ;; Ring response passthrough (e.g. redirect from render middleware)
-      (handle-ring-redirect render-result tab-id channel br-out br-stream)
+      (handle-ring-redirect render-result tab-id channel gz-out gz-stream)
       ;; Normal render — assemble and send SSE payload
       (let [{:keys [title head-html body-html url
                     declared-signals registered-action-ids
@@ -178,15 +178,15 @@
               sig-event    (when (seq sig-patches)
                              (signal/format-patch-signals-event sig-patches))
               sse-payload  (str head-event body-event sig-event)]
-          (send-sse! channel br-out br-stream sse-payload))))))
+          (send-sse! channel gz-out gz-stream sse-payload))))))
 
 (defn- send-pending-scripts!
   "Send drained scripts over SSE.
    Returns true/nil on success, false when the channel is closed."
-  [scripts tab-id channel br-out br-stream]
+  [scripts tab-id channel gz-out gz-stream]
   (try
     (when (seq scripts)
-      (send-sse! channel br-out br-stream
+      (send-sse! channel gz-out gz-stream
                  (apply str (map effects/format-execute-script-event scripts))))
     (catch Throwable e
       (t/error! {:id   :hyper.error/renderer-scripts
@@ -198,7 +198,7 @@
 (defn- -renderer-loop!
   "Virtual-thread render loop for a single tab.
 
-   Owns the http-kit AsyncChannel and (optional) streaming Brotli state,
+   Owns the http-kit AsyncChannel and (optional) streaming gzip state,
    guaranteeing single-writer semantics by construction.
 
    Blocks on the render queue until events are available, drains them into
@@ -207,12 +207,12 @@
    Exits when a :shutdown event is received."
   [app-state* session-id tab-id channel compress?
    render-queue]
-  (let [br-out           (when compress? (br/byte-array-out-stream))
-        br-stream        (when br-out (br/compress-out-stream br-out :window-size 18))
+  (let [gz-out           (when compress? (gz/byte-array-out-stream))
+        gz-stream        (when gz-out (gz/compress-out-stream gz-out :window-size 18))
         headers          (cond-> {"Content-Type"      "text/event-stream"
                                   "Cache-Control"     "no-cache, no-transform"
                                   "X-Accel-Buffering" "no"}
-                           compress? (assoc "Content-Encoding" "br"))
+                           compress? (assoc "Content-Encoding" "gzip"))
         throttle-ms      (long (or (get @app-state* :render-throttle-ms)
                                    default-render-throttle-ms))
         ;; Heartbeat keepalive interval (ms).  nil / non-positive disables it,
@@ -230,8 +230,8 @@
             sent?         (boolean
                             (http-kit/send! channel
                                             {:headers headers
-                                             :body    (if br-stream
-                                                        (br/compress-stream br-out br-stream connected-msg)
+                                             :body    (if gz-stream
+                                                        (gz/compress-stream gz-out gz-stream connected-msg)
                                                         connected-msg)}
                                             false))]
         (when sent?
@@ -250,7 +250,7 @@
                 ;; surfaces a dead/half-open channel (send-sse! returns false),
                 ;; which exits the loop -> on-close -> detach -> grace window.
                 idle?
-                (let [sent? (send-sse! channel br-out br-stream (render/format-heartbeat))]
+                (let [sent? (send-sse! channel gz-out gz-stream (render/format-heartbeat))]
                   (when-not (false? sent?)
                     (recur last-sent-signals)))
 
@@ -264,11 +264,11 @@
                                                  (not full-render?)
                                                  (not (seq sig-patches)))
                                           (handle-partial-render app-state* tab-id dirty-ids
-                                                                 channel br-out br-stream)
+                                                                 channel gz-out gz-stream)
                                           (handle-full-render app-state* session-id tab-id sig-patches
                                                               last-sent-signals
                                                               trigger-render! enqueue-partial!
-                                                              channel br-out br-stream))
+                                                              channel gz-out gz-stream))
                                         (catch Throwable e
                                           (t/error! {:id   :hyper.error/renderer
                                                      :msg  "Error rendering page"
@@ -276,7 +276,7 @@
                                                     e)
                                           nil))
                       script-sent?    (send-pending-scripts! scripts tab-id
-                                                             channel br-out br-stream)]
+                                                             channel gz-out gz-stream)]
                   ;; sent? is true (ok), nil (no render-fn or error), false (channel closed)
                   ;; script-sent? follows the same convention
                   (when-not (or (false? sent?) (false? script-sent?))
@@ -288,7 +288,7 @@
                    :data {:hyper/tab-id tab-id}}
                   e))
       (finally
-        (br/close-stream br-stream)
+        (gz/close-stream gz-stream)
         (when (instance? org.httpkit.server.AsyncChannel channel)
           (t/catch->error! :hyper.error/close-sse-channel
                            (http-kit/close channel)))
@@ -456,12 +456,12 @@
 (defn sse-events-handler
   "Handler for SSE event stream.
    Starts a per-tab renderer thread that owns the channel and optional
-   brotli stream, then wires up watchers to trigger re-renders."
+   gzip stream, then wires up watchers to trigger re-renders."
   [app-state*]
   (fn [req]
     (let [session-id (:hyper/session-id req)
           tab-id     (:hyper/tab-id req)
-          compress?  (br/accepts-br? req)
+          compress?  (gz/accepts-gzip? req)
           ;; Identity for THIS SSE connection — shared by :on-open and
           ;; :on-close so a stale half-open connection can't detach a tab
           ;; whose renderer a newer connection already took over.
@@ -1105,7 +1105,7 @@
            ;; are parsed, before routing.  Earlier entries wrap outermost (execute first).
            (reduce (fn [h mw] (mw h)) h (reverse (vec middleware)))
            ((wrap-hyper-context app-state*) h)
-           (br/wrap-brotli h)
+           (gz/wrap-gzip h)
            (keyword-params/wrap-keyword-params h)
            (params/wrap-params h)
            (cookies/wrap-cookies h))]

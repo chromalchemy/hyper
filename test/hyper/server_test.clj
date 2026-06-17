@@ -99,7 +99,7 @@
              [true  {"Content-Type"      "text/event-stream"
                      "Cache-Control"     "no-cache, no-transform"
                      "X-Accel-Buffering" "no"
-                     "Content-Encoding"  "br"}]]]
+                     "Content-Encoding"  "gzip"}]]]
       (let [captured-response (atom nil)
             render-queue      (rq/make-queue)]
         ;; Pre-enqueue a full render so drain! doesn't block forever

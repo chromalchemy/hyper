@@ -241,7 +241,7 @@
 ;;
 ;; The middleware stack (in execution order):
 ;;
-;; 1. Hyper built-ins: cookies → params → keyword-params → brotli → hyper-context
+;; 1. Hyper built-ins: cookies → params → keyword-params → gzip → hyper-context
 ;; 2. :middleware (Ring):
 ;;    a. wrap-db    — injects {:db db} into :hyper/env (read-only infrastructure)
 ;;    b. wrap-auth  — reads cookie, hydrates :user session cursor

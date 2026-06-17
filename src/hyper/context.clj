@@ -10,7 +10,7 @@
 
 ;; Per-render action counter. Bound to (atom 0) before each render so that
 ;; deterministic render functions produce the same action IDs every time,
-;; enabling effective brotli streaming compression.
+;; enabling effective gzip streaming compression.
 (def ^:dynamic *action-idx* nil)
 
 ;; Datastar signal values parsed from the @post() request body during
