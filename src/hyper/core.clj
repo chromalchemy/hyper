@@ -150,14 +150,13 @@
 
      (defn ticker-page [req]
        (let [now* (h/tab-cursor :now)]
-         (fn []                              ;; setup — runs once per mount
-           (h/spawn!
-             (fn []
-               (loop []
-                 (reset! now* (System/currentTimeMillis))
-                 (Thread/sleep 1000)
-                 (recur))))                  ;; interrupted on unmount
-           (fn [req] [:p \"Now: \" @now*]))))  ;; render — pure
+         (h/spawn!                           ;; setup — runs once per mount
+           (fn []
+             (loop []
+               (reset! now* (System/currentTimeMillis))
+               (Thread/sleep 1000)
+               (recur))))                    ;; interrupted on unmount
+         (fn [req] [:p \"Now: \" @now*])))     ;; render — pure
 
    For background work, prefer modeling results as state the worker writes;
    reach for `spawn!` only when you genuinely need a long-lived loop or
