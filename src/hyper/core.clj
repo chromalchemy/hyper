@@ -10,15 +10,18 @@
   (:require [clojure.string :as str]
             [hyper.actions :as actions]
             [hyper.client-params :as client-params]
+            [hyper.component :as component]
             [hyper.context :as context :refer [*request* *action-idx*]]
+            [hyper.expr]
+            [hyper.lifecycle :as lifecycle]
             [hyper.reactive :as reactive]
             [hyper.render :as render]
             [hyper.routes :as routes]
             [hyper.server :as server]
             [hyper.signal :as signal]
             [hyper.state :as state]
+            [hyper.subview :as subview]
             [hyper.utils :as utils]
-            [hyper.watch :as watch]
             [reitit.core :as reitit]))
 
 (defn global-cursor
@@ -93,8 +96,8 @@
                                        app-state*
                                        [:tabs tab-id :route :query-params]
                                        path)]
-     (when (nil? @cursor)
-       (reset! cursor default-value))
+     ;; cas so the default init yields to a concurrent write (see state/Cursor).
+     (compare-and-set! cursor nil default-value)
      cursor)))
 
 (defn watch!
@@ -114,12 +117,58 @@
      ;; Watch any Watchable source
      (watch! my-event-stream)"
   [source]
+  (context/guard-effect! :watch "h/watch!")
   (let [{:keys [tab-id app-state*]} (context/require-context! "watch!")
+        ;; A user watch is a mount-scoped, full-render subview: registered once
+        ;; per mount (form-2 setup) or idempotently each render (form-1 body),
+        ;; keyed by source identity for dedup.  Torn down on navigation
+        ;; (page-view remount) and tab disconnect — never by the per-render sweep.
+        sid                         (subview/register-watch! app-state* tab-id source)
         trigger-render!             (get-in @app-state* [:tabs tab-id :renderer :trigger-render!])]
-    (if trigger-render!
-      (watch/watch-source! app-state* tab-id trigger-render! source)
-      ;; No SSE renderer yet (initial HTTP render) — stash for later promotion
-      (watch/stash-pending-watch! app-state* tab-id source))))
+    ;; Wire immediately when an SSE renderer already exists; otherwise the
+    ;; first full render's setup-new-watches! wires it (initial HTTP render).
+    (when trigger-render!
+      (subview/wire-subview! app-state* tab-id sid trigger-render! nil))
+    nil))
+
+(defn spawn!
+  "Spawn a background virtual-thread worker bound to the current view's
+   lifecycle.  `worker-fn` is a zero-arg fn run once on a fresh virtual
+   thread; the framework owns the thread handle and **interrupts it on
+   unmount** (navigation away, route-handler redefinition, or tab
+   disconnect).  Returns nil; a worker is fire-and-forget and communicates by
+   writing state (cursors), which drives the usual declarative re-render.
+
+   The worker runs on its own thread with `*request*` rebound, so cursor writes
+   land and the same `tab-cursor`/`session-cursor`/`global-cursor`/`env` calls
+   work inside it as in a handler.
+
+   Mount-scoped and keyed by call order (like `reactive`), so a form-1 body
+   that calls `spawn!` on every render still spawns exactly one worker.
+   Prefer calling it from a **form-2 setup closure** (runs once per mount),
+   where its intent — \"start this worker when the view mounts\" — is clearest:
+
+     (defn ticker-page [req]
+       (let [now* (h/tab-cursor :now)]
+         (h/spawn!                           ;; setup — runs once per mount
+           (fn []
+             (loop []
+               (reset! now* (System/currentTimeMillis))
+               (Thread/sleep 1000)
+               (recur))))                    ;; interrupted on unmount
+         (fn [req] [:p \"Now: \" @now*])))     ;; render — pure
+
+   For background work, prefer modeling results as state the worker writes;
+   reach for `spawn!` only when you genuinely need a long-lived loop or
+   blocking consumer tied to the view.  For one-shot data loading with a
+   placeholder, prefer `async`."
+  [worker-fn]
+  (context/guard-effect! :spawn "h/spawn!")
+  (let [{:keys [session-id tab-id app-state* router]} (context/require-context! "spawn!")
+        idx                                           (if *action-idx* (swap! *action-idx* inc) 0)
+        sid                                           (str "s_" tab-id "_" idx)]
+    (subview/spawn-worker! app-state* tab-id sid session-id router worker-fn)
+    nil))
 
 (defn env
   "Get the request environment, or a specific key from it.
@@ -175,6 +224,10 @@
    Nested batches are transparent — the inner batch executes within the
    existing overlay and the outermost boundary handles the flush.
 
+   A batch inside background work (future, send-off, fiber) spawned from a
+   render or outer batch ignores the conveyed overlay and creates its own,
+   flushing to the live app-state when its body completes.
+
    Example:
      ;; Without batch, the renderer might snapshot between cursor updates
      ;; and show a partial state (e.g. new data with loading still true).
@@ -192,14 +245,16 @@
            (reset! (h/tab-cursor :data) data)
            (reset! (h/tab-cursor :loading?) false))))"
   [& body]
-  `(if context/*state-overlay*
-     ;; Already inside an overlay (render or outer batch) — just execute.
-     ;; Writes accumulate in the existing overlay; outer boundary flushes.
+  `(if (context/current-overlay)
+     ;; Already inside an overlay owned by this thread — just execute;
+     ;; the outer boundary flushes.  A conveyed overlay from another
+     ;; thread does not count (see context/current-overlay).
      (do ~@body)
      ;; Fresh overlay — snapshot current state, execute, flush.
      (let [{app-state*# :app-state*} (context/require-context! "batch")
            overlay#                  {:state* (atom @app-state*#)
-                                      :paths* (atom #{})}]
+                                      :ops*   (atom [])
+                                      :owner  (Thread/currentThread)}]
        (binding [context/*state-overlay* overlay#]
          (let [result# (do ~@body)]
            (context/flush-overlay! app-state*#)
@@ -241,6 +296,111 @@
          deps#                                     ~deps
          render-fn#                                (fn [] ~@body)]
      (reactive/render-component app-state*# tab-id# component-id# deps# render-fn#)))
+
+(defmacro async
+  "Render-time data loading with a placeholder.  Spawns the `fetch` on a
+   background virtual thread, renders a placeholder immediately, and re-renders
+   *just this region* when the value lands — no manual loading-state plumbing.
+
+   Shape (a sibling of `reactive`):
+
+     (h/async [deps] fetch-expr binding & render-body)
+
+   - `deps`        a vector of Watchable sources (like `reactive`).  `[]` means
+                   fetch once per mount; otherwise a change to a dep refetches
+                   (stale-while-revalidate — see `:reloading` below).
+   - `fetch-expr`  a single expression evaluated on a background worker thread
+                   while the placeholder renders (wrap multiple forms in `do`).
+                   Blocking I/O is fine (it is a virtual thread).
+   - `binding`     a destructuring form bound to the status map.
+   - `render-body` hiccup rendered from the status; must return a single rooted
+                   element (as with `reactive`) so the region id can be injected.
+
+   The status map is `{:status :result :error}` where `:status` is one of:
+   - `:loading`   — first load in flight; `:result` is nil.
+   - `:ready`     — `:result` holds the fetched value (a nil result is
+                    `{:status :ready :result nil}`).
+   - `:error`     — `:error` holds the throwable; `:result` keeps the prior
+                    value (if any) so you can show stale data with an error.
+   - `:reloading` — a dep changed and a refetch is in flight; `:result` still
+                    holds the previous value (stale-while-revalidate).
+
+   Example:
+
+     (defn rows-page [req]
+       (let [user-id* (h/path-cursor :user 0)]
+         (h/async [user-id*]
+           (db/fetch-rows @user-id*)
+           {:keys [status result error]}
+           (case status
+             :ready     (render-rows result)
+             :error     [:p \"Failed: \" (ex-message error)]
+             :reloading [:div.stale (render-rows result)]
+             [:p \"Loading…\"]))))
+
+   `async` is a *declaration*: rendering it registers a region and starts the
+   fetch on a worker thread, so it belongs in the render body like `reactive`.
+   The region is torn down (and any in-flight fetch interrupted) when it
+   disappears from the view tree, on navigation, or on tab disconnect.
+
+   Prefer `async` for leaf / region-local data that wants its own loading state
+   co-located with its render.  For page-level data you want before first paint
+   or shared across regions, load it in a form-2 setup closure into a cursor."
+  [deps fetch-expr binding & render-body]
+  `(let [{tab-id#     :tab-id
+          app-state*# :app-state*
+          session-id# :session-id
+          router#     :router}    (context/require-context! "async")
+         idx#                     (if context/*action-idx* (swap! context/*action-idx* inc) 0)
+         component-id#            (str "async_" tab-id# "_" idx#)]
+     (subview/render-async! app-state*# tab-id# session-id# router# component-id#
+                            ~deps
+                            (fn [] ~fetch-expr)
+                            (fn [~binding] ~@render-body))))
+
+;; ---------------------------------------------------------------------------
+;; View lifecycle (form-3)
+;; ---------------------------------------------------------------------------
+
+(defn view
+  "Declare a form-3 view that owns an external resource needing explicit
+   teardown (a connection, a file handle, a subscription that is not a
+   Watchable, etc.).
+
+   A page handler returns a `view` instead of hiccup when it must allocate
+   something at mount and release it at unmount.  The framework threads the
+   resource immutably through the lifecycle — there is no mutable per-view
+   slot, because the server always re-renders declaratively.
+
+   Spec keys:
+   - :render  (required) `(fn [resource req] -> hiccup)`.  `resource` is the
+              value returned by `:mount` (nil when there is no `:mount`).
+              Called on every render; must be pure.
+   - :mount   (optional) `(fn [] -> resource)`.  Runs once when the view
+              mounts; its return value is the resource.
+   - :unmount (optional) `(fn [resource] -> any)`.  Runs once when the view
+              unmounts (navigation away, handler redefinition, or tab
+              disconnect).
+
+   The view (re)mounts when the page first renders or the route handler
+   identity changes; a superseded view is unmounted first.
+
+   Prefer the simpler rungs of the ladder when you can: a pure `(fn [req] ->
+   hiccup)` (form-1) when the view owns nothing, or a setup closure
+   `(fn [req] (h/watch! …) (fn [req] hiccup))` (form-2) when it owns only
+   framework-managed subscriptions.  Reach for `view` only for a genuine
+   external resource — frequent need for it is a sign a resource should be
+   modeled as Watchable or owned by the system layer (:hyper/env) instead.
+
+   Example:
+     (defn report-page [req]
+       (h/view
+         {:mount   (fn []          (db/open-cursor (h/env :db) :reports))
+          :render  (fn [cursor req] [:ul (for [r (db/take! cursor 50)]
+                                           [:li (:title r)])])
+          :unmount (fn [cursor]     (db/close-cursor cursor))}))"
+  [spec]
+  (lifecycle/view spec))
 
 ;; ---------------------------------------------------------------------------
 ;; Signals
@@ -299,6 +459,57 @@
    (signal/create-local-signal path default-value)))
 
 ;; ---------------------------------------------------------------------------
+;; Connection status signals (client-only, maintained by Datastar)
+;; ---------------------------------------------------------------------------
+
+(def connected?*
+  "Static client-only boolean signal — true while the SSE connection is
+   healthy, false while disconnected/reconnecting.  Maintained entirely
+   client-side from Datastar's connection lifecycle (the server cannot report
+   on a connection that is down).
+
+   Deref in render/`expr` yields its Datastar expression; deref in an action
+   throws (connection state is not server-readable).
+
+     [:div {:data-show (h/expr (not @h/connected?*))} \"Reconnecting…\"]"
+  signal/connected?*)
+
+(def connection*
+  "Static client-only signal holding the SSE connection status as a keyword
+   token from `connection-states` (`:connecting`, `:open`, `:reconnecting`,
+   `:error`, `:closed`).  Use it for richer connection UX; compare against
+   keyword tokens (they compile to the wire string):
+
+     [:span {:data-show (h/expr (= @h/connection* :reconnecting))} \"Reconnecting…\"]
+     [:span {:data-show (h/expr (= @h/connection* :error))}        \"Connection lost\"]"
+  signal/connection*)
+
+(def connection-states
+  "The set of keyword tokens `connection*` may hold."
+  signal/connection-states)
+
+(defn reconnect
+  "Return a Datastar expression that re-opens this tab's SSE connection, for
+   binding to an event attribute — e.g. a \"Retry\" button shown when
+   `connection*` is `:error`:
+
+     [:button {:data-on:click (h/reconnect)} \"Retry\"]
+
+   This is a *soft* reconnect: it re-attaches to the still-living tab (within
+   the disconnect grace window), so cursor state, signals, and workers are
+   preserved — unlike a full page reload, which starts a fresh tab.  Useful for
+   the connection states Datastar does not auto-retry (`:error` / `:closed`).
+
+   Reuses the exact same `@get` the page booted with (endpoint, base-path, and
+   `openWhenHidden`), so the two can't drift.  Must be called in render
+   context."
+  []
+  (let [{:keys [tab-id app-state*]} (context/require-context! "reconnect")
+        base-path                   (get @app-state* :base-path "")
+        owh?                        (get @app-state* :open-when-hidden? true)]
+    (server/sse-connect-expr base-path tab-id owh?)))
+
+;; ---------------------------------------------------------------------------
 ;; Client param support for actions
 ;; ---------------------------------------------------------------------------
 
@@ -315,27 +526,6 @@
                    (assoc m sym (client-params/client-param sym)))
                  {}))))
 
-(defn build-action-expr
-  "Build the Datastar/JS expression string for an action.
-   Always uses Datastar's @post() so that all non-underscore signals are
-   automatically sent in the request body.  When client params are present,
-   they are URL-encoded into the query string via the hyper.encodeClientParams helper
-   so the server can read them from query-params.
-   Optionally injects a custom Datastar expression to conditionally prevent the post.
-   base-path is prepended to the /hyper/actions endpoint (empty string when not set)."
-  [action-id used-params js base-path]
-  (let [js-injection (when js (str js " && "))]
-    (if (empty? used-params)
-      (str js-injection "@post('" base-path "/hyper/actions?action-id=" action-id "')")
-      (let [obj-entries (->> used-params
-                             vals
-                             (map (fn [{:keys [js key]}]
-                                    (str key ":" js)))
-                             (str/join ","))]
-        (str js-injection
-             "@post('" base-path "/hyper/actions?action-id=" action-id
-             "&' + hyper.encodeClientParams({" obj-entries "}))")))))
-
 (defmacro action
   "Create a server action expression for use in Datastar event attributes.
    Returns a Datastar expression string that can be bound to any event.
@@ -343,7 +533,7 @@
    The action is registered with the current session/tab context
    and can access state via cursors. Action IDs are deterministic
    (derived from a per-render counter + tab-id) so that re-renders
-   produce identical HTML, enabling effective brotli streaming compression.
+   produce identical HTML, enabling effective gzip streaming compression.
 
    Supports client-side special forms that transmit DOM values to the server:
    - $value     — the value of the input/select/textarea that fired the event
@@ -389,9 +579,13 @@
                                  (some #{:when :as} (keys maybe-opts)))
         [js as-name body]   (if opts-map?
                               (let [guard (:when maybe-opts)
-                                    js    (when (and (string? guard)
-                                                     (not (str/blank? guard)))
-                                            guard)]
+                                    ;; String literals are validated here; any
+                                    ;; other form (e.g. (expr ...)) is deferred
+                                    ;; to runtime evaluation — sanitize-guard
+                                    ;; validates the result.
+                                    js    (cond
+                                            (string? guard) (when-not (str/blank? guard) guard)
+                                            (some? guard)   guard)]
                                 [js (:as maybe-opts) body])
                               [nil nil args])
         used-params         (find-client-params body)
@@ -417,7 +611,50 @@
            _#                       (actions/register-action! app-state*# session-id# tab-id# action-fn# action-id#
                                                               ~(when as-name {:as as-name}))
            base-path#               (get @app-state*# :base-path "")]
-       (build-action-expr action-id# '~used-params ~js base-path#))))
+       (actions/build-action-expr action-id# '~used-params (actions/sanitize-guard ~js) base-path#))))
+
+;; ---------------------------------------------------------------------------
+;; Client-side expressions and components (re-exports)
+;; ---------------------------------------------------------------------------
+
+(defmacro expr
+  "Compile Clojure forms into a Datastar expression string for use in
+   data-* attributes, action :when guards, etc.
+
+   Signals use atom vocabulary — the same (reset! sig v) that means a
+   server round-trip inside `action` compiles to an instant client-side
+   assignment here:
+
+     (let [open?* (local-signal :open false)]
+       [:button {:data-on:click (expr (swap! open?* not))} \"Toggle\"]
+       [:div {:data-show (expr @open?*)} \"...\"])
+
+     [:input {:data-on:keydown
+              (expr (when (= evt.key \"Enter\") (@post \"/search\")))}]
+
+   Locals splice automatically; evt/el/$signals/JS interop pass through
+   to the client.  Canonical documentation: hyper.expr/->expr."
+  [& forms]
+  `(hyper.expr/->expr ~@forms))
+
+(defmacro defc
+  "Define a client-side web component, authored in a CLJS dialect (Squint)
+   and compiled to JavaScript on the JVM at macro-expansion time.
+
+     (defc temp-gauge
+       [{:keys [value max label]}]
+       (event ::selected [_e]
+         (emit \"gauge-selected\" {:value value :label label}))
+       (render
+         [:div {:on {:click ::selected}} label \": \" value]))
+
+   Also defines a server-side render function of the same name, so pages
+   call components like ordinary hiccup functions.  Canonical
+   documentation: hyper.component/defc."
+  {:style/indent        1
+   :style.cljfmt/indent [[:block 1] [:inner 1]]}
+  [& args]
+  `(component/defc ~@args))
 
 (defn navigate
   "Create a navigation link using reitit named routes.
@@ -493,6 +730,9 @@
    Options (keyword arguments):
    - :app-state         — Atom for application state (default: fresh atom)
    - :datastar-script   - Override of the default datastar script tag (as Hiccup) or nil to suppress
+   - :squint-core-url   — Override of the squint core.js URL used by the client
+                          components bundle (default: version-matched jsDelivr CDN).
+                          Point at a self-hosted copy for offline/air-gapped deploys.
    - :head              — Hiccup nodes appended to the HTML <head>, or (fn [req] ...) -> hiccup
    - :base-path         — URL path prefix for reverse-proxy deployments where the app is served
                           under a subfolder (e.g. \"/my-app\"). When set, all internal hyper
@@ -526,6 +766,12 @@
                           to `hyper.render.error/minimal` (generic, production-
                           safe).  Use `hyper.render.error/explain` in development
                           to render the message, ex-data, and full stack trace.
+   - :not-found         — Function `(fn [req] -> hiccup)` rendered when no route
+                          matches, served as a full page with HTTP 404 (and over
+                          SSE for client-side navigation).  May be a Var to pick
+                          up redefinitions.  Defaults to
+                          `hyper.render.error/not-found`; pass `nil` to disable
+                          and fall back to reitit's plain-text 404.
 
    The request key :hyper/env is reserved for application-provided context.
    Ring middleware that sets :hyper/env on the request will have it automatically
@@ -559,9 +805,10 @@
      (stop! app)"
   [routes & {:keys [app-state head static-resources static-dir watches
                     datastar-script base-path middleware render-middleware
-                    render-error hiccup-transform]
+                    render-error hiccup-transform squint-core-url render-guard]
              :or   {app-state       (atom (state/init-state))
-                    datastar-script server/default-datastar-script}}]
+                    datastar-script server/default-datastar-script}
+             :as   opts}]
   (server/create-handler routes app-state
                          (cond-> {:head              head
                                   :datastar-script   datastar-script
@@ -571,10 +818,13 @@
                                   :base-path         base-path
                                   :middleware        middleware
                                   :render-middleware render-middleware
-                                  :hiccup-transform  hiccup-transform}
-                           ;; Only forward when supplied so server-level
-                           ;; default (`render.error/minimal`) applies otherwise.
-                           render-error (assoc :render-error render-error))))
+                                  :hiccup-transform  hiccup-transform
+                                  :squint-core-url   squint-core-url}
+                           ;; Only forward when supplied so server defaults apply.
+                           render-error (assoc :render-error render-error)
+                           render-guard (assoc :render-guard render-guard)
+                           ;; `contains?` so an explicit `:not-found nil` (disable) is honored.
+                           (contains? opts :not-found) (assoc :not-found (:not-found opts)))))
 
 (defn start!
   "Start the hyper application server.

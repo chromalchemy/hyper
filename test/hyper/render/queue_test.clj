@@ -248,3 +248,33 @@
       (is (nil? (rq/enqueue-partial! q "x")))
       (is (nil? (rq/enqueue-scripts! q ["y"])))
       (is (nil? (rq/enqueue-shutdown! q))))))
+
+;; ---------------------------------------------------------------------------
+;; Timeout arity (heartbeat)
+;; ---------------------------------------------------------------------------
+
+(deftest test-drain-timeout-idle
+  (testing "drain! with a timeout returns :idle? when no events arrive"
+    (let [q      (rq/make-queue)
+          result (rq/drain! q 10)]
+      (is (true? (:idle? result)))
+      (is (false? (:shutdown? result)))
+      (is (false? (:full-render? result)))
+      (is (= #{} (:dirty-ids result)))
+      (is (= [] (:scripts result))))))
+
+(deftest test-drain-timeout-returns-events
+  (testing "drain! with a timeout categorizes events present within the window"
+    (let [q (rq/make-queue)]
+      (rq/enqueue-full-render! q)
+      (rq/enqueue-partial! q "comp-1")
+      (let [result (rq/drain! q 1000)]
+        (is (false? (:idle? result)))
+        (is (true? (:full-render? result)))
+        (is (= #{"comp-1"} (:dirty-ids result)))))))
+
+(deftest test-blocking-drain-not-idle
+  (testing "the blocking arity never reports :idle?"
+    (let [q (rq/make-queue)]
+      (rq/enqueue-full-render! q)
+      (is (false? (:idle? (rq/drain! q)))))))

@@ -145,14 +145,14 @@
 
       ;; Count reactive components registered
       (let [tab-id     "test-tab"
-            components (get-in @(:app-state r1) [:tabs tab-id :reactive-components])]
+            components (get-in @(:app-state r1) [:tabs tab-id :subviews])]
         (is (= 1 (count components)) "should have 1 reactive component for mode A"))
 
       ;; Switch mode and re-render
       (swap! (:app-state r1) assoc-in [:tabs "test-tab" :data :mode] :b)
       (let [r2         (ht/test-page render-fn {:app-state (:app-state r1)})
             tab-id     "test-tab"
-            components (get-in @(:app-state r2) [:tabs tab-id :reactive-components])]
+            components (get-in @(:app-state r2) [:tabs tab-id :subviews])]
         (is (str/includes? (:body-html r2) "Mode B"))
         (is (= 1 (count components)) "should have 1 reactive component for mode B (old one swept)")))))
 
@@ -177,5 +177,5 @@
         ;; But disposal only happens if watches were set up (which requires a renderer)
         ;; In test-page context, component watches are not set up since there's no
         ;; renderer thread. The sweep still removes the component registration.
-        (is (empty? (get-in @(:app-state r1) [:tabs "test-tab" :reactive-components]))
+        (is (empty? (get-in @(:app-state r1) [:tabs "test-tab" :subviews]))
             "swept component should be removed")))))

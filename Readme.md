@@ -45,6 +45,22 @@ grateful to the people whose work and ideas made this possible:
   [From Tomorrow Back to Yesterday](https://www.youtube.com/watch?v=8W6Lr1hRgXo&t=2s)
   at Clojure/conj 2025 shaped our thinking on server-driven UI and the
   direction of web development in Clojure.
+- [Thomas Heller](https://github.com/thheller)'s
+  [shadow-grove](https://github.com/thheller/shadow-grove), whose `defc`
+  macro — declarative segments for event handlers and rendering — directly
+  shaped the API of hyper's [client components](#client-components-web-components).
+  Its community-contributed
+  [defc linter](https://github.com/thheller/shadow-grove/pull/10) likewise
+  inspired our clj-kondo hook design.
+- [Michiel Borkent](https://github.com/borkdude)'s
+  [Squint](https://github.com/squint-cljs/squint) compiler, which runs on
+  the JVM and makes it possible to compile client components to JavaScript
+  at macro-expansion time — no Node, no build step.
+- [Casey Link](https://github.com/ramblurr)'s
+  [datastar-expressions](https://github.com/outskirtslabs/datastar-expressions),
+  whose transpiler core — sandbox-safe operator output, `@action` syntax
+  restoration, kebab-case signal preservation — hyper's
+  [`expr`](#expressions) macro is ported from.
 
 ## Project Status
 
@@ -110,6 +126,11 @@ The optional second argument sets a default value when the key is nil.
 | `session-cursor` | ✅ | No | ✅  (session length) |
 | `tab-cursor` | No | No | No (in-memory) |
 | `path-cursor` | No | No | ✅ (URL query params) |
+
+`tab-cursor` state is in-memory and does not survive a full page reload, but it
+**does** survive a transient connection drop: a brief disconnect detaches the tab
+and a reconnect within the grace window restores it untouched. See
+[Reconnection and the disconnect grace window](#reconnection-and-the-disconnect-grace-window).
 
 Mutating any cursor triggers a re-render for every tab that depends on that
 scope — global changes re-render all tabs, session changes re-render tabs in
@@ -190,7 +211,11 @@ Actions can capture client-side DOM values and transmit them to the server using
 | `$value` | `evt.target.value` | Input/select/textarea value |
 | `$checked` | `evt.target.checked` | Checkbox/radio boolean state |
 | `$key` | `evt.key` | Keyboard event key name |
+| `$detail` | `evt.detail` | CustomEvent payload (e.g. from web components) |
 | `$form-data` | All named form fields | Form submission as a map |
+
+Map-shaped params (`$form-data`, `$detail`) arrive with keyword keys —
+`{:name "Alice"}`, not `{"name" "Alice"}`.
 
 Example usage:
 
@@ -243,9 +268,12 @@ The guard runs before the action fires, letting you filter events at the browser
 ```clojure
 ;; Only POST when Enter is pressed — no network traffic on other keystrokes
 [:input {:type "text"
-         :data-on:keydown (h/action {:when "evt.key === 'Enter'"}
+         :data-on:keydown (h/action {:when (h/expr (= evt.key "Enter"))}
                            (reset! (h/tab-cursor :value) $value))}]
 ```
+
+The guard is any Datastar expression — build it with [`expr`](#expressions)
+as above, or pass a raw string (`{:when "evt.key === 'Enter'"}`).
 
 ## Signals
 
@@ -306,6 +334,13 @@ Datastar expressions with normal string operations:
 [:div {:data-show (str @name* " !== ''")} "Has name"] ;; → data-show="$userName !== ''"
 ```
 
+For anything beyond trivial concatenation, prefer [`expr`](#expressions),
+which compiles s-expressions to Datastar expressions:
+
+```clojure
+[:div {:data-show (h/expr (not= @name* ""))} "Has name"]
+```
+
 The signal itself **without deref** renders as the raw signal name (no `$`
 prefix), which is the correct format for `data-bind`:
 
@@ -359,8 +394,8 @@ dropdown visibility, accordion state, modal toggles:
 ```clojure
 (let [open?* (h/local-signal :open false)]
   [:div
-   ;; Build a toggle expression using deref
-   [:button {:data-on:click (str @open?* " = !" @open?*)} "Toggle"]
+   ;; Toggle with atom vocabulary — compiles to "$_open = !($_open)"
+   [:button {:data-on:click (h/expr (swap! open?* not))} "Toggle"]
    ;; data-show needs the expression form (@)
    [:div {:data-show @open?*} "Collapsible content"]])
 ```
@@ -383,6 +418,63 @@ Under the hood, `h/signal` does three things:
 All actions use Datastar's `@post()` under the hood, so signal values are
 always available — even in actions that also use client params like `$value`,
 `$key`, etc.
+
+## Expressions
+
+`expr` compiles Clojure s-expressions into
+[Datastar expression](https://data-star.dev/guide/datastar_expressions)
+strings, eliminating string-concatenation gymnastics in `data-*` attributes:
+
+```clojure
+(let [open?*  (h/local-signal :open false)
+      query*  (h/signal :query "")]
+  [:div
+   ;; signals use atom vocabulary — exactly like in actions
+   [:button {:data-on:click (h/expr (swap! open?* not))} "Toggle"]
+   ;; → data-on:click="$_open = !($_open)"
+
+   [:input {:data-on:keydown
+            (h/expr (when (= evt.key "Enter")
+                      (reset! query* evt.target.value)
+                      (@post "/search")))}]
+   ;; → guard + assignment + Datastar action, in one expression
+
+   [:div {:data-show (h/expr (not= @query* ""))} "Searching…"]])
+```
+
+The key idea: **the same vocabulary means the same thing everywhere** — a
+`(reset! sig v)` inside `h/action` is a server round-trip; inside `h/expr`
+it compiles to an instant client-side assignment. The surrounding macro
+decides where code runs, not the syntax.
+
+`expr` infers the Clojure/client boundary automatically:
+
+| Form | Treatment |
+|---|---|
+| Locals from surrounding scope | Spliced at runtime — signals become `$refs`, values become JS literals |
+| `(reset! sig v)` / `(swap! sig f & args)` | Client-side signal assignment |
+| `@sig` | Signal reference (`$name`) |
+| `(:kw m)` keyword calls | Evaluated as Clojure, spliced as literals |
+| `~form` | Explicit splice (escape hatch for arbitrary Clojure) |
+| `$signals`, `evt`, `el`, `(@post "/x")`, JS interop | Pass through to the client |
+
+Compilation happens at macro-expansion time (via the same embedded
+[Squint](https://github.com/squint-cljs/squint) compiler that powers
+[client components](#client-components-web-components)) — runtime cost is
+string interpolation of spliced values only. Output is dependency-free
+JavaScript suitable for Datastar's sandboxed evaluator.
+
+`expr` also works in `action`'s `:when` guard:
+
+```clojure
+[:input {:data-on:keydown (h/action {:when (h/expr (= evt.key "Enter"))}
+                            (search! $value))}]
+```
+
+It covers the simple, obvious expressions a human would write; it is
+possible to construct forms that compile to broken JavaScript. Raw strings
+remain supported everywhere expressions are accepted. The canonical
+namespace is `hyper.expr` (`->expr`); `h/expr` is a re-export.
 
 ## Effects
 
@@ -687,7 +779,7 @@ The execution order for `:middleware` is:
 
 ```
 Request arrives
-  → Hyper built-ins: cookies → params → keyword-params → brotli → hyper-context
+  → Hyper built-ins: cookies → params → keyword-params → gzip → hyper-context
   → Your :middleware (first in vector = outermost, runs first)
   → Router dispatch (page-handler, action-handler, etc.)
 ```
@@ -790,7 +882,7 @@ In an action:
 | Entry point | What happens |
 |---|---|
 | **Page load** (GET) | Ring middleware sets `:hyper/env` → Hyper stashes per-tab → render fn sees it |
-| **SSE re-render** | Hyper merges stashed env into the synthetic request → render fn sees it |
+| **SSE re-render** | Hyper seeds the synthetic request with the stashed env → render fn sees it |
 | **Action POST** | Ring middleware refreshes `:hyper/env` → Hyper re-stashes (full replace) → action body sees it |
 | **SPA navigation** | No HTTP request → render uses stashed env from last capture |
 
@@ -944,6 +1036,30 @@ You can also read it from `context/*request*` inside actions or anywhere within
 the request context — the value is always consistent with the tab's current
 route.
 
+### Parameter coercion
+
+Add a `:parameters` spec to a route and Hyper coerces the raw string params into
+typed values (via [reitit](https://github.com/metosin/reitit) + malli) before
+your render function runs. The coerced values show up on `:hyper/route` under
+`:path-params` / `:query-params`:
+
+```clojure
+(def routes
+  [["/user/:id" {:name :user
+                 :parameters {:path  [:map [:id :int]]
+                              :query [:map [:tab :keyword]]}
+                 :get #'user-page}]])
+
+(defn user-page [req]
+  (let [{:keys [id]}  (get-in req [:hyper/route :path-params])   ;; => 42 (int)
+        {:keys [tab]} (get-in req [:hyper/route :query-params])] ;; => :posts (keyword)
+    ...))
+```
+
+If coercion fails (e.g. `/user/abc` against an `:int`), Hyper responds with a
+`400` and a human-readable explanation of what was wrong. Routes without a
+`:parameters` spec keep their raw string params as before.
+
 ### Ring response passthrough
 
 If a route handler returns a Ring response map (a map with `:status`) instead of
@@ -961,6 +1077,29 @@ doesn't fit the render-and-stream model:
 This works for any status code or response shape — 301/302 redirects, 403
 forbidden, JSON responses, etc.
 
+### Custom 404 page
+
+When no route matches, Hyper renders a built-in 404 page through the normal
+render pipeline — full HTML with HTTP 404 on initial loads, and pushed over SSE
+when client-side navigation hits a dead URL. Override it with `:not-found`, a
+`(fn [req] -> hiccup)`:
+
+```clojure
+(defn not-found-page [req]
+  [:div
+   [:h1 "Page not found"]
+   [:p "No page at " [:code (:uri req)]]
+   [:a (h/navigate :home) "Go home"]])
+
+(def handler
+  (h/create-handler #'routes
+    :not-found #'not-found-page))
+```
+
+Pass a Var to pick up REPL redefinitions without restarting. The default lives
+at `hyper.render.error/not-found`. Pass `:not-found nil` to disable the feature
+and fall back to Reitit's plain-text 404.
+
 ## Suppress hyper wrapping certain endpoints
 
 You can suppress hyper wrapping an endpoint altogether by marking it as `:hyper/disabled?`
@@ -975,6 +1114,130 @@ You can suppress hyper wrapping an endpoint altogether by marking it as `:hyper/
                    :get #'about-page}]])
 ```
 
+## View lifecycle: form-1 / form-2 / form-3
+
+A page handler climbs a small ladder, chosen by one question: **what does this
+view own?** The vocabulary is the same at every rung — the *shape of the return
+value* tells Hyper which rung you're on.
+
+| rung | owns | handler returns |
+| --- | --- | --- |
+| **form-1** | nothing | hiccup — `(fn [req] [:div …])` |
+| **form-2** | framework-managed subscriptions (auto-cleaned) | a *setup* closure that returns the render fn |
+| **form-3** | an external resource needing explicit teardown | a `View` (via `h/view`) |
+
+### form-1 — pure
+
+The default. A pure function of state to hiccup. Owns nothing, cleans up
+nothing.
+
+```clojure
+(defn counter [req]
+  (let [n* (h/tab-cursor :n 0)]
+    [:div "n=" @n*]))
+```
+
+### form-2 — setup closure
+
+When a view needs *effects* to set up — a `watch!`, a worker, a one-time claim —
+return a closure. The **outer** fn runs once per mount (effects allowed); the
+**inner** fn it returns is your pure render, run on every re-render:
+
+```clojure
+(defn dashboard [req]
+  (h/watch! db-results*)              ;; setup — runs once per mount
+  (let [results* (h/tab-cursor :results)]
+    (fn [req]                         ;; render — runs every render, pure
+      [:ul (for [r @results*]
+             [:li (:name r)])])))
+```
+
+The subscriptions you register in setup are framework-managed: `watch!`/route
+`:watches` are reference-counted and torn down automatically when the tab
+disconnects or navigates away. form-2 needs no teardown of its own.
+
+### form-3 — `h/view`
+
+When a view owns a *resource that is not a `Watchable`* and must be released —
+a connection, a cursor, a file handle — return a `View`. Its `:mount` allocates
+and **returns** the resource; Hyper threads that value immutably into `:render`
+and `:unmount`:
+
+```clojure
+(defn report-page [req]
+  (h/view
+    {:mount   (fn []          (db/open-cursor (h/env :db) :reports))
+     :render  (fn [cursor req] [:ul (for [r (db/take! cursor 50)]
+                                      [:li (:title r)])])
+     :unmount (fn [cursor]     (db/close-cursor cursor))}))
+```
+
+`:render` is required; `:mount`/`:unmount` are optional. The view (re)mounts
+when the page first renders or the route handler identity changes (navigation,
+or a Var redefinition during REPL development); a superseded view is unmounted
+first. There is deliberately **no** mutable per-view slot — the server always
+re-renders declaratively, so a resource opened at mount, read during renders,
+and closed at unmount is just a value threaded through the lifecycle.
+
+Reach for form-3 sparingly. Frequent need for it usually means a resource
+should be modeled as a [`Watchable`](#the-watchable-protocol) (folding back into
+form-2) or owned by the system layer (`:hyper/env` + Integrant/Component) and
+merely *subscribed* by the view.
+
+### The render purity guard
+
+Because effects belong in form-2 setup or a form-3 `:mount`, the **render phase
+is pure**. Hyper watches for violations — a cursor `reset!`/`swap!`, a
+`h/watch!`, etc. during render — and reports them. `compare-and-set!` (used by
+the cursor/signal *default-value* arg) is exempt, since default-init is
+declarative, not a mutation.
+
+Configure via `:render-guard` on `create-handler`:
+
+- `:warn` (default) — log a warning; the effect still runs.
+- `:error` — throw; surface the violation as a hard failure.
+- `:off` — disable the guard.
+
+```clojure
+(h/create-handler #'routes :render-guard :error)
+```
+
+### Background workers — `h/spawn!`
+
+When a view needs a long-lived background process — a poller, a queue
+consumer, a clock — call `h/spawn!`. It runs a zero-arg function once on a
+virtual thread that Hyper owns and **interrupts on unmount** (navigation away,
+a Var redefinition, or tab disconnect). A worker is fire-and-forget — it
+communicates by **writing state** (cursors), which drives the usual declarative
+re-render.
+
+```clojure
+(defn ticker-page [req]
+  (let [now* (h/tab-cursor :now)]
+    (h/spawn!                             ;; setup — runs once per mount
+      (fn []
+        (loop []
+          (reset! now* (System/currentTimeMillis))
+          (Thread/sleep 1000)
+          (recur))))                      ;; interrupted on unmount
+    (fn [req] [:p "Now: " @now*])))       ;; render — pure
+```
+
+The worker runs on its own thread with `*request*` bound, so `tab-cursor`,
+`session-cursor`, `global-cursor`, and `env` work inside it exactly as in a
+handler, and it may write cursors freely. Keep the loop interruptible — block on
+`Thread/sleep`, a `BlockingQueue`, etc. — so the unmount interrupt unwinds it;
+catch `InterruptedException` to clean up on the way out.
+
+`spawn!` is **mount-scoped** and keyed by call order, so a form-1 body that
+calls it on every render spawns exactly one worker. A
+[form-2](#form-2--setup-closure) setup closure is its natural home — "start this
+worker when the view mounts" — keeping the render body a pure function of state.
+
+> Reach for `spawn!` only when you genuinely need a long-lived loop or blocking
+> consumer tied to the view. For one-shot data loading with a placeholder,
+> prefer [`async`](#async--render-time-data-loading).
+
 ## Watches
 
 Under the hood, Hyper maintains a persistent SSE connection per tab. When state
@@ -985,22 +1248,30 @@ external sources you need to tell Hyper what to watch.
 
 ### `watch!`
 
-Call `watch!` from your render function to observe any external source. When it
-changes, Hyper re-renders and pushes an update to the client:
+Call `watch!` to observe any external source. When it changes, Hyper re-renders
+and pushes an update to the client. `watch!` is an *effect*, so it belongs in a
+[form-2](#form-2--setup-closure) setup closure — registered once per mount:
 
 ```clojure
 (def db-results* (atom []))
 
 (defn dashboard [req]
-  (h/watch! db-results*)
-  [:div
-   [:h1 "Results"]
-   [:ul (for [r @db-results*]
-          [:li (:name r)])]])
+  (h/watch! db-results*)          ;; setup — runs once per mount
+  (fn [req]                       ;; render — pure
+    [:div
+     [:h1 "Results"]
+     [:ul (for [r @db-results*]
+            [:li (:name r)])]]))
 ```
 
-`watch!` is idempotent — safe to call on every render. Watches are automatically
-cleaned up when the tab disconnects.
+Watches are reference-counted and automatically cleaned up when the tab is torn
+down (navigation away, or a disconnect that is not reconnected within the
+[grace window](#reconnection-and-the-disconnect-grace-window)). A transient
+disconnect leaves watches in place, so a reconnect does not re-run their setup.
+
+> Calling `watch!` directly in a form-1 render body still works (it is
+> idempotent), but trips the [render purity guard](#the-render-purity-guard) —
+> prefer the form-2 setup closure shown above.
 
 ### The `Watchable` protocol
 
@@ -1159,6 +1430,318 @@ into functions:
      (live-clock clock*)]))
 ```
 
+## `async` — render-time data loading
+
+`async` loads data in the background and renders a placeholder until it lands —
+then re-renders **just that region** with the result. It's the ergonomic pairing
+of a [`spawn!`](#background-workers--hspawn) worker, a backing status value, and
+a [`reactive`](#reactive-components) region, with no manual loading-state plumbing.
+
+```clojure
+(defn rows-page [req]
+  (let [user-id* (h/path-cursor :user 0)]
+    (h/async [user-id*]
+      (db/fetch-rows @user-id*)                ;; runs off-render on a worker thread
+      {:keys [status result error]}
+      (case status
+        :ready     (render-rows result)
+        :error     [:p "Failed: " (ex-message error)]
+        :reloading [:div.stale (render-rows result)]
+        [:p "Loading…"]))))
+```
+
+`async` reads its deps inline and returns hiccup, so it sits directly in the
+render body wherever the data is shown.
+
+The shape is a sibling of `reactive`:
+
+```
+(h/async [deps] fetch-expr binding & render-body)
+```
+
+- **`deps`** — a vector of `Watchable` sources. `[]` fetches once per mount;
+  otherwise a change to a dep refetches (see `:reloading`).
+- **`fetch-expr`** — a single expression evaluated on a background virtual
+  thread while the placeholder renders (wrap multiple forms in `do`). Blocking
+  I/O is fine — it's a virtual thread.
+- **`binding`** — destructures the status map.
+- **`render-body`** — hiccup rendered from the status; must return a single
+  rooted element (as with `reactive`), so the region id can be injected.
+
+### The status map
+
+`async` hands your body a map `{:status :result :error}`:
+
+| `:status`    | meaning                                                              |
+|--------------|---------------------------------------------------------------------|
+| `:loading`   | first load in flight; `:result` is nil                              |
+| `:ready`     | `:result` holds the value; a nil result is `{:status :ready :result nil}` |
+| `:error`     | `:error` holds the throwable; `:result` keeps the prior value       |
+| `:reloading` | a dep changed and a refetch is in flight; `:result` still holds the previous value (stale-while-revalidate) |
+
+### Lifecycle and purity
+
+`async` is a *declaration*: rendering it registers a region and starts the fetch
+on a worker thread, so it belongs in the render body just as
+[`reactive`](#reactive-components) does — see the [render purity
+guard](#the-render-purity-guard). The placeholder→result transition is a state
+change driving a targeted re-render. The region is torn down — and any in-flight
+fetch interrupted — when it leaves the view tree, on navigation, or on tab
+disconnect.
+
+> Prefer `async` for **leaf / region-local** data that wants its own loading
+> state co-located with its render. For **page-level** data you want before
+> first paint or shared across regions, load it in a form-2 setup closure into a
+> cursor instead.
+
+### Lint support
+
+A clj-kondo hook validates `async` at edit time: it checks the call shape
+(deps vector, a fetch expression, a binding form, a non-empty render body),
+makes the destructured `status`/`result`/`error` bindings visible to normal
+linting (including unused-binding), and **flags `:status` branches outside the
+status set** (`:loading`, `:ready`, `:error`, `:reloading`) — a `case` branch or
+`(= status …)` testing any other keyword:
+
+```clojure
+(h/async [] (fetch) {:keys [status]}
+  (case status
+    :ready  (render result)
+    :done   ...))           ;; ⚠ :done is outside async's status set
+```
+
+It also scans the render body for effects — `h/watch!`, `h/spawn!`, and state
+mutations (`swap!`/`reset!`) — and warns when one appears in render flow,
+pointing them at a form-2 setup closure or an action. The `reactive` hook shares
+this scan. Mutations inside `action`/`expr` (event and client contexts) and the
+`async` fetch (which runs on a worker thread) are render-legal and pass; this
+edit-time check complements the runtime [render purity
+guard](#the-render-purity-guard), which covers every render body, including page
+handlers the linter cannot identify statically.
+
+## Client Components (Web Components)
+
+Most hyper UIs need no client-side code at all — but some islands genuinely
+do: charts, editors, maps, anything built on a JavaScript library that owns
+its own DOM. `hyper.component/defc` lets you author those islands as
+**web components** written in a ClojureScript dialect
+([Squint](https://github.com/squint-cljs/squint)), compiled to JavaScript
+**on the JVM at macro-expansion time** — no Node, no build step, no npm.
+Compiled components are served as a single ES module at
+`/hyper/components.js` and auto-injected into the page `<head>`.
+
+The model follows Datastar's recommended pattern for rich client-side
+islands: **props down (attributes), events up (CustomEvents)**.
+
+```clojure
+(h/defc temp-gauge
+  "A client-side temperature gauge."
+  [{:keys [value max label]}]              ;; ← observed attributes
+
+  (event ::selected [_e]
+    (emit "gauge-selected" {:label label :value value}))
+
+  (render
+    (let [pct (js/Math.round (* 100 (/ value max)))]
+      [:div {:on {:click ::selected}}
+       [:strong label] " "
+       [:span pct "%"]])))
+```
+
+`defc` also emits a server-side function of the same name, so pages use
+components like ordinary hiccup functions:
+
+```clojure
+(defn dashboard [req]
+  (let [temp* (h/tab-cursor :temp 20)]
+    [:div
+     (temp-gauge {:value @temp*
+                  :max   40
+                  :label "CPU"
+                  :data-on:gauge-selected
+                  (h/action (handle-selection! $detail))})]))
+```
+
+### Attributes are the boundary
+
+The server pushes data into the component through HTML attributes —
+strings and numbers serialize raw, collections as deterministic JSON.
+When state changes, hyper re-renders the page and Datastar's morph updates
+attributes in place. The component re-renders **only when an attribute
+string actually changed** — unrelated server re-renders are a no-op (a
+single string comparison, no parse, no render). Multiple attribute changes
+in one morph are batched into a single client-side update.
+
+Because Squint uses plain JS data structures, a parsed attribute *is*
+native component data — `{:keys [...]}` destructuring works directly on
+it, with zero conversion.
+
+The boundary is JSON-typed: strings, numbers, booleans, vectors, and maps
+round-trip; **keywords become strings** on the client (Squint has no
+keyword type).
+
+### Events are the channel out
+
+`emit` (in scope in every segment) dispatches a bubbling, composed
+`CustomEvent` that crosses the shadow boundary. The server catches it with
+an ordinary `data-on:*` action; the payload arrives via the `$detail`
+client param as an idiomatic Clojure map. Parent elements can also
+intercept events before (or instead of) the server — composition is just
+DOM event bubbling.
+
+### JS libraries: `:require`
+
+Declare ES module dependencies with `:require`. Each URL is imported once
+in the bundle, deduplicated across components; an alias may map to only
+one URL across the app (conflicts throw at definition time).
+
+```clojure
+(h/defc stock-chart
+  {:require [["https://esm.sh/d3@7" :as d3]]}
+  [{:keys [points]}]
+  (render [:svg [:path {:d (d3/line points)}]]))
+```
+
+Global-script libraries also work without `:require` — load them via a
+`:head` script tag and call them through `js/` interop.
+
+### Seamless mode: `mount` / `update` / `unmount`
+
+For libraries that animate data transitions (d3, charting libs), re-rendering
+on every change would destroy the chart instance. Seamless mode hands data
+changes to the library instead:
+
+```clojure
+(h/defc live-bars
+  {:require [["https://esm.sh/d3@7" :as d3]]}
+  [{:keys [values]}]
+
+  (render                                  ;; once-only scaffold
+    [:svg {:width 560 :height 180}])
+
+  (mount [root]                            ;; runs once
+    (let [draw (fn [vs]
+                 (-> (d3/select (.querySelector root "svg"))
+                     (.selectAll "rect") (.data vs) (.join "rect")
+                     (.transition) (.duration 500)
+                     (.attr "height" (fn [v] (* v 3)))))]
+      (set! (.-draw ctx) draw)             ;; ctx = per-instance state slot
+      (draw values)))
+
+  (update [_root]                          ;; runs on each data change
+    ((.-draw ctx) values)))
+```
+
+The contract: `mount` once, `update` per real data change, `unmount` on
+true removal. The DOM is never re-rendered after mount, so chart instances
+and in-flight transitions survive arbitrary server re-renders — morphs
+that merely move the element are debounced and do **not** unmount.
+`update` optionally receives the previous attributes:
+`(update [root old-attrs] ...)`.
+
+`ctx` is a stable per-instance JS object available in every segment — it
+carries `emit` and serves as the instance state slot
+(`(set! (.-chart ctx) ...)`).
+
+### Signal-linked attributes
+
+Pass a [signal](#signals) object (un-deref'd, mirroring `data-bind`) as an
+attribute value to create a **live two-way client-side link** — the
+component reacts to signal changes with zero server round-trips, and
+writes the signal back by emitting an event named after the attribute:
+
+```clojure
+(defn dashboard [req]
+  (let [hover* (h/signal :hovered-symbol nil)]
+    [:div
+     (stock-chart {:points @points* :hover hover*})
+     (sparkline   {:points @points* :hover hover*})   ;; shared crosshair
+     [:span {:data-text @hover*}]]))                  ;; same signal, plain hiccup
+
+;; inside either component: read `hover` like any attribute; write it with
+(emit "hover" "AAPL")
+```
+
+The component cannot tell whether an attribute is driven by the server, a
+signal, or a test — components stay pure functions of their attributes.
+
+### Styles
+
+Components render into shadow DOM (which also makes them invisible to
+Datastar's morph — internals are never clobbered). Document stylesheets
+are inherited into each shadow root automatically, so global CSS — e.g. a
+Tailwind build included via `:head` — styles component internals without
+extra wiring.
+
+### Live reload
+
+Re-evaluating a `defc` at the REPL recompiles the component and hot-swaps
+it into every connected tab over SSE: declarative components re-render,
+seamless components unmount and remount against the new code. Instance
+`ctx` survives the swap.
+
+### The Squint dialect
+
+`defc` segment bodies are [Squint](https://github.com/squint-cljs/squint),
+not Clojure — they compile to JavaScript and run in the browser:
+
+- Data structures are plain JS objects/arrays; keywords are strings
+- `js/` interop everywhere (`js/Math.round`, `(.querySelector root "svg")`)
+- Squint's core library covers most of `clojure.core`, operating on JS data
+- Compilation happens at macro-expansion — Squint errors fail your build
+  with the generated source attached, never reaching the browser
+
+Hyper ships clj-kondo config (see [clj-kondo](#clj-kondo)) that validates
+`defc` structure at lint time and makes attrs, `emit`, and `ctx` resolve
+inside segments.
+
+`h/defc` is a re-export; the canonical namespace is `hyper.component`,
+which also houses the lower-level API (`register-component!`, `attrs`,
+the bundle registry).
+
+For self-hosted/air-gapped deploys, override the Squint runtime CDN URL
+with the `:squint-core-url` option on `create-handler`.
+
+### Editor indentation
+
+`defc`'s `render`/`event`/`mount`/`update`/`unmount` segments are
+method-body forms, so they should indent two spaces (like `deftype`)
+rather than aligning under the argument vector:
+
+```clojure
+(h/defc foo
+  (render [x]
+    [:h1 x]))        ;; ← body indented 2, not aligned under [x]
+```
+
+Editors learn this differently:
+
+- **clojure-lsp** (Calva, Emacs/lsp-mode, neovim, …) — hyper ships the rule
+  on the classpath. Add one line to your `.lsp/config.edn`:
+
+  ```clojure
+  {:classpath-config-paths ["dynamic-alpha/hyper"]}
+  ```
+
+  clojure-lsp merges hyper's `:cljfmt :extra-indents` automatically.
+
+- **CIDER (Emacs)** — works with no config: `defc` carries `:style/indent`
+  metadata that CIDER reads live from the REPL.
+
+- **Plain `cljfmt` / `lein-cljfmt` / Calva's bundled formatter** — these
+  don't read dependency classpaths, so add the rule to your project
+  `.cljfmt.edn` (`:extra-indents` appends to the defaults):
+
+  ```clojure
+  {:extra-indents
+   {defc                 [[:block 1] [:inner 1]]
+    hyper.core/defc      [[:block 1] [:inner 1]]
+    hyper.component/defc [[:block 1] [:inner 1]]}}
+  ```
+
+  The unqualified entry covers `defc` called via `:refer`; the qualified
+  entries cover `h/defc` / `component/defc`.
+
 ## Batched cursor updates
 
 When an action updates multiple cursors, the renderer could snapshot between
@@ -1314,10 +1897,180 @@ Hyper's built-in `/hyper/events` endpoint automatically sends SSE-friendly
 headers, including `Cache-Control: no-cache, no-transform` and
 `X-Accel-Buffering: no`, to improve compatibility with reverse proxies.
 
-## Brotli compression
+### Heartbeat keepalive
 
-Hyper uses [brotli4j](https://github.com/hyperxpro/Brotli4j) to compress both
-initial page responses and streaming SSE updates.
+An otherwise-idle SSE connection (no state changes for a while) sends a periodic
+keepalive — a tiny SSE comment line that every conformant parser, Datastar
+included, ignores. It does two jobs:
+
+- **Survives reverse-proxy idle timeouts.** Many proxies (nginx, load balancers,
+  CDNs) cull connections idle for ~30–60s. The keepalive keeps the stream warm so
+  a quiet page doesn't get disconnected and reconnected on a loop.
+- **Surfaces dead/half-open connections.** When a client vanishes without a clean
+  close (laptop sleep, NAT timeout), the server may not notice until it next tries
+  to write. The keepalive *is* that write — so a broken channel is detected and
+  closed, which starts the [grace window](#reconnection-and-the-disconnect-grace-window)
+  instead of leaving the tab pinned as "connected" indefinitely.
+
+The interval is configurable with `:heartbeat-ms` (default **25000**, i.e. 25s —
+comfortably under common proxy timeouts); pass `nil` or `0` to disable:
+
+```clojure
+(def handler
+  (h/create-handler
+    #'routes
+    :heartbeat-ms 15000))   ;; ping idle connections every 15s
+```
+
+### Reconnection and the disconnect grace window
+
+Real connections drop: wifi blips, cellular handoffs, proxy idle timeouts, a
+laptop going to sleep, or a hidden tab under `:open-when-hidden? false`. When the
+SSE connection drops, Hyper does **not** immediately tear the tab down. Instead it
+*detaches* — it stops the renderer and closes the channel, but keeps the tab's
+state alive for a grace window:
+
+- **tab-cursor state** and **signals** are preserved
+- **watches**, **reactive components**, and **form-3 resources** stay mounted
+  (no `:unmount`/re-`:mount` churn — your DB cursors and connections are not
+  reopened)
+- **`spawn!` background workers** keep running (they are not interrupted)
+
+Datastar reconnects automatically to the same tab, and Hyper **re-attaches** a
+fresh renderer to the still-living tab. The reconnect is reconciled with a single
+full render, so the DOM catches up to current state in one step — there is no
+missed-event replay to worry about, because every render is a complete snapshot.
+
+The practical effect: a transient disconnect is **invisible**. The user keeps
+their unsaved form input, the open modal, the running upload; nothing flickers or
+resets.
+
+Only if the tab fails to reconnect within the grace window is it fully torn down
+(watches removed, `form-3`/`watch!` resources disposed, workers interrupted, state
+dropped) — exactly the old behavior, just deferred.
+
+Configure the window with `:disconnect-grace-ms` (default **180000**, i.e. 3
+minutes):
+
+```clojure
+(def handler
+  (h/create-handler
+    #'routes
+    :disconnect-grace-ms (* 5 60 1000)))   ;; keep detached tabs for 5 minutes
+```
+
+A shorter window frees server resources sooner after a tab is truly gone; a longer
+window tolerates longer outages before resetting. Note that this covers
+*transient disconnects* of a still-loaded page — a full page **reload** still
+starts a fresh tab (as the [cursor table](#cursors) describes), and `tab-cursor`
+state is in-memory, so it does not survive a server restart.
+
+### Connection status signals
+
+While the grace window keeps reconnection *invisible* most of the time, sometimes
+you want to *show* connection state — a "Reconnecting…" banner, a dimmed UI, a
+"connection lost" message. Hyper exposes two built-in signals for this:
+
+- **`h/connected?*`** — a boolean: `true` while the SSE connection is healthy,
+  `false` while disconnected or reconnecting. Covers the common case.
+- **`h/connection*`** — a keyword token for richer UX, one of
+  `h/connection-states`: `:connecting`, `:open`, `:reconnecting`, `:error`,
+  `:closed`.
+
+Both are **client-only signals** maintained entirely in the browser from
+Datastar's connection lifecycle — the server can't report on a connection that's
+down, so there's nothing to wire up and no per-page setup. Just deref them in
+your views:
+
+```clojure
+;; Simple — show a banner whenever the connection isn't healthy
+(defn app [req]
+  [:div
+   [:div.banner {:data-show (h/expr (not @h/connected?*))}
+    "Reconnecting…"]
+   (page-content req)])
+
+;; Richer — distinguish reconnecting from a terminal failure
+[:div
+ [:span {:data-show (h/expr (= @h/connection* :reconnecting))} "Reconnecting…"]
+ [:span {:data-show (h/expr (= @h/connection* :error))}        "Connection lost"]
+ ;; dim the whole app while not connected
+ [:main {:data-class (h/expr {:offline (not @h/connected?*)})}
+  (page-content req)]]
+```
+
+Compare `connection*` against **keyword tokens** — they compile to the same
+client-side string the signal actually holds, so `(= @h/connection* :reconnecting)`
+is both idiomatic and correct. (Raw strings work too:
+`"$_hyperConnection === 'reconnecting'"`.)
+
+Because they are client-only, these signals behave like any
+[local signal](#local-signal): deref in **render**/`expr` yields the Datastar
+expression (`$_hyperConnected` / `$_hyperConnection`); deref in an **action**
+throws, since connection state isn't readable server-side. You'll generally only
+read them in `data-show`/`data-class`/`data-text` and `expr`.
+
+> **About the error state:** browser SSE errors are opaque, so `:error` (and the
+> messaging around it) is *your* copy keyed on the token — not a server-provided
+> error string. The server can't send error detail while the connection is down.
+> `:error` is reached only when Datastar's retries are exhausted; a transient
+> blip surfaces as `:reconnecting`.
+
+### Triggering a reconnect — `h/reconnect`
+
+Datastar auto-retries network errors, but it does **not** auto-retry the
+end-of-stream cases — exhausted retries (`:error`) or a graceful close
+(`:closed`). For those, `h/reconnect` gives you a recovery action to bind to an
+event, typically a "Retry" button shown alongside the `:error` state:
+
+```clojure
+[:div {:data-show (h/expr (= @h/connection* :error))}
+ "Connection lost. "
+ [:button {:data-on:click (h/reconnect)} "Retry"]]
+```
+
+`h/reconnect` returns the Datastar `@get` expression that re-opens this tab's
+SSE connection (reusing the exact endpoint, `:base-path`, and `:open-when-hidden?`
+the page booted with, so the two can't drift). It must be called in render
+context.
+
+It performs a **soft** reconnect: because the tab-id is unchanged, it
+re-attaches to the still-living tab within the
+[grace window](#reconnection-and-the-disconnect-grace-window) — cursor state,
+signals, and background workers are preserved. This is the key difference from a
+full page reload (`window.location.reload()`), which starts a fresh tab and
+discards all tab-local state. Reach for a reload only as a nuclear fallback (e.g.
+after a server redeploy where client code may have changed).
+
+> If the grace window has already elapsed, the tab has been fully torn down, so
+> reconnecting starts a fresh tab — the connection comes back, but tab-local
+> state does not. Word any "Retry" copy accordingly.
+
+## Gzip compression
+
+Hyper compresses both initial page responses and streaming SSE updates with
+gzip, using only `java.util.zip` (no native dependency).
+
+- **Initial page responses** are compressed one-shot at maximum level
+  (`Deflater/BEST_COMPRESSION`) by the built-in `wrap-gzip` middleware.
+- **SSE updates** are compressed with a single streaming `GZIPOutputStream`
+  per connection (so the deflate window is shared across patches for better
+  ratios), flushed after every patch with `SYNC_FLUSH` so the browser paints
+  each patch the moment it is written.
+
+Compression is enabled whenever the client advertises `Accept-Encoding: gzip`,
+which every browser does over both HTTP and HTTPS.
+
+### Why gzip and not brotli?
+
+hyper streams SSE patches compressed, flushing after each one. A brotli flush
+emits a block that is only surfaced by an *eager* decoder — and WebKit/Safari's
+decoder is not eager, so a flushed-but-not-final brotli block stays buffered
+until the *next* write arrives. The visible symptom is Safari rendering each SSE
+patch one event behind (most noticeable with large, discrete patches). gzip's
+`SYNC_FLUSH` boundary (the `00 00 FF FF` marker) is surfaced mid-stream by every
+browser, so patches paint immediately. Standardising on gzip also lets hyper
+drop the brotli4j JNI native dependency entirely.
 
 ## clj-kondo
 
@@ -1406,7 +2159,7 @@ Without `:as`, actions are keyed by their auto-generated action ID. `:as` can
 be combined with `:when`:
 
 ```clojure
-(h/action {:as "search" :when "evt.key === 'Enter'"} (search! $value))
+(h/action {:as "search" :when (h/expr (= evt.key "Enter"))} (search! $value))
 ```
 
 ### `test-action`
@@ -1488,7 +2241,7 @@ clojure -M:test
 ### Unit tests
 
 Unit tests live in `test/hyper/` and cover cursors, actions, navigation, routing,
-rendering, state management, effects, render middleware, and brotli compression.
+rendering, state management, effects, render middleware, and gzip compression.
 They run in-process with no server or browser — just bind `*request*` and
 exercise the API directly.
 

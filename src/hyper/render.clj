@@ -4,9 +4,12 @@
    Handles rendering hiccup to HTML and formatting Datastar SSE events."
   (:require [clojure.string :as string]
             [dev.onionpancakes.chassis.core :as c]
+            [hyper.component.bundle :as component.bundle]
             [hyper.context :as context]
+            [hyper.lifecycle :as lifecycle]
             [hyper.routes :as routes]
             [hyper.state :as state]
+            [hyper.subview :as subview]
             [hyper.utils :as utils]
             [taoensso.telemere :as t]))
 
@@ -42,6 +45,21 @@
   [app-state* tab-id render-fn]
   (swap! app-state* assoc-in [:tabs tab-id :render-fn] render-fn)
   nil)
+
+(defn- register-route-watches!
+  "Register the current route's framework watches as mount-scoped, full-render
+   subviews so they route through the unified subview engine: global :watches,
+   the route's :watches metadata, and the auto-watched :get Var (live reload).
+
+   Runs every full render — idempotent and keyed by source identity, so the
+   watches are wired by `subview/setup-new-watches!` and torn down on page-view
+   remount (navigation) / tab disconnect, exactly like user `h/watch!`."
+  [app-state* tab-id route-index route]
+  (when-let [route-name (:name route)]
+    (doseq [source (routes/find-route-watches route-index
+                                              (get @app-state* :global-watches)
+                                              route-name)]
+      (subview/register-watch! app-state* tab-id source))))
 
 (defn get-render-fn
   "Get the render function for a tab."
@@ -119,6 +137,32 @@
 
         :else head-hiccup))))
 
+(defn- head-elements
+  "Normalize a resolved :head value to a vector of elements.
+   Handles nil, a single element ([:style ...]), and a seq/vector of elements."
+  [h]
+  (cond
+    (nil? h)                                    []
+    (and (vector? h) (keyword? (first h)))      [h]
+    :else                                       (vec h)))
+
+(defn- resolve-full-head
+  "Resolve the user :head for a request and append the client-components
+   bundle script tag (when components are registered).  Injected here — in
+   the shared render pipeline — so both initial page loads and SSE head
+   updates carry it, and a component registry change rotates the script URL
+   (fingerprint diffing then hot-swaps the module).  Returns marked head
+   hiccup or nil."
+  [app-state* req]
+  (let [user-head (routes/resolve-head (get @app-state* :head) req)
+        comp-tag  (component.bundle/head-script-tag
+                    (get @app-state* :base-path "")
+                    {:squint-core-url (get @app-state* :squint-core-url)})
+        els       (cond-> (head-elements user-head)
+                    comp-tag (conj comp-tag))]
+    (when (seq els)
+      (mark-head-elements els))))
+
 (defn format-head-update
   "Build a self-removing <script> SSE event that imperatively updates
    the document title and diffs user-provided <head> elements.
@@ -164,9 +208,22 @@
                     "if(!newFps[fp])el.remove();"
                     "else delete newFps[fp];"  ;; already in DOM, skip
                     "});"
-                    ;; Append only genuinely new/changed elements
+                    ;; Append only genuinely new/changed elements.  Script
+                    ;; elements must be recreated via createElement — nodes
+                    ;; parsed from innerHTML are flagged non-executable, so a
+                    ;; plain appendChild would silently never run them (e.g.
+                    ;; the client-components bundle after a REPL redefine).
                     "Object.keys(newFps).forEach(function(fp){"
-                    "document.head.appendChild(newFps[fp]);"
+                    "var el=newFps[fp];"
+                    "if(el.tagName==='SCRIPT'){"
+                    "var s=document.createElement('script');"
+                    "for(var j=0;j<el.attributes.length;j++){"
+                    "s.setAttribute(el.attributes[j].name,el.attributes[j].value);"
+                    "}"
+                    "s.textContent=el.textContent;"
+                    "el=s;"
+                    "}"
+                    "document.head.appendChild(el);"
                     "});"))
                 "})();")]
     (str "event: datastar-patch-elements\n"
@@ -282,20 +339,33 @@
            base        (if base-req
                          base-req
                          (utils/warn-on-access-map {}))
+           ;; Resolve env up front from base-req (regular map) rather than
+           ;; reading it back off the synthetic request — reading a missing
+           ;; key through the warn-on-access map would itself log a warning.
+           env         (or (:hyper/env base-req) tab-env)
            req         (cond-> base
                          true    (assoc :hyper/session-id session-id
                                         :hyper/tab-id     tab-id
                                         :hyper/app-state  app-state*)
                          router  (assoc :hyper/router router)
                          route   (assoc :hyper/route route)
-                         tab-env (update :hyper/env #(or % tab-env))
+                         ;; Always seed :hyper/env (a reserved, framework-propagated
+                         ;; key) so reading it via h/env never trips the
+                         ;; warn-on-access map.  The value may be nil — that's
+                         ;; fine, it matches the silent nil returned on initial
+                         ;; page load.
+                         true    (assoc :hyper/env env)
                          true    (dissoc :reitit.core/match))]
        (push-thread-bindings (context/render-bindings req app-state*))
        (try
+         ;; Register framework route-level watches (global :watches, route
+         ;; :watches, auto-watched :get Var) as mount-scoped subviews.
+         (register-route-watches! app-state* tab-id route-index route)
          (let [mw-chain        (resolve-render-middleware app-state* route-index route)
-               wrapped-fn      (apply-render-middleware render-fn mw-chain)
+               wrap-mw         #(apply-render-middleware % mw-chain)
                render-error-fn (get @app-state* :render-error)
-               raw-body        (safe-render wrapped-fn req render-error-fn)]
+               raw-body        (lifecycle/render-page app-state* tab-id render-fn req
+                                                      render-error-fn wrap-mw)]
            ;; Ring response passthrough - render-fn returned a redirect,
            ;; error, or other non-hiccup response; pass it through as-is.
            (if (and (map? raw-body) (:status raw-body))
@@ -306,30 +376,29 @@
              ;; *registered-action-ids* AFTER serialization so the
              ;; accumulator captures every action the render produced.
              (let [transform    (get @app-state* :hiccup-transform)
-                   body         (unwrap-body raw-body)
+                   body        (unwrap-body raw-body)
                    body         (if transform (transform body) body)
-                   body-html    (if (vector? body)
-                                  (c/html body)
-                                  (apply str (map c/html body)))
-                   title-spec   (when (and (seq route-index) route)
-                                  (routes/find-route-title route-index (:name route)))
-                   title        (routes/resolve-title title-spec req)
-                   head         (some-> (routes/resolve-head (get @app-state* :head) req)
-                                        mark-head-elements)
+                   body-html   (if (vector? body)
+                                 (c/html body)
+                                 (apply str (map c/html body)))
+                   title-spec  (when (and (seq route-index) route)
+                                 (routes/find-route-title route-index (:name route)))
+                   title       (routes/resolve-title title-spec req)
+                   head        (resolve-full-head app-state* req)
                    head         (if (and transform head) (transform head) head)
-                   declared     @context/*declared-signals*
-                   action-ids   @context/*registered-action-ids*
-                   reactive-ids @context/*registered-reactive-ids*]
+                   declared    @context/*declared-signals*
+                   action-ids  @context/*registered-action-ids*
+                   subview-ids @context/*registered-subview-ids*]
                ;; Flush default-value inits and any other cursor writes
                ;; from the overlay to the live atom in a single swap.
                (context/flush-overlay! app-state*)
-               {:title                   title
-                :head-html               (some-> head c/html)
-                :body-html               body-html
-                :url                     url
-                :declared-signals        declared
-                :registered-action-ids   action-ids
-                :registered-reactive-ids reactive-ids})))
+               {:title                  title
+                :head-html              (some-> head c/html)
+                :body-html              body-html
+                :url                    url
+                :declared-signals       declared
+                :registered-action-ids  action-ids
+                :registered-subview-ids subview-ids})))
          (finally
            (pop-thread-bindings)))))))
 
@@ -338,3 +407,12 @@
   [tab-id]
   (str "event: connected\n"
        "data: {\"tab-id\":\"" tab-id "\"}\n\n"))
+
+(defn format-heartbeat
+  "Format an SSE keepalive as a comment line.  Lines beginning with ':' are
+   comments per the SSE spec and are ignored by every conformant parser
+   (including Datastar), so this carries no payload — its only job is to keep
+   the stream warm through idle-timeout proxies and to surface a dead/half-open
+   channel the next time the renderer writes."
+  []
+  ": hb\n\n")

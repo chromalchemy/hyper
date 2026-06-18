@@ -16,6 +16,7 @@
   (testing "custom symbol is listed as defined"
     (is (= '#{$mouse-x-offset
               $checked
+              $detail
               $form-data
               $key
               $value}
@@ -28,6 +29,7 @@
            (ex-message e)))
     (is (=
           '{:defined-symbols #{$checked
+                               $detail
                                $form-data
                                $key
                                $mouse-x-offset

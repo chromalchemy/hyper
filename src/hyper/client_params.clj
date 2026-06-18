@@ -3,13 +3,14 @@
   of the hyper.core/action macro, allowing server-side event handlers
   to access data collected from the client event handler.
   
-  The built-in parameters are $value, $checked, $key, and $form-data.")
+  The built-in parameters are $value, $checked, $key, $detail, and $form-data.")
 
 (def ^:private default-client-param-registry
   "The default registry of client params."
   {'$value     {:js "evt.target.value" :key "value"}
    '$checked   {:js "evt.target.checked" :key "checked"}
    '$key       {:js "evt.key" :key "key"}
+   '$detail    {:js "evt.detail" :key "detail"}
    '$form-data {:js  "Object.fromEntries(new FormData(evt.target.closest('form')))"
                 :key "formData"}})
 

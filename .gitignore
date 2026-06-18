@@ -4,4 +4,5 @@
 /.nrepl-port
 .envrc
 /.lsp/
-/.portal/
+/.portal
+/.direnv/

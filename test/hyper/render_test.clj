@@ -465,3 +465,48 @@
       (render/render-tab app-state* session-id tab-id {:uri "/" :request-method :get})
       (is (not (instance? hyper.utils.WarnOnAccessMap @captured))
           "HTTP page load request should be a regular map"))))
+
+(deftest test-env-does-not-warn-on-re-render
+  (testing "Reading :hyper/env on an SSE re-render never trips the warn map"
+    (let [app-state* (atom (state/init-state))
+          session-id "test-session-env-warn"
+          tab-id     "test_tab_env_warn"
+          captured   (atom nil)
+          render-fn  (fn [_req]
+                       (reset! captured (hy/env))
+                       [:div "test"])]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (render/register-render-fn! app-state* tab-id render-fn)
+      ;; SSE re-render — no base-req and no stashed env
+      (let [{:keys [signals]} (t/with-signals
+                                (render/render-tab app-state* session-id tab-id))]
+        (is (= 0 (count (filter #(= :hyper.warn/http-key-in-render (:id %)) signals)))
+            ":hyper/env is framework-managed and must not warn on re-render")
+        (is (nil? @captured)
+            "Unset env reads as nil, matching initial page load"))))
+
+  (testing "Stashed env is visible on SSE re-render"
+    (let [app-state* (atom (state/init-state))
+          session-id "test-session-env-stash"
+          tab-id     "test_tab_env_stash"
+          captured   (atom nil)
+          render-fn  (fn [_req]
+                       (reset! captured (hy/env))
+                       [:div "test"])]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (render/register-render-fn! app-state* tab-id render-fn)
+      (swap! app-state* assoc-in [:tabs tab-id :env] {:db :test-db})
+      ;; SSE re-render — no base-req, env stashed per-tab
+      (let [{:keys [signals]} (t/with-signals
+                                (render/render-tab app-state* session-id tab-id))]
+        (is (= 0 (count (filter #(= :hyper.warn/http-key-in-render (:id %)) signals)))
+            "Reading stashed env must not warn")
+        (is (= {:db :test-db} @captured)
+            "Stashed tab env should be propagated into the re-render request")))))
+
+(deftest test-format-heartbeat
+  (testing "heartbeat is an SSE comment line (ignored by conformant parsers)"
+    (let [hb (render/format-heartbeat)]
+      (is (string? hb))
+      (is (.startsWith hb ":") "SSE comment lines start with ':'")
+      (is (.endsWith hb "\n\n") "SSE messages end with a blank line"))))

@@ -4,6 +4,8 @@
             [hyper.context :as context]
             [hyper.core :as hy]
             [hyper.render :as render]
+            [hyper.render.error :as render.error]
+            [hyper.signal :as signal]
             [hyper.state :as state]
             [hyper.test :as ht]
             [reitit.ring :as ring]))
@@ -198,7 +200,33 @@
           _handler   (hy/create-handler routes
                                         :app-state app-state*
                                         :base-path "/sub")]
-      (is (= "/sub" (:base-path @app-state*))))))
+      (is (= "/sub" (:base-path @app-state*)))))
+
+  (testing ":not-found defaults to render.error/not-found when not supplied"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          _handler   (hy/create-handler routes :app-state app-state*)]
+      (is (= render.error/not-found (:not-found @app-state*)))))
+
+  (testing ":not-found is passed through to server and stored in app-state"
+    (let [app-state* (atom (state/init-state))
+          not-found  (fn [_req] [:div "Nope"])
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          _handler   (hy/create-handler routes
+                                        :app-state app-state*
+                                        :not-found not-found)]
+      (is (= not-found (:not-found @app-state*)))))
+
+  (testing "explicit :not-found nil disables the feature"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          _handler   (hy/create-handler routes
+                                        :app-state app-state*
+                                        :not-found nil)]
+      (is (nil? (:not-found @app-state*))))))
 
 (deftest test-server-lifecycle
   (testing "start! and stop! work together"
@@ -446,7 +474,32 @@
           (is (.contains action-expr "@post("))
           (is (.contains action-expr "hyper.encodeClientParams"))
           (is (.contains action-expr "value:evt.target.value"))
-          (is (not (.contains action-expr " && "))))))))
+          (is (not (.contains action-expr " && ")))))))
+
+  (testing ":when accepts a runtime-evaluated form, e.g. (hy/expr ...)"
+    (let [app-state* (atom (state/init-state))
+          session-id "test-session-js"
+          tab-id     "test_tab_js"]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (binding [context/*request* {:hyper/session-id session-id
+                                   :hyper/tab-id     tab-id
+                                   :hyper/app-state  app-state*}]
+        (let [action-expr (hy/action {:when (hy/expr (= evt.key "Enter"))}
+                                     (reset! (hy/tab-cursor :val) $value))]
+          (is (.startsWith action-expr "(evt.key) === (\"Enter\") && "))
+          (is (.contains action-expr "@post("))))))
+
+  (testing ":when guard evaluating to a non-string throws"
+    (let [app-state* (atom (state/init-state))
+          session-id "test-session-js"
+          tab-id     "test_tab_js"]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (binding [context/*request* {:hyper/session-id session-id
+                                   :hyper/tab-id     tab-id
+                                   :hyper/app-state  app-state*}]
+        (is (thrown-with-msg?
+              Exception #"must evaluate to a string"
+              (hy/action {:when 42} (reset! (hy/tab-cursor :val) $value))))))))
 
 (deftest test-base-path-action
   (testing "action macro uses /hyper/actions without :base-path"
@@ -724,6 +777,224 @@
       (is (= 100 @captured)))))
 
 ;; ---------------------------------------------------------------------------
+;; Overlay thread ownership — async work spawned from render/batch
+;;
+;; future/send-off/fibers convey dynamic bindings, so background work
+;; launched inside a render inherits *state-overlay*.  Overlays are owned
+;; by their creating thread: conveyed copies must be ignored so worker
+;; reads/writes hit the live app-state (writes fire watchers → SSE frames),
+;; instead of silently landing in a snapshot that is dead after the flush.
+;; ---------------------------------------------------------------------------
+
+(deftest render-spawned-future-writes-live-test
+  (testing "future launched from render writes to live app-state after render flushes"
+    (let [app-state*     (atom (state/init-state))
+          _              (state/get-or-create-tab! app-state* "s1" "t1")
+          release        (promise)
+          done           (promise)
+          watcher-fired* (atom false)
+          page-fn        (fn [_req]
+                           (future
+                             @release ;; wait until render completed and flushed
+                             (reset! (hy/tab-cursor :worker-result) :done)
+                             (deliver done true))
+                           [:div "page"])]
+      (ht/test-page page-fn {:app-state app-state* :tab-id "t1" :session-id "s1"})
+      ;; Render is done, overlay flushed and dead.  Now let the worker write.
+      (add-watch app-state* :ownership-test (fn [_ _ _ _] (reset! watcher-fired* true)))
+      (deliver release true)
+      (is (true? (deref done 2000 false)) "worker should complete")
+      (is (= :done (get-in @app-state* [:tabs "t1" :data :worker-result]))
+          "worker write must land in live app-state, not the dead render overlay")
+      (is (true? @watcher-fired*)
+          "worker write must fire app-state watchers (drives re-render/SSE)")
+      (remove-watch app-state* :ownership-test))))
+
+(deftest render-spawned-future-reads-live-test
+  (testing "owner thread reads its snapshot; conveyed worker thread reads live state"
+    (let [app-state*  (atom (state/init-state))
+          _           (state/get-or-create-tab! app-state* "s1" "t1")
+          _           (swap! app-state* assoc-in [:tabs "t1" :data :x] 100)
+          owner-saw*  (atom nil)
+          worker-saw* (atom nil)
+          page-fn     (fn [_req]
+                        (let [x* (hy/tab-cursor :x)]
+                          ;; Mutate live state out-of-band after the snapshot
+                          (swap! app-state* assoc-in [:tabs "t1" :data :x] 200)
+                          ;; Conveyed worker bypasses the overlay → sees live value
+                          (reset! worker-saw* (deref (future @(hy/tab-cursor :x)) 2000 ::timeout))
+                          ;; Owner still reads the consistent snapshot
+                          (reset! owner-saw* @x*)
+                          [:div]))]
+      (ht/test-page page-fn {:app-state app-state* :tab-id "t1" :session-id "s1"})
+      (is (= 100 @owner-saw*) "render thread keeps snapshot read-consistency")
+      (is (= 200 @worker-saw*) "worker reads live state, not the conveyed snapshot"))))
+
+(deftest render-spawned-future-writes-during-render-test
+  (testing "worker write during an in-flight render goes live and survives the flush"
+    (let [app-state* (atom (state/init-state))
+          _          (state/get-or-create-tab! app-state* "s1" "t1")
+          mid-render (atom nil)
+          page-fn    (fn [_req]
+                       ;; Owner write — lands in the overlay, flushed at render end
+                       (reset! (hy/tab-cursor :owner-key) :from-owner)
+                       ;; Worker write — different path, goes live immediately
+                       (deref (future (reset! (hy/tab-cursor :worker-key) :from-worker)) 2000 nil)
+                       (reset! mid-render (get-in @app-state* [:tabs "t1" :data :worker-key]))
+                       [:div])]
+      (ht/test-page page-fn {:app-state app-state* :tab-id "t1" :session-id "s1"})
+      (is (= :from-worker @mid-render)
+          "worker write visible in live atom before render completes")
+      (is (= :from-owner (get-in @app-state* [:tabs "t1" :data :owner-key]))
+          "owner overlay write flushed normally")
+      (is (= :from-worker (get-in @app-state* [:tabs "t1" :data :worker-key]))
+          "overlay flush must not clobber the worker's live write"))))
+
+(deftest batch-spawned-future-writes-live-test
+  (testing "future launched inside batch writes directly to the live atom"
+    (let [app-state* (atom (state/init-state))
+          _          (state/get-or-create-tab! app-state* "s1" "t1")
+          mid-batch  (atom nil)]
+      (binding [context/*request* {:hyper/session-id "s1"
+                                   :hyper/tab-id     "t1"
+                                   :hyper/app-state  app-state*}]
+        (hy/batch
+          (reset! (hy/tab-cursor :a) 1)
+          (deref (future (reset! (hy/tab-cursor :from-worker) :live)) 2000 nil)
+          ;; Worker's write is already in the live atom, mid-batch
+          (reset! mid-batch (get-in @app-state* [:tabs "t1" :data :from-worker])))
+        (is (= :live @mid-batch)
+            "worker write visible in live atom before the batch flushes")
+        (is (= 1 (get-in @app-state* [:tabs "t1" :data :a])))
+        (is (= :live (get-in @app-state* [:tabs "t1" :data :from-worker]))
+            "batch flush must preserve the worker's live write")))))
+
+(deftest batch-inside-conveyed-future-test
+  (testing "batch inside a render-spawned future creates its own overlay and flushes live"
+    (let [app-state*  (atom (state/init-state))
+          _           (state/get-or-create-tab! app-state* "s1" "t1")
+          release     (promise)
+          done        (promise)
+          worker-saw* (atom nil)
+          page-fn     (fn [_req]
+                        (future
+                          @release ;; render's overlay is dead by now
+                          (hy/batch
+                            (reset! (hy/tab-cursor :a) 1)
+                            (reset! (hy/tab-cursor :b) 2)
+                            ;; read-your-writes inside the worker's own batch
+                            (reset! worker-saw* @(hy/tab-cursor :a)))
+                          (deliver done true))
+                        [:div])]
+      (ht/test-page page-fn {:app-state app-state* :tab-id "t1" :session-id "s1"})
+      (deliver release true)
+      (is (true? (deref done 2000 false)) "worker should complete")
+      (is (= 1 @worker-saw*) "worker's batch supports read-your-writes")
+      (is (= 1 (get-in @app-state* [:tabs "t1" :data :a])))
+      (is (= 2 (get-in @app-state* [:tabs "t1" :data :b]))
+          "worker's batch flushes to live app-state despite the conveyed dead overlay"))))
+
+;; ---------------------------------------------------------------------------
+;; Op-log overlay — writes recorded as composable ops, not values.  Flush
+;; replays them against live state, so swap!/update merges with concurrent
+;; same-path writes; reset! keeps overwrite semantics.
+;; ---------------------------------------------------------------------------
+
+(deftest overlay-swap-composes-with-concurrent-live-write-test
+  (testing "a render's swap! claim composes with a worker's concurrent live write"
+    ;; Streaming foot-gun: render claims :status on the cursor a worker streams
+    ;; rows into.  Value-replay wiped the rows; op-log merges the claim on top.
+    (let [app-state* (atom (state/init-state))
+          _          (state/get-or-create-tab! app-state* "s1" "t1")
+          page-fn    (fn [_req]
+                       (let [results* (hy/tab-cursor :results)]
+                         ;; Owner stakes its claim on a sub-key (compositional swap)
+                         (swap! results* assoc :status :starting)
+                         ;; Worker streams rows into the SAME cursor on live state
+                         ;; (a conveyed future bypasses the overlay), finishing
+                         ;; before the render returns and flushes.
+                         (deref (future
+                                  (swap! (hy/tab-cursor :results)
+                                         update :rows (fnil into []) [:row1 :row2]))
+                                2000 nil)
+                         [:div]))]
+      (ht/test-page page-fn {:app-state app-state* :tab-id "t1" :session-id "s1"})
+      (let [results (get-in @app-state* [:tabs "t1" :data :results])]
+        (is (= :starting (:status results))
+            "render's claim is applied")
+        (is (= [:row1 :row2] (:rows results))
+            "worker's streamed rows survive the render flush (no clobber)")))))
+
+(deftest overlay-reset-overwrites-concurrent-write-test
+  (testing "reset! keeps overwrite semantics: a whole-value reset replays absolutely"
+    ;; Two whole-cursor resets are a genuine conflict; the render's reset wins.
+    (let [app-state* (atom (state/init-state))
+          _          (state/get-or-create-tab! app-state* "s1" "t1")
+          page-fn    (fn [_req]
+                       (let [results* (hy/tab-cursor :results)]
+                         (reset! results* {:status :starting})
+                         (deref (future (reset! (hy/tab-cursor :results) {:rows [:row1]}))
+                                2000 nil)
+                         [:div]))]
+      (ht/test-page page-fn {:app-state app-state* :tab-id "t1" :session-id "s1"})
+      (is (= {:status :starting} (get-in @app-state* [:tabs "t1" :data :results]))
+          "render's reset op replays as an absolute write, overwriting the worker"))))
+
+(deftest overlay-read-your-writes-test
+  (testing "@cursor after a swap! returns the written value within the overlay"
+    (let [app-state* (atom (state/init-state))
+          _          (state/get-or-create-tab! app-state* "s1" "t1")
+          seen       (atom nil)
+          page-fn    (fn [_req]
+                       (let [s* (hy/tab-cursor :s)]
+                         (swap! s* assoc :rows [:a :b :c])
+                         ;; read-your-writes: shadow reflects the write immediately
+                         (reset! seen (:rows @s*))
+                         [:p (str (:rows @s*))]))
+          result     (ht/test-page page-fn {:app-state  app-state*
+                                            :tab-id     "t1"
+                                            :session-id "s1"})]
+      (is (= [:a :b :c] @seen)
+          "the body sees its own write synchronously via the shadow")
+      (is (string/includes? (:body-html result) "[:a :b :c]")
+          "the rendered HTML reflects the written value")
+      (is (= [:a :b :c] (get-in @app-state* [:tabs "t1" :data :s :rows]))
+          "the write is committed to live state after flush"))))
+
+(deftest batch-swap-composes-with-live-write-test
+  (testing "batch swap! ops compose with a concurrent worker's live write to the same path"
+    (let [app-state* (atom (state/init-state))
+          _          (state/get-or-create-tab! app-state* "s1" "t1")]
+      (binding [context/*request* {:hyper/session-id "s1"
+                                   :hyper/tab-id     "t1"
+                                   :hyper/app-state  app-state*}]
+        (hy/batch
+          (swap! (hy/tab-cursor :results) assoc :status :done)
+          ;; worker appends rows to the same cursor on live, mid-batch
+          (deref (future (swap! (hy/tab-cursor :results)
+                                update :rows (fnil conj []) :r1))
+                 2000 nil))
+        (let [results (get-in @app-state* [:tabs "t1" :data :results])]
+          (is (= :done (:status results)))
+          (is (= [:r1] (:rows results))
+              "batch flush replays ops, preserving the worker's rows"))))))
+
+(deftest default-init-does-not-clobber-concurrent-write-test
+  (testing "first-render default init yields to a concurrent worker write (cas op)"
+    (let [app-state* (atom (state/init-state))
+          _          (state/get-or-create-tab! app-state* "s1" "t1")
+          page-fn    (fn [_req]
+                       ;; Worker initializes :count on live before the default
+                       ;; init's cas op flushes.
+                       (deref (future (reset! (hy/tab-cursor :count) 41)) 2000 nil)
+                       ;; Render asks for the cursor with a default of 0.
+                       (let [c* (hy/tab-cursor :count 0)]
+                         [:div (str @c*)]))]
+      (ht/test-page page-fn {:app-state app-state* :tab-id "t1" :session-id "s1"})
+      (is (= 41 (get-in @app-state* [:tabs "t1" :data :count]))
+          "default init must not overwrite the worker's value"))))
+
+;; ---------------------------------------------------------------------------
 ;; Env
 ;; ---------------------------------------------------------------------------
 
@@ -849,3 +1120,31 @@
       ;; :feature-flags should be gone — full replace, not merge
       (is (= {:db :db :user {:name "Bob"}}
              (get-in @app-state* [:tabs tab-id :env]))))))
+
+(deftest test-connection-signal-reexports
+  (testing "core re-exports the connection signals and token set from hyper.signal"
+    (is (identical? signal/connected?* hy/connected?*))
+    (is (identical? signal/connection* hy/connection*))
+    (is (= signal/connection-states hy/connection-states))))
+
+(deftest test-reconnect
+  (testing "reconnect returns the SSE @get expression for this tab"
+    (let [app-state* (atom (assoc (state/init-state)
+                                  :base-path "" :open-when-hidden? true))]
+      (binding [context/*request* {:hyper/session-id "s1"
+                                   :hyper/tab-id     "tab_abc"
+                                   :hyper/app-state  app-state*}]
+        (is (= "@get('/hyper/events?tab-id=tab_abc', {openWhenHidden: true})"
+               (hy/reconnect))))))
+
+  (testing "reconnect honors :base-path and :open-when-hidden? false"
+    (let [app-state* (atom (assoc (state/init-state)
+                                  :base-path "/app" :open-when-hidden? false))]
+      (binding [context/*request* {:hyper/session-id "s1"
+                                   :hyper/tab-id     "tab_xyz"
+                                   :hyper/app-state  app-state*}]
+        (is (= "@get('/app/hyper/events?tab-id=tab_xyz')"
+               (hy/reconnect))))))
+
+  (testing "reconnect throws outside request context"
+    (is (thrown? Exception (hy/reconnect)))))

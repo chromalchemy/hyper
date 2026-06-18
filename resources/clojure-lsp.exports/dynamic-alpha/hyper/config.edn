@@ -1,0 +1,22 @@
+;; clojure-lsp config shipped on the classpath by hyper.
+;;
+;; Consumers opt in with a single line in their own .lsp/config.edn:
+;;
+;;   {:classpath-config-paths ["dynamic-alpha/hyper"]}
+;;
+;; clojure-lsp then merges these :cljfmt :extra-indents so `defc` (and its
+;; render/event/mount/update/unmount segments) indent as method-body forms:
+;;
+;;   (defc foo
+;;     (render [x]
+;;       [:h1 x]))
+;;
+;; `:extra-indents` appends to cljfmt's defaults (vs. `:indents`, which
+;; replaces them).  We register the unqualified name plus both qualified
+;; vars, since cljfmt only matches a qualified rule when the macro is
+;; called qualified and cannot resolve names brought in via :refer/:use.
+{:cljfmt
+ {:extra-indents
+  {defc                 [[:block 1] [:inner 1]]
+   hyper.core/defc      [[:block 1] [:inner 1]]
+   hyper.component/defc [[:block 1] [:inner 1]]}}}

@@ -337,3 +337,112 @@
     (is (= {:old-key nil}
            (signal/changed-signals {:name "Alice" :old-key "x"}
                                    {:name "Alice"})))))
+
+;; ---------------------------------------------------------------------------
+;; drop-ifmissing-covered-patches (issue #44)
+;; ---------------------------------------------------------------------------
+
+(deftest drop-ifmissing-covered-patches-test
+  (let [declared [{:path :ids :html-name "ids" :default-val [] :local? false}]]
+    (testing "first-load patch equal to declared default is suppressed"
+      ;; This is the issue-#44 scenario: a checkbox-array signal declared as
+      ;; [] would otherwise emit a redundant {\"ids\":[]} patch that clobbers
+      ;; Datastar's DOM-materialized array.  sent-signals is nil on first load.
+      (is (= {}
+             (signal/drop-ifmissing-covered-patches {:ids []} declared nil))))
+
+    (testing "patch differing from declared default is kept"
+      (is (= {:ids ["a"]}
+             (signal/drop-ifmissing-covered-patches {:ids ["a"]} declared nil))))
+
+    (testing "patch equal to default but already sent is kept (reset-to-default)"
+      ;; The client already has :ids (it was sent before, here as [\"a\"]), so
+      ;; __ifmissing won't reset it — the patch back to the default [] must be
+      ;; delivered explicitly.
+      (is (= {:ids []}
+             (signal/drop-ifmissing-covered-patches {:ids []} declared {:ids ["a"]}))))
+
+    (testing "undeclared signals are always kept"
+      (is (= {:other 0}
+             (signal/drop-ifmissing-covered-patches {:other 0} declared nil))))
+
+    (testing "nested-path patch equal to declared default is suppressed and pruned"
+      (let [declared [{:path        [:form :ids] :html-name "form.ids"
+                       :default-val []           :local?    false}]]
+        (is (= {}
+               (signal/drop-ifmissing-covered-patches
+                 {:form {:ids []}} declared nil)))))
+
+    (testing "nested-path drop preserves sibling leaves under the same branch"
+      (let [declared [{:path        [:form :ids] :html-name "form.ids"
+                       :default-val []           :local?    false}
+                      {:path        [:form :name] :html-name "form.name"
+                       :default-val ""            :local?    false}]]
+        ;; :ids matches its default and is dropped; :name differs and stays,
+        ;; so the :form branch survives with only :name.
+        (is (= {:form {:name "x"}}
+               (signal/drop-ifmissing-covered-patches
+                 {:form {:ids [] :name "x"}} declared nil)))))
+
+    (testing "nested-path patch already sent is kept"
+      (let [declared [{:path        [:form :ids] :html-name "form.ids"
+                       :default-val []           :local?    false}]]
+        (is (= {:form {:ids []}}
+               (signal/drop-ifmissing-covered-patches
+                 {:form {:ids []}} declared {:form {:ids ["a"]}})))))
+
+    (testing "mixed patch — suppresses default-matching, keeps the rest"
+      (let [declared [{:path :ids :html-name "ids" :default-val [] :local? false}
+                      {:path :count :html-name "count" :default-val 0 :local? false}]]
+        (is (= {:count 5}
+               (signal/drop-ifmissing-covered-patches
+                 {:ids [] :count 5} declared nil)))))
+
+    (testing "single-element vector path is treated as top-level"
+      (let [declared [{:path [:ids] :html-name "ids" :default-val [] :local? false}]]
+        (is (= {}
+               (signal/drop-ifmissing-covered-patches {:ids []} declared nil)))))
+
+    (testing "empty/nil patches pass through unchanged"
+      (is (= {} (signal/drop-ifmissing-covered-patches {} declared nil)))
+      (is (nil? (signal/drop-ifmissing-covered-patches nil declared nil))))))
+
+;; ---------------------------------------------------------------------------
+;; Connection status signals (static, client-only)
+;; ---------------------------------------------------------------------------
+
+(deftest connection-render-deref-test
+  (testing "in render context, connection signals deref to their $-expression"
+    (is (= "$_hyperConnected" @signal/connected?*))
+    (is (= "$_hyperConnection" @signal/connection*))))
+
+(deftest connection-action-deref-throws-test
+  (testing "in action context, connection signals throw (client-only)"
+    (binding [context/*signals* {}]
+      (is (thrown? clojure.lang.ExceptionInfo @signal/connected?*))
+      (is (thrown? clojure.lang.ExceptionInfo @signal/connection*)))))
+
+(deftest connection-states-test
+  (testing "the documented token set"
+    (is (= #{:connecting :open :reconnecting :error :closed}
+           signal/connection-states))))
+
+(deftest connection-attrs-test
+  (testing "connection-attrs declares both signals and the lifecycle handler"
+    (let [attrs (signal/connection-attrs)]
+      (is (= "'connecting'"
+             (get attrs (keyword "data-signals:_hyper-connection__ifmissing"))))
+      (is (= "true"
+             (get attrs (keyword "data-signals:_hyper-connected__ifmissing"))))
+      (let [js (get attrs (keyword "data-on:datastar-fetch"))]
+        ;; isolates the SSE connection from action POSTs
+        (is (clojure.string/includes? js "evt.detail.el === el"))
+        ;; healthy stream
+        (is (clojure.string/includes?
+              js "evt.detail.type === 'started' ? ($_hyperConnection = 'open', $_hyperConnected = true)"))
+        ;; transient drop
+        (is (clojure.string/includes?
+              js "'retrying' ? ($_hyperConnection = 'reconnecting', $_hyperConnected = false)"))
+        ;; terminal failure
+        (is (clojure.string/includes?
+              js "'retries-failed' ? ($_hyperConnection = 'error', $_hyperConnected = false)"))))))

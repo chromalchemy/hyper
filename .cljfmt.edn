@@ -3,4 +3,12 @@
  :function-arguments-indentation  :cursive
  :sort-ns-references?             true
  :normalize-newlines-at-file-end? true
- :paths                           ["deps.edn" "src" "test" "example"]}
+ :paths                           ["deps.edn" "src" "test" "example"]
+ ;; Indent `defc` and its render/event/mount/update/unmount segments as
+ ;; method-body forms.  `:extra-indents` appends to cljfmt's defaults.
+ ;; Unqualified + both qualified vars, since cljfmt only matches a
+ ;; qualified rule when the macro is called qualified.
+ :extra-indents
+ {defc                 [[:block 1] [:inner 1]]
+  hyper.core/defc      [[:block 1] [:inner 1]]
+  hyper.component/defc [[:block 1] [:inner 1]]}}

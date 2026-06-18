@@ -3,11 +3,16 @@
             [clojure.string :as string]
             [clojure.test :refer [deftest is testing]]
             [hyper.actions :as actions]
+            [hyper.component :as component]
+            [hyper.component.bundle :as bundle]
+            [hyper.context :as context]
+            [hyper.core :as h]
             [hyper.render :as render]
             [hyper.render.queue :as rq]
             [hyper.routes :as routes]
             [hyper.server :as server]
             [hyper.state :as state]
+            [hyper.subview :as subview]
             [hyper.watch :as watch]
             [matcher-combinators.matchers :as m]
             [matcher-combinators.test :refer [match?]]
@@ -94,7 +99,7 @@
              [true  {"Content-Type"      "text/event-stream"
                      "Cache-Control"     "no-cache, no-transform"
                      "X-Accel-Buffering" "no"
-                     "Content-Encoding"  "br"}]]]
+                     "Content-Encoding"  "gzip"}]]]
       (let [captured-response (atom nil)
             render-queue      (rq/make-queue)]
         ;; Pre-enqueue a full render so drain! doesn't block forever
@@ -404,6 +409,40 @@
       (is (contains? route-idx :user-profile))
       (is (= "About Us" (routes/find-route-title route-idx :about))))))
 
+(deftest test-parameter-coercion
+  (testing "Route :parameters coerce raw string params into typed values"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/page" {:name       :page
+                                :parameters {:query [:map [:n :int]]}
+                                :get        (fn [req]
+                                              [:div "n=" (get-in req [:hyper/route :query-params :n])])}]]
+          handler    (server/create-handler routes app-state*)
+          good       (handler {:uri "/page" :request-method :get :query-params {"n" "5"}})]
+      (is (= 200 (:status good)))
+      ;; The coerced value is an int (5), not the raw string "5"
+      (is (string/includes? (:body good) "n=5"))))
+
+  (testing "Coercion failure returns HTTP 400 with a malli explanation, not a hang"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/page" {:name       :page
+                                :parameters {:query [:map [:n :int]]}
+                                :get        (fn [_req] [:div "ok"])}]]
+          handler    (server/create-handler routes app-state*)
+          bad        (handler {:uri "/page" :request-method :get :query-params {"n" "abc"}})]
+      (is (= 400 (:status bad)))
+      (is (match? {:humanized {:n ["should be an integer"]}}
+                  (:body bad)))))
+
+  (testing "Routes without :parameters keep raw string params"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/page" {:name :page
+                                :get  (fn [req]
+                                        [:div "n=" (get-in req [:hyper/route :query-params :n])])}]]
+          handler    (server/create-handler routes app-state*)
+          response   (handler {:uri "/page" :request-method :get :query-params {"n" "abc"}})]
+      (is (= 200 (:status response)))
+      (is (string/includes? (:body response) "n=abc")))))
+
 (deftest test-create-handler-with-hyper-disabled
   (testing "render fn can disable endpoint wrapping"
     (let [app-state*  (atom (state/init-state))
@@ -653,3 +692,346 @@
       (is (string/includes? body "/app/hyper/navigate"))
       (is (string/includes? body "rel=\"stylesheet\""))
       (is (not (string/includes? body "openWhenHidden"))))))
+
+(deftest test-not-found-handler
+  (testing "Unmatched route renders the default 404 view as a full Hyper page"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          handler    (server/create-handler routes app-state*)
+          response   (handler {:uri "/does-not-exist" :request-method :get})
+          body       (:body response)]
+      (is (= 404 (:status response)))
+      (is (string/includes? (get-in response [:headers "Content-Type"]) "text/html"))
+      ;; Full document scaffolding, same as a normal page
+      (is (string/includes? body "<!DOCTYPE html>"))
+      (is (string/includes? body "/hyper/events")
+          "404 page boots the SSE connection like any other page")
+      ;; Default not-found content + title
+      (is (string/includes? body "404"))
+      (is (string/includes? body "<title>Not Found</title>"))))
+
+  (testing "Custom :not-found renderer is used and sees the request"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          handler    (server/create-handler routes app-state*
+                                            {:not-found (fn [req]
+                                                          [:div "Missing: " (:uri req)])})
+          response   (handler {:uri "/ghost" :request-method :get})
+          body       (:body response)]
+      (is (= 404 (:status response)))
+      (is (string/includes? body "Missing: /ghost"))))
+
+  (testing "Custom :not-found may be a Var (picks up redefinitions)"
+    (let [app-state*    (atom (state/init-state))
+          not-found-var (intern *ns* (gensym "nf-")
+                                (fn [_req] [:div "var-404-v1"]))
+          routes        [["/" {:name :home
+                               :get  (fn [_req] [:div "Home"])}]]
+          handler       (server/create-handler routes app-state* {:not-found not-found-var})]
+      (is (string/includes? (:body (handler {:uri "/x" :request-method :get}))
+                            "var-404-v1"))
+      ;; Redefine the Var's value; the handler should pick it up without rebuild
+      (alter-var-root not-found-var (constantly (fn [_req] [:div "var-404-v2"])))
+      (is (string/includes? (:body (handler {:uri "/x" :request-method :get}))
+                            "var-404-v2"))))
+
+  (testing "The :not-found renderer is stored in app-state"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          _handler   (server/create-handler routes app-state*)]
+      (is (fn? (:not-found @app-state*)))))
+
+  (testing ":not-found nil disables the feature (reitit plain-text 404)"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          handler    (server/create-handler routes app-state* {:not-found nil})
+          response   (handler {:uri "/nope" :request-method :get})]
+      (is (= 404 (:status response)))
+      (is (nil? (:not-found @app-state*)))
+      ;; Plain reitit default — not the full Hyper HTML document
+      (is (not (string/includes? (str (:body response)) "<!DOCTYPE html>")))))
+
+  (testing ":not-found nil makes navigate to a dead route reply with JSON 404"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          handler    (server/create-handler routes app-state* {:not-found nil})
+          response   (handler {:uri            "/hyper/navigate"
+                               :request-method :post
+                               :query-params   {"path" "/ghost"}})]
+      (is (= 404 (:status response)))
+      (is (string/includes? (:body response) "Route not found"))))
+
+  (testing "Matched route with unsupported method is not treated as 404"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home
+                            :get  (fn [_req] [:div "Home"])}]]
+          handler    (server/create-handler routes app-state*)
+          ;; POST to a GET-only route -> 405, not the 404 page
+          response   (handler {:uri "/" :request-method :post})]
+      (is (= 405 (:status response))))))
+
+;; ===========================================================================
+;; Graceful reconnect (Tier 0): detach / re-attach / grace-window reaper
+;; ===========================================================================
+
+(defn- ctx
+  [app-state* session-id tab-id]
+  {:hyper/session-id session-id
+   :hyper/tab-id     tab-id
+   :hyper/app-state  app-state*
+   :hyper/router     nil})
+
+(defmacro ^:private rendering
+  [app-state* session-id tab-id & body]
+  `(binding [context/*request*    (ctx ~app-state* ~session-id ~tab-id)
+             context/*action-idx* (atom 0)]
+     ~@body))
+
+(deftest test-detach-preserves-tab-state
+  (testing "detach-tab! keeps tab-cursor data, stamps :disconnected-at, drops renderer"
+    (let [app-state* (atom (state/init-state))
+          session-id "s-detach"
+          tab-id     "t_detach"
+          stopped?   (atom false)]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (swap! app-state* assoc-in [:tabs tab-id :renderer]
+             {:render-queue (rq/make-queue)
+              :stop!        #(reset! stopped? true)})
+      (rendering app-state* session-id tab-id
+                 (reset! (h/tab-cursor :count 0) 42))
+      (is (= 42 (get-in @app-state* [:tabs tab-id :data :count])))
+
+      (server/detach-tab! app-state* tab-id)
+
+      (is (true? @stopped?) "renderer stop! was called on detach")
+      (is (contains? (:tabs @app-state*) tab-id) "tab survives detach")
+      (is (= 42 (get-in @app-state* [:tabs tab-id :data :count]))
+          "tab-cursor state survives detach")
+      (is (number? (get-in @app-state* [:tabs tab-id :disconnected-at]))
+          ":disconnected-at is stamped")
+      (is (nil? (get-in @app-state* [:tabs tab-id :renderer]))
+          "renderer is removed on detach"))))
+
+(deftest test-detach-does-not-interrupt-worker
+  (testing "a spawn! worker survives a detach (no interrupt within grace)"
+    (let [app-state*  (atom (state/init-state))
+          session-id  "s-detach-worker"
+          tab-id      "t_detach_worker"
+          started     (promise)
+          interrupted (promise)]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (swap! app-state* assoc-in [:tabs tab-id :renderer]
+             {:render-queue (rq/make-queue) :stop! (fn [])})
+      (rendering app-state* session-id tab-id
+                 (h/spawn! (fn []
+                             (deliver started true)
+                             (try (Thread/sleep 60000)
+                                  (catch InterruptedException _
+                                    (deliver interrupted true))))))
+      (is (true? (deref started 1000 :timeout)) "worker started")
+
+      (server/detach-tab! app-state* tab-id)
+
+      (is (= :still-running (deref interrupted 300 :still-running))
+          "worker is NOT interrupted by a detach")
+      (is (= 1 (count (get-in @app-state* [:tabs tab-id :subviews])))
+          "worker subview survives detach")
+      (subview/teardown-all! app-state* tab-id))))
+
+(deftest test-watchers-follow-reattached-renderer
+  (testing "after detach + re-attach, an existing app-state watcher drives the
+            NEW renderer's queue without being re-installed"
+    (let [app-state*      (atom (state/init-state))
+          session-id      "s-reattach"
+          tab-id          "t_reattach"
+          trigger-render! (#'server/tab-trigger-render! app-state* tab-id)
+          q1              (rq/make-queue)]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (swap! app-state* assoc-in [:tabs tab-id :renderer] {:render-queue q1})
+      (watch/setup-watchers! app-state* session-id tab-id trigger-render!)
+
+      (rendering app-state* session-id tab-id
+                 (reset! (h/tab-cursor :n 0) 1))
+      (is (= {:idle? false :full-render? true :shutdown? false :dirty-ids #{} :scripts []}
+             (rq/drain! q1))
+          "connection-1 queue received the render")
+
+      (server/detach-tab! app-state* tab-id)
+      (let [q2 (rq/make-queue)]
+        (swap! app-state* assoc-in [:tabs tab-id :renderer] {:render-queue q2})
+        (swap! app-state* update-in [:tabs tab-id] dissoc :disconnected-at)
+
+        (rendering app-state* session-id tab-id
+                   (reset! (h/tab-cursor :n 1) 2))
+        (is (= {:idle? false :full-render? true :shutdown? false :dirty-ids #{} :scripts []}
+               (rq/drain! q2))
+            "connection-2 queue received the render via the same watcher"))
+      (watch/remove-watchers! app-state* tab-id))))
+
+(deftest test-reaper-respects-grace-window
+  (testing "reap-disconnected-tabs! leaves tabs within grace and reaps expired ones"
+    (let [app-state*  (atom (assoc (state/init-state) :disconnect-grace-ms 180000))
+          session-id  "s-reap"
+          fresh       "t_fresh"
+          stale       "t_stale"
+          interrupted (promise)]
+      (state/get-or-create-tab! app-state* session-id fresh)
+      (swap! app-state* assoc-in [:tabs fresh :disconnected-at] (System/currentTimeMillis))
+
+      (state/get-or-create-tab! app-state* session-id stale)
+      (swap! app-state* assoc-in [:tabs stale :renderer]
+             {:render-queue (rq/make-queue) :stop! (fn [])})
+      (rendering app-state* session-id stale
+                 (h/spawn! (fn []
+                             (try (Thread/sleep 60000)
+                                  (catch InterruptedException _
+                                    (deliver interrupted true))))))
+      (Thread/sleep 50)
+      (swap! app-state* assoc-in [:tabs stale :disconnected-at]
+             (- (System/currentTimeMillis) 200000))
+
+      (server/reap-disconnected-tabs! app-state* (System/currentTimeMillis))
+
+      (is (contains? (:tabs @app-state*) fresh)
+          "tab within grace window is preserved")
+      (is (not (contains? (:tabs @app-state*) stale))
+          "expired tab is fully reaped")
+      (is (true? (deref interrupted 1000 :timeout))
+          "reaping an expired tab interrupts its worker"))))
+
+(deftest test-disconnect-grace-ms-option
+  (testing "defaults to 3 minutes"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home :get (fn [_req] [:div "Home"])}]]
+          _handler   (server/create-handler routes app-state*)]
+      (is (= 180000 (:disconnect-grace-ms @app-state*)))))
+
+  (testing "honors an explicit :disconnect-grace-ms"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home :get (fn [_req] [:div "Home"])}]]
+          _handler   (server/create-handler routes app-state*
+                                            {:disconnect-grace-ms 5000})]
+      (is (= 5000 (:disconnect-grace-ms @app-state*))))))
+
+(deftest test-sse-connect-expr
+  (testing "builds the SSE @get expression shared by data-init and reconnect"
+    (is (= "@get('/hyper/events?tab-id=tab_1', {openWhenHidden: true})"
+           (server/sse-connect-expr "" "tab_1" true)))
+    (is (= "@get('/hyper/events?tab-id=tab_1')"
+           (server/sse-connect-expr "" "tab_1" false)))
+    (is (= "@get('/app/hyper/events?tab-id=tab_1', {openWhenHidden: true})"
+           (server/sse-connect-expr "/app" "tab_1" true))))
+
+  (testing "the page's data-init uses the same builder"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home :get (fn [_req] [:div "Home"])}]]
+          handler    (server/create-handler routes app-state*)
+          body       (:body (handler {:uri "/" :request-method :get}))]
+      ;; the exact @get string (entity-decoded apostrophes) appears in data-init
+      (is (string/includes? body "/hyper/events?tab-id=tab_"))
+      (is (string/includes? body "openWhenHidden: true"))
+      ;; :open-when-hidden? is stashed so reconnect can reproduce it
+      (is (true? (:open-when-hidden? @app-state*))))))
+
+(deftest test-rendered-page-wires-connection-signals
+  (testing "an initial page load declares the connection signals + handler on <body>"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home :get (fn [_req] [:div "Home"])}]]
+          handler    (server/create-handler routes app-state*)
+          body       (:body (handler {:uri "/" :request-method :get}))]
+      (is (string/includes? body "data-signals:_hyper-connection__ifmissing"))
+      (is (string/includes? body "data-signals:_hyper-connected__ifmissing"))
+      (is (string/includes? body "data-on:datastar-fetch"))
+      (is (string/includes? body "evt.detail.el === el")))))
+
+;; ===========================================================================
+;; Heartbeat keepalive
+;; ===========================================================================
+
+(deftest test-heartbeat-ms-option
+  (testing "defaults to 25s"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home :get (fn [_req] [:div "Home"])}]]
+          _handler   (server/create-handler routes app-state*)]
+      (is (= 25000 (:heartbeat-ms @app-state*)))))
+
+  (testing "honors an explicit interval"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home :get (fn [_req] [:div "Home"])}]]
+          _handler   (server/create-handler routes app-state* {:heartbeat-ms 5000})]
+      (is (= 5000 (:heartbeat-ms @app-state*)))))
+
+  (testing "nil disables it"
+    (let [app-state* (atom (state/init-state))
+          routes     [["/" {:name :home :get (fn [_req] [:div "Home"])}]]
+          _handler   (server/create-handler routes app-state* {:heartbeat-ms nil})]
+      (is (nil? (:heartbeat-ms @app-state*))))))
+
+(deftest test-heartbeat-sent-when-idle
+  (testing "an idle renderer loop emits keepalive comments, and a closed
+            channel (send! -> false) exits the loop"
+    (let [app-state* (atom (assoc (state/init-state) :heartbeat-ms 20))
+          q          (rq/make-queue)
+          sends      (atom [])
+          done       (promise)]
+      (with-redefs [http-kit/send! (fn [_ch payload _close?]
+                                     (swap! sends conj payload)
+                                     true)]
+        (let [_fut (future
+                     (#'server/-renderer-loop! app-state* "s" "t" ::ch false q)
+                     (deliver done true))]
+          (Thread/sleep 120)
+          ;; stop the loop
+          (rq/enqueue-shutdown! q)
+          (is (true? (deref done 1000 :timeout)) "loop exited on shutdown")
+          ;; at least one heartbeat comment was sent (string payloads only;
+          ;; the first send is the connected-event response map)
+          (is (some #(and (string? %) (string/starts-with? % ":")) @sends)
+              "a keepalive comment was emitted while idle"))))))
+
+(deftest test-components-js-handler-cache-headers
+  (testing "components.js is only served immutable when ?v matches the
+            current bundle hash, so a stale ?v can never poison the cache"
+    (let [saved @component/registry*]
+      (try
+        (reset! component/registry* {})
+        (component/register-component! "x-widget" {:attrs [] :render "(fn [_ _] [:i])"})
+        (let [app-state* (atom {})
+              handler    (#'server/components-js-handler app-state*)
+              hash       (:hash (bundle/bundle))]
+          (testing "matching ?v -> immutable (true content-addressed cache)"
+            (let [resp (handler {:query-params {"v" hash}})]
+              (is (= 200 (:status resp)))
+              (is (= "public, max-age=31536000, immutable"
+                     (get-in resp [:headers "Cache-Control"])))
+              (is (= (str "\"" hash "\"") (get-in resp [:headers "ETag"])))
+              (is (string? (:body resp)))))
+          (testing "stale ?v -> no-cache (no immutable promise for old URL)"
+            (let [resp (handler {:query-params {"v" "0000000000000000"}})]
+              (is (= 200 (:status resp)))
+              (is (= "no-cache" (get-in resp [:headers "Cache-Control"])))
+              ;; still serves the *current* bundle + its real hash
+              (is (= (str "\"" hash "\"") (get-in resp [:headers "ETag"])))))
+          (testing "missing ?v -> no-cache"
+            (let [resp (handler {})]
+              (is (= 200 (:status resp)))
+              (is (= "no-cache" (get-in resp [:headers "Cache-Control"]))))))
+        (finally
+          (reset! component/registry* saved))))))
+
+(deftest test-components-js-handler-no-components
+  (testing "404 when no components are registered"
+    (let [saved @component/registry*]
+      (try
+        (reset! component/registry* {})
+        (let [app-state* (atom {})
+              handler    (#'server/components-js-handler app-state*)
+              resp       (handler {:query-params {"v" "anything"}})]
+          (is (= 404 (:status resp))))
+        (finally
+          (reset! component/registry* saved))))))

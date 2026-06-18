@@ -3,9 +3,48 @@
 
    Actions are server-side functions triggered by client interactions."
   (:require [clojure.set]
+            [clojure.string :as str]
             [compact-uuids.core :as uuid]
             [hyper.context :as context]
             [taoensso.telemere :as t]))
+
+;; ---------------------------------------------------------------------------
+;; Action expression building (client side of the boundary)
+;; ---------------------------------------------------------------------------
+;; Used by the hyper.core/action macro expansion at render time.
+
+(defn sanitize-guard
+  "Validate an action :when guard at runtime.  Returns the guard string,
+   nil for nil/blank guards, and throws for anything else — a guard must
+   evaluate to a Datastar expression string (e.g. from `expr` or a raw
+   string)."
+  [g]
+  (cond
+    (nil? g)    nil
+    (string? g) (when-not (str/blank? g) g)
+    :else       (throw (ex-info "action :when guard must evaluate to a string Datastar expression"
+                                {:guard g}))))
+
+(defn build-action-expr
+  "Build the Datastar/JS expression string for an action.
+   Always uses Datastar's @post() so that all non-underscore signals are
+   automatically sent in the request body.  When client params are present,
+   they are URL-encoded into the query string via the hyper.encodeClientParams helper
+   so the server can read them from query-params.
+   Optionally injects a custom Datastar expression to conditionally prevent the post.
+   base-path is prepended to the /hyper/actions endpoint (empty string when not set)."
+  [action-id used-params js base-path]
+  (let [js-injection (when js (str js " && "))]
+    (if (empty? used-params)
+      (str js-injection "@post('" base-path "/hyper/actions?action-id=" action-id "')")
+      (let [obj-entries (->> used-params
+                             vals
+                             (map (fn [{:keys [js key]}]
+                                    (str key ":" js)))
+                             (str/join ","))]
+        (str js-injection
+             "@post('" base-path "/hyper/actions?action-id=" action-id
+             "&' + hyper.encodeClientParams({" obj-entries "}))")))))
 
 (defn register-action!
   "Register an action function and return its ID.

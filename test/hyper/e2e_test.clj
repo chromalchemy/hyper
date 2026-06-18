@@ -126,6 +126,77 @@
        "Start"]
       [:span#async-display {:data-text (str "$" name*)} ""]]]))
 
+(defn- checkbox-array-get
+  "Faithful reproduction of issue #44: a checkbox group bound to a
+   server-backed array signal initialized to []."
+  [_]
+  (let [ids* (h/signal :ids [])]
+    [:main
+     (for [v ["a" "b" "c"]]
+       [:label {:id (str "label-" v)}
+        [:input {:type      "checkbox"
+                 :value     v
+                 :data-bind ids*
+                 :id        (str "cb-" v)}]
+        (str " " v)])
+     ;; Robust read-out of the live signal value, independent of the
+     ;; data-json-signals attribute name.
+     [:span {:id "ids-dump" :data-text "JSON.stringify($ids)"}]]))
+
+(defn- cb-nested-get
+  "Issue #44: checkbox group bound to a nested array signal [:form :ids]."
+  [_]
+  (let [ids* (h/signal [:form :ids] [])]
+    [:main
+     (for [v ["a" "b" "c"]]
+       [:label {:id (str "nlabel-" v)}
+        [:input {:type "checkbox" :value v :data-bind ids* :id (str "ncb-" v)}]
+        (str " " v)])
+     [:span {:id "nids-dump" :data-text "JSON.stringify($form.ids)"}]]))
+
+(defn- select-multi-get
+  "Issue #44 sibling case: <select multiple> bound to an array signal,
+   another binding Datastar materializes from the DOM."
+  [_]
+  (let [colors* (h/signal :colors [])]
+    [:main
+     [:select {:id "color-multi" :multiple true :data-bind colors*}
+      (for [c ["red" "green" "blue"]]
+        [:option {:value c :id (str "opt-" c)} c])]
+     [:span {:id "colors-dump" :data-text "JSON.stringify($colors)"}]]))
+
+(defn- cb-prechecked-get
+  "Issue #44 sibling case: checkbox array seeded with a value, so the signal
+   value equals its declared default and one box starts checked."
+  [_]
+  (let [ids* (h/signal :ids ["a"])]
+    [:main
+     (for [v ["a" "b" "c"]]
+       [:label {:id (str "plabel-" v)}
+        [:input {:type "checkbox" :value v :data-bind ids* :id (str "pcb-" v)}]
+        (str " " v)])
+     [:span {:id "pids-dump" :data-text "JSON.stringify($ids)"}]]))
+
+(defn- cb-rerender-get
+  "Issue #44 sibling case: a checkbox array alongside an unrelated action
+   that forces a full page re-render, to verify a later re-render does not
+   stomp the array the client materialized from the DOM."
+  [_]
+  (let [ids* (h/signal :ids [])
+        n*   (h/tab-cursor :n 0)]
+    [:main
+     (for [v ["a" "b" "c"]]
+       [:label {:id (str "rlabel-" v)}
+        [:input {:type "checkbox" :value v :data-bind ids* :id (str "rcb-" v)}]
+        (str " " v)])
+     [:button {:id            "rerender-btn"
+               :data-on:click (h/action (swap! n* inc))}
+      "re-render"]
+     ;; Server-rendered cursor value (not a client signal) — its text
+     ;; changes only when a full re-render morphs the page.
+     [:span {:id "rn-dump"} @n*]
+     [:span {:id "rids-dump" :data-text "JSON.stringify($ids)"}]]))
+
 ;; Shared atom for testing reactive components — mutated from test code
 ;; to verify partial re-renders via SSE.
 (def ^:private reactive-clock* (atom "00:00"))
@@ -224,6 +295,14 @@
     {:name  :signals
      :title "Signals"
      :get   #'signals-get}]
+   ["/checkbox-array"
+    {:name  :checkbox-array
+     :title "Checkbox Array"
+     :get   #'checkbox-array-get}]
+   ["/cb-nested"     {:name :cb-nested :title "Nested Checkbox Array" :get #'cb-nested-get}]
+   ["/select-multi"  {:name :select-multi :title "Select Multiple" :get #'select-multi-get}]
+   ["/cb-prechecked" {:name :cb-prechecked :title "Prechecked Array" :get #'cb-prechecked-get}]
+   ["/cb-rerender"   {:name :cb-rerender :title "Rerender Array" :get #'cb-rerender-get}]
    ["/watch-bootstrap"
     {:name  :watch-bootstrap
      :title "Watch Bootstrap"
@@ -323,43 +402,43 @@
   [js]
   (.evaluate (w/get-page) js))
 
+(defn wait-for-pred
+  "Poll a zero-arg predicate every 100ms until it returns truthy or the
+   timeout elapses.  Exceptions from pred count as falsey (elements may not
+   exist yet).  Returns true on success, false on timeout — callers decide
+   how to assert/report failure."
+  [pred & {:keys [timeout] :or {timeout 5000}}]
+  (let [deadline (+ (System/currentTimeMillis) timeout)]
+    (loop []
+      (cond
+        (try (boolean (pred)) (catch Exception _ false)) true
+        (> (System/currentTimeMillis) deadline)          false
+        :else (do (Thread/sleep 100) (recur))))))
+
 (defn wait-for-text
   "Poll until an element's text content matches expected, with timeout."
   [selector expected & {:keys [timeout] :or {timeout 5000}}]
-  (let [deadline (+ (System/currentTimeMillis) timeout)]
-    (loop []
+  (or (wait-for-pred #(= expected (w/text-content selector)) :timeout timeout)
       (let [actual (try (w/text-content selector) (catch Exception _ nil))]
-        (if (= expected actual)
-          true
-          (if (> (System/currentTimeMillis) deadline)
-            (do (is (= expected actual)
-                    (str "Timed out waiting for " selector " to equal " (pr-str expected)
-                         ", last saw " (pr-str actual)))
-                false)
-            (do (Thread/sleep 100)
-                (recur))))))))
+        (is (= expected actual)
+            (str "Timed out waiting for " selector " to equal " (pr-str expected)
+                 ", last saw " (pr-str actual)))
+        false)))
 
 (defn wait-for-cookie
   "Poll until document.cookie contains (or no longer contains) a cookie name=value pair.
    When `absent?` is true, waits until the cookie name is NOT present."
   [cookie-name expected-value & {:keys [timeout absent?] :or {timeout 5000 absent? false}}]
-  (let [deadline (+ (System/currentTimeMillis) timeout)
-        pattern  (str cookie-name "=" expected-value)]
-    (loop []
-      (let [cookies (try (eval-js "document.cookie") (catch Exception _ ""))]
-        (if absent?
-          (if (not (.contains (str cookies) (str cookie-name "=")))
-            true
-            (if (> (System/currentTimeMillis) deadline)
-              (do (is false (str "Timed out waiting for cookie " cookie-name " to be absent, saw: " cookies))
-                  false)
-              (do (Thread/sleep 100) (recur))))
-          (if (.contains (str cookies) pattern)
-            true
-            (if (> (System/currentTimeMillis) deadline)
-              (do (is false (str "Timed out waiting for cookie " pattern " in: " cookies))
-                  false)
-              (do (Thread/sleep 100) (recur)))))))))
+  (let [pattern (str cookie-name "=" expected-value)
+        pred    (if absent?
+                  #(not (.contains (str (eval-js "document.cookie")) (str cookie-name "=")))
+                  #(.contains (str (eval-js "document.cookie")) pattern))]
+    (or (wait-for-pred pred :timeout timeout)
+        (let [cookies (try (eval-js "document.cookie") (catch Exception _ ""))]
+          (is false (if absent?
+                      (str "Timed out waiting for cookie " cookie-name " to be absent, saw: " cookies)
+                      (str "Timed out waiting for cookie " pattern " in: " cookies)))
+          false))))
 
 (defn counter-text
   "Get the text of a counter's h2 heading."
@@ -1020,6 +1099,109 @@
 
       (finally
         (close-browser! browser-info)))))
+
+;; ---------------------------------------------------------------------------
+;; Issue #44: checkbox group bound to an empty-array signal
+;; ---------------------------------------------------------------------------
+
+(deftest ^:e2e checkbox-array-bind-test
+  (testing "checkbox group bound to (h/signal :ids []) updates on first click (issue #44)"
+    (let [browser-info (launch-browser)
+          ctx          (new-context browser-info)
+          page         (new-page ctx)]
+      (try
+        (w/with-page page
+          (w/navigate (str base-url "/checkbox-array"))
+          (wait-for-sse)
+
+          ;; The signal starts as an empty array.  We wait until Datastar has
+          ;; evaluated the data-text expression at least once.
+          (testing "initial signal value is an array"
+            (is (wait-for-pred
+                  #(let [t (w/text-content "#ids-dump")]
+                     (and t (str/starts-with? (str/trim t) "[")))
+                  :timeout 5000)
+                (str "ids-dump never rendered an array, last saw "
+                     (pr-str (try (w/text-content "#ids-dump") (catch Exception _ nil))))))
+
+          ;; Clicking the first checkbox adds "a" to the bound array signal,
+          ;; confirming Datastar keeps the checkbox-array setup it builds
+          ;; from the DOM.
+          (testing "clicking checkbox 'a' adds 'a' to the signal"
+            (w/click "#cb-a")
+            (is (wait-for-pred
+                  #(let [t (w/text-content "#ids-dump")]
+                     (and t (str/includes? t "\"a\"")))
+                  :timeout 5000)
+                (str "signal never included 'a' after clicking checkbox; last saw "
+                     (pr-str (try (w/text-content "#ids-dump") (catch Exception _ nil)))))))
+
+        (finally
+          (close-browser! browser-info))))))
+
+(defn- assert-array-bind-updates
+  "Navigate to `path`, wait for SSE, click `click-id`, and assert the live
+   signal dumped at `dump-id` includes `expect` — i.e. Datastar retained
+   the DOM-materialized array binding and the click reached the signal."
+  [path click-id dump-id expect]
+  (let [browser-info (launch-browser)
+        ctx          (new-context browser-info)
+        page         (new-page ctx)]
+    (try
+      (w/with-page page
+        (w/navigate (str base-url path))
+        (wait-for-sse)
+        (w/click click-id)
+        (is (wait-for-pred
+              #(let [t (w/text-content dump-id)]
+                 (and t (str/includes? t expect)))
+              :timeout 5000)
+            (str path " — signal never included " (pr-str expect)
+                 "; last saw "
+                 (pr-str (try (w/text-content dump-id) (catch Exception _ nil))))))
+      (finally
+        (close-browser! browser-info)))))
+
+(deftest ^:e2e nested-checkbox-array-bind-test
+  (testing "checkbox group bound to a nested array signal updates on click (issue #44)"
+    (assert-array-bind-updates "/cb-nested" "#ncb-a" "#nids-dump" "\"a\"")))
+
+(deftest ^:e2e select-multiple-bind-test
+  (testing "<select multiple> bound to an array signal updates on selection (issue #44)"
+    (assert-array-bind-updates "/select-multi" "#opt-red" "#colors-dump" "\"red\"")))
+
+(deftest ^:e2e prechecked-checkbox-array-bind-test
+  (testing "checkbox array seeded with a value (value == default) still toggles (issue #44)"
+    ;; seeded with "a"; clicking "b" should add it alongside
+    (assert-array-bind-updates "/cb-prechecked" "#pcb-b" "#pids-dump" "\"b\"")))
+
+(deftest ^:e2e checkbox-array-survives-rerender-test
+  (testing "a later full re-render does not stomp the client-materialized array (issue #44)"
+    (let [browser-info (launch-browser)
+          ctx          (new-context browser-info)
+          page         (new-page ctx)]
+      (try
+        (w/with-page page
+          (w/navigate (str base-url "/cb-rerender"))
+          (wait-for-sse)
+
+          ;; Materialize the array on the client by ticking a checkbox.
+          (w/click "#rcb-a")
+          (is (wait-for-pred
+                #(str/includes? (str (w/text-content "#rids-dump")) "\"a\"")
+                :timeout 5000)
+              "checkbox click did not reach the signal")
+
+          ;; Force an unrelated full page re-render via an action.
+          (w/click "#rerender-btn")
+          (wait-for-text "#rn-dump" "1")
+
+          ;; The array the client built must survive the re-render.
+          (is (str/includes? (str (w/text-content "#rids-dump")) "\"a\"")
+              (str "array was clobbered by the re-render; saw "
+                   (pr-str (w/text-content "#rids-dump")))))
+        (finally
+          (close-browser! browser-info))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Test 6: watch! bootstrap — server-side atom mutation triggers SSE update
