@@ -86,6 +86,27 @@
     (swap! app-state* assoc-in [:tabs tab-id :subviews sid] spec)
     spec))
 
+;; ---------------------------------------------------------------------------
+;; Serialization
+;; ---------------------------------------------------------------------------
+
+(defn- render-html
+  "Serialize subview hiccup to an HTML string, applying the app's
+   `:hiccup-transform` (if configured) first.
+
+   The full-page render path (`hyper.render/render-tab`) applies
+   `:hiccup-transform` to the whole body before serializing.  Partial and
+   async subview re-renders are independent serialization points (a dep
+   change can re-render just this region with no full render), so they must
+   apply the same transform — otherwise a consumer hiccup dialect that relies
+   on it (e.g. lambdaisland/ornament `defstyled` tags, or function components)
+   serializes raw on a transform-less re-render: the component leaks its name
+   as text and loses its element/attributes.  Applied after `inject-id` so the
+   injected id flows through the transform onto the root element."
+  [app-state* hiccup]
+  (let [transform (get @app-state* :hiccup-transform)]
+    (c/html (if transform (transform hiccup) hiccup))))
+
 (defn render-reactive!
   "Render a render-bearing subview inline during a full page render.
 
@@ -100,7 +121,7 @@
   [app-state* tab-id sid deps render-fn]
   (let [body             (render-fn)
         [html-id hiccup] (inject-id body sid)
-        html             (c/html hiccup)]
+        html             (render-html app-state* hiccup)]
     (register-subview! app-state* tab-id sid
                        {:render-fn   render-fn
                         :deps        deps
@@ -131,7 +152,7 @@
         (try
           (let [body             (render-fn)
                 [html-id hiccup] (inject-id body sid)
-                html             (c/html hiccup)]
+                html             (render-html app-state* hiccup)]
             (swap! app-state* assoc-in [:tabs tab-id :subviews sid]
                    (assoc spec
                           :dep-vals    (mapv deref deps)
@@ -422,7 +443,7 @@
         deps             (into [cell] user-deps)
         body             (render-fn @cell)
         [html-id hiccup] (inject-id body component-id)
-        html             (c/html hiccup)
+        html             (render-html app-state* hiccup)
         ;; The stored render-fn re-coordinates (so a partial re-render from a
         ;; user-dep change still refetches) then renders the current status.
         thunk            (fn []

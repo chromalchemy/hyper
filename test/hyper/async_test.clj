@@ -1,5 +1,6 @@
 (ns hyper.async-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
             [hyper.context :as context]
             [hyper.core :as h]
             [hyper.server :as server]
@@ -177,3 +178,39 @@
       (server/cleanup-tab! app-state* "t")
       (is (true? (deref interrupted 1000 :timeout)))
       (is (not (contains? (:tabs @app-state*) "t"))))))
+
+(deftest test-partial-async-render-applies-hiccup-transform
+  (testing "a transform-less re-render path (partial / async) still applies the
+            app's :hiccup-transform, so a consumer hiccup dialect (ornament
+            defstyled tags, function components) expands instead of leaking its
+            raw tag — parity with the full-page render in hyper.render/render-tab"
+    (let [app-state* (atom (state/init-state))
+          ;; Stand-in for ornament/expand-ornament: expand a sentinel ::styled
+          ;; tag into a real element.  An untransformed serialization would
+          ;; leak the namespaced keyword instead of producing <div class=styled>.
+          xf         (fn xf [form]
+                       (cond
+                         (and (vector? form) (= ::styled (first form)))
+                         (xf (into [:div.styled] (rest form)))
+                         (vector? form) (mapv xf form)
+                         (seq? form)    (map xf form)
+                         :else          form))
+          gate       (promise)]
+      (state/get-or-create-tab! app-state* "s" "t")
+      (swap! app-state* assoc :hiccup-transform xf)
+      (rendering app-state* "t"
+                 (h/async [] (do @gate :rows)
+                          {:keys [status]}
+                          [::styled (str status)]))
+      (deliver gate true)
+      (is (wait-for #(= :ready (:status @(cell app-state* "t" "async_t_1")))))
+      (let [html (subview/partial-render app-state* "t" "async_t_1")]
+        (is (str/includes? html "class=\"styled\"")
+            "transform ran on the partial re-render")
+        (is (str/includes? html ":ready")
+            "the ready status rendered")
+        (is (str/includes? html "id=\"async_t_1\"")
+            "the injected region id flows through the transform")
+        (is (not (str/includes? html "async-test"))
+            "the raw ::styled tag must not leak to Chassis"))
+      (subview/teardown-all! app-state* "t"))))
