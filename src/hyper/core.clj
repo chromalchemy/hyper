@@ -105,17 +105,21 @@
    tab when it changes. Source must satisfy the hyper.protocols/Watchable protocol
    (extended by default for atoms, refs, vars, and any IRef).
 
-   Idempotent — safe to call on every render with the same source.
-   Watches are automatically cleaned up when the tab disconnects.
+   A watch is a mount-scoped subscription, keyed by source identity for dedup.
+   Prefer a **form-2 setup closure** (runs once per mount):
 
-   Example:
-     ;; Watch a database query result atom
      (defn my-page [req]
-       (watch! db-results)
-       [:div [:p \"Count: \" (count @db-results)]])
+       (let [results (db/query-atom (get-in req [:hyper/route :path-params :id]))]
+         (watch! results)                     ;; setup — runs once per mount
+         (fn [req] [:p \"Count: \" (count @results)])))
 
-     ;; Watch any Watchable source
-     (watch! my-event-stream)"
+   It is idempotent, so a form-1 render body also works (re-subscribing each
+   render); that path triggers the render-purity warning nudging you to form-2.
+
+   The mount boundary is keyed on `[handler path-params]`, so a source derived
+   from a path-param re-subscribes when that path-param changes: the page
+   remounts, tearing down the old watch and running setup for the new one.
+   Watches are cleaned up on remount and tab disconnect."
   [source]
   (context/guard-effect! :watch "h/watch!")
   (let [{:keys [tab-id app-state*]} (context/require-context! "watch!")

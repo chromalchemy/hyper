@@ -1133,9 +1133,11 @@ and `:unmount`:
 ```
 
 `:render` is required; `:mount`/`:unmount` are optional. The view (re)mounts
-when the page first renders or the route handler identity changes (navigation,
-or a Var redefinition during REPL development); a superseded view is unmounted
-first. There is deliberately **no** mutable per-view slot — the server always
+when the page first renders, the route handler identity changes (navigation, or
+a Var redefinition during REPL development), or the route's **path-params**
+change (the same handler serving a different path-param value); a superseded
+view is unmounted first. Query-param changes re-render in place. There is deliberately
+**no** mutable per-view slot — the server always
 re-renders declaratively, so a resource opened at mount, read during renders,
 and closed at unmount is just a value threaded through the lifecycle.
 
@@ -1224,8 +1226,10 @@ and pushes an update to the client. `watch!` is an *effect*, so it belongs in a
             [:li (:name r)])]]))
 ```
 
-Watches are reference-counted and automatically cleaned up when the tab is torn
-down (navigation away, or a disconnect that is not reconnected within the
+Watches are reference-counted and automatically cleaned up when the page
+remounts (navigation, or a path-param change — which re-runs setup, so a
+path-param-keyed watch re-subscribes to the new source) or the tab is torn down
+(a disconnect not reconnected within the
 [grace window](#reconnection-and-the-disconnect-grace-window)). A transient
 disconnect leaves watches in place, so a reconnect does not re-run their setup.
 

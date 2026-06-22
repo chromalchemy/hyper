@@ -358,14 +358,16 @@
                          true    (dissoc :reitit.core/match))]
        (push-thread-bindings (context/render-bindings req app-state*))
        (try
-         ;; Register framework route-level watches (global :watches, route
-         ;; :watches, auto-watched :get Var) as mount-scoped subviews.
-         (register-route-watches! app-state* tab-id route-index route)
          (let [mw-chain        (resolve-render-middleware app-state* route-index route)
                wrap-mw         #(apply-render-middleware % mw-chain)
                render-error-fn (get @app-state* :render-error)
                raw-body        (lifecycle/render-page app-state* tab-id render-fn req
-                                                      render-error-fn wrap-mw)]
+                                                      render-error-fn wrap-mw)
+               ;; Framework route-level watches (global :watches, route :watches,
+               ;; auto-watched :get Var), registered AFTER render-page so they
+               ;; survive a remount's mount-scoped teardown.  Idempotent, keyed
+               ;; by source identity; wired later by setup-new-watches!.
+               _               (register-route-watches! app-state* tab-id route-index route)]
            ;; Ring response passthrough - render-fn returned a redirect,
            ;; error, or other non-hiccup response; pass it through as-is.
            (if (and (map? raw-body) (:status raw-body))
