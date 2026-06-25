@@ -30,4 +30,4 @@
 
  :linters
  {:unresolved-symbol
-  {:exclude [(hyper.core/action [$value $checked $key $detail $form-data])]}}}
+  {:exclude [(hyper.core/action [$value $checked $key $detail $form-data $form $files])]}}}

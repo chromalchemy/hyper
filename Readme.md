@@ -593,6 +593,140 @@ All effect functions throw if called outside an action context. This is
 intentional — effects are tied to the HTTP request/response cycle and have no
 meaning outside of it.
 
+## File uploads
+
+A file upload is just an `action` whose body uses a **file client param** —
+`$form` or `$files`. Binary content can't ride Datastar's JSON `@post()`, so
+when one of these appears the macro switches the action to a real
+`multipart/form-data` upload (a small `XMLHttpRequest` to `/hyper/upload`),
+while everything else — the trigger you bind it to, cursors, effects — works
+exactly as in a normal action.
+
+```clojure
+(defn profile-page [_]
+  (let [status* (h/signal :avatar-upload {:phase :idle :percent 0})]
+    [:form {:data-on:submit__prevent
+            (h/action {:upload status*}
+              (let [f (:avatar $form)]
+                (store-avatar! (:tempfile f))
+                {:saved (:filename f)}))}
+     [:input {:name "name"}]
+     [:input {:type "file" :name "avatar"}]
+     [:button "Upload"]]))
+```
+
+### File params: `$form` vs `$files`
+
+| Param | Captures | Bound on the server to |
+|---|---|---|
+| `$form` | the whole enclosing `<form>` (named fields **and** files) | a keyword-keyed map, files inline: `{:name "Alice" :avatar {file…}}` |
+| `$files` | the file(s) on the event target (`evt.target.files`) | a vector of file maps |
+
+Each file is a map `{:filename :content-type :tempfile :size}`, where
+`:tempfile` is a `java.io.File`.
+
+**Pick the param to match the event.** `$form` reads the closest form, so use it
+for `data-on:submit`. `$files` reads `evt.target.files`, which is only populated
+on a file input itself — use it on an `<input type="file">`'s `data-on:change`
+to upload the moment a file is chosen:
+
+```clojure
+[:input {:type "file"
+         :data-on:change (h/action {:upload status*} (ingest! $files))}]
+```
+
+You may use at most one file param per action, and not mixed with other client
+params (`$value`, etc.). File extraction is extensible like any client param —
+define a `:multipart? true` method on `hyper.client-params/client-param` whose
+`:js` returns a `FormData` (e.g. a drop zone reading `evt.dataTransfer.files`).
+
+### Status and progress — the `:upload` ref
+
+Pass any `IRef` as `:upload`; the framework writes the upload's status into it:
+
+```clojure
+{:phase   :idle | :uploading | :processing | :done | :error
+ :percent 0-100        ;; live transfer % (signal refs only)
+ :result  …            ;; the action's return value, on :done
+ :error   "…"}         ;; the exception message, on :error
+```
+
+The ref type you choose selects the ergonomics:
+
+| `:upload` ref | live transfer `%` | how you read it in render |
+|---|---|---|
+| **signal** (recommended) | ✅ written client-side from `xhr.upload.onprogress` | drive UI via Datastar attributes on the signal |
+| **cursor** / atom | ❌ server-only (`:idle → :processing → :done`) | branch server-side: `(case (:phase @status*) …)` |
+
+A **signal** is the natural home because it's the one ref both sides can write:
+the client sets `:phase :uploading` + `:percent` during transfer (no round
+trip), and the server sets `:processing` → `:done`/`:error` over SSE. The server
+never writes `:percent` mid-transfer, so it can't clobber the live client value
+(it sets `100` only once the body has fully arrived).
+
+Because a signal holds a map, read its fields as Datastar **paths**, not with
+Clojure keyword access — in render `@status*` is the expression string
+`"$avatarUpload"`, so build the path with `str` (`(:phase @status*)` would be
+evaluated as Clojure and yield `null`):
+
+```clojure
+[:progress {:data-show     (str @status* ".phase === 'uploading'")
+            :max           100
+            :data-attr:value (str @status* ".percent")}]
+[:p {:data-show (str @status* ".phase === 'done'")}
+ "Saved " [:strong {:data-text (str @status* ".result.filename")}]]
+```
+
+With a **cursor** the page re-renders server-side, so ordinary Clojure works
+(`(case (:phase @status*) :processing [:p "…"] :done …)`) — you just don't get a
+live transfer percentage.
+
+The action's return value becomes `:result`, and an uncaught throw becomes
+`:error`. Since the ref is yours, the handler can also write it directly for
+richer status (e.g. per-file results when a `multiple` input or repeated field
+yields several files).
+
+`:upload` is optional — omit it for a fire-and-forget upload with no
+status/progress.
+
+### Signals and form fields
+
+The upload sends the form's named fields (a `data-bind` input with a `name` is
+included automatically), so they arrive in `:form`. They are also folded into
+`*signals*`, so `@a-signal*` reads in the handler resolve to the submitted value
+when the input's `name` matches the signal (e.g. a `data-bind` input named
+`userName` satisfies `(h/signal :user-name)`). For a signal not represented as a
+named form field, add a hidden bound input
+(`[:input {:type "hidden" :name "token" :data-bind token*}]`).
+
+### Streaming, memory, and limits
+
+Uploads stream to disk: Jetty hands the request body to Ring as an
+`InputStream`, and the multipart temp-file store writes each part to a temp file
+as bytes arrive — so large files never buffer in heap. Your handler gets a
+`:tempfile` (a `File`); **move or stream it** to permanent storage rather than
+reading it whole into memory. Temp files left behind are reaped after
+`:upload-expires-in` seconds (default 3600).
+
+Configure limits on `create-handler`:
+
+| Option | Meaning | Default |
+|---|---|---|
+| `:max-file-size` | max bytes per file (413 when exceeded) | no limit |
+| `:max-file-count` | max files per request | no limit |
+| `:upload-expires-in` | temp-file TTL in seconds | `3600` |
+
+```clojure
+(h/create-handler #'routes
+  :max-file-size  (* 25 1024 1024)
+  :max-file-count 5)
+```
+
+> For very large files over flaky networks, resumable/chunked uploads (each
+> chunk a bounded request) are the principled answer — both for resume and to
+> keep per-request memory flat. That's a planned future addition; today's
+> single-request uploads cover the common case with a size cap.
+
 ## Render Middleware
 
 Render middleware lets you wrap every page render with cross-cutting logic —

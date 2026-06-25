@@ -21,6 +21,7 @@
             [hyper.signal :as signal]
             [hyper.state :as state]
             [hyper.subview :as subview]
+            [hyper.uploads :as uploads]
             [hyper.utils :as utils]
             [hyper.watch :as watch]
             [reitit.coercion :as coercion]
@@ -34,6 +35,8 @@
             [ring.middleware.cookies :as cookies]
             [ring.middleware.file :as file]
             [ring.middleware.keyword-params :as keyword-params]
+            [ring.middleware.multipart-params :as multipart-params]
+            [ring.middleware.multipart-params.temp-file :as temp-file]
             [ring.middleware.not-modified :as not-modified]
             [ring.middleware.params :as params]
             [ring.middleware.resource :as resource]
@@ -617,6 +620,89 @@
             (finally
               (pop-thread-bindings))))))))
 
+(defn- trigger-tab-render!
+  "Enqueue a full render for `tab-id` on its currently attached renderer (if
+   any).  Used after an upload status transition so a plain-atom `:upload` ref
+   — which the app-state watcher does not observe — is still reflected; signal
+   and cursor refs already trigger via the watcher, so this is a harmless
+   coalesced extra render for them."
+  [app-state* tab-id]
+  (when-let [trigger! (get-in @app-state* [:tabs tab-id :renderer :trigger-render!])]
+    (trigger!)))
+
+(defn upload-handler
+  "Handler for multipart file-upload POST requests (`/hyper/upload`).
+
+   Uploads are `h/action`s whose body uses a file param ($form/$files); the
+   client posts a real multipart/form-data request here (rather than Datastar's
+   JSON @post()).  Wrapped with Ring's multipart middleware, which streams each
+   part to a temp file on disk, this:
+
+   - Looks up the registered action + its `:upload-ref` by action-id.
+   - Parses the multipart body into the `{:form :files}` client-params and
+     folds non-file fields into `context/*signals*` (so `@signal*` reads resolve
+     to submitted field values by matching input name).
+   - Transitions the status ref :processing -> :done (handler return as
+     `:result`) / :error, pushing each change to the client over SSE.
+   - Returns 204 (with any cookies from effects), like the action handler."
+  [app-state*]
+  (fn [req]
+    (let [action-id   (get-in req [:query-params "action-id"])
+          action-data (when action-id (get-in @app-state* [:actions action-id]))]
+      (cond
+        (not action-id)
+        {:status  400
+         :headers {"Content-Type" "application/json"}
+         :body    "{\"error\": \"Missing action-id\"}"}
+
+        (not (:fn action-data))
+        {:status  404
+         :headers {"Content-Type" "application/json"}
+         :body    "{\"error\": \"Upload action not found\"}"}
+
+        :else
+        (let [{:keys [tab-id upload-ref as]} action-data
+              multipart-params               (:multipart-params req)
+              client-params                  (uploads/parse-multipart multipart-params)
+              signals                        (uploads/form-fields->signals multipart-params)
+              req-with-state                 (assoc req
+                                                    :hyper/app-state app-state*
+                                                    :hyper/router (get @app-state* :router))]
+          (when-let [env (:hyper/env req)]
+            (when tab-id
+              (swap! app-state* assoc-in [:tabs tab-id :env] env)))
+          (push-thread-bindings {#'context/*request*     req-with-state
+                                 #'context/*signals*     signals
+                                 #'context/*action-name* as
+                                 #'effects/*pending*     (effects/init-pending)})
+          (try
+            ;; Body fully received: transfer is complete, processing begins.
+            (uploads/set-status! upload-ref {:phase :processing :percent 100 :error nil})
+            (trigger-tab-render! app-state* tab-id)
+            (let [result (try
+                           ((:fn action-data) client-params)
+                           (catch Throwable e
+                             (uploads/set-status! upload-ref {:phase :error :error (.getMessage e)})
+                             (trigger-tab-render! app-state* tab-id)
+                             (throw e)))]
+              (uploads/set-status! upload-ref {:phase :done :percent 100 :result result :error nil})
+              (trigger-tab-render! app-state* tab-id)
+              (let [pending (effects/collect-pending!)]
+                (when-let [scripts (seq (:scripts pending))]
+                  (when-let [renderer (get-in @app-state* [:tabs tab-id :renderer])]
+                    ((:enqueue-scripts! renderer) scripts)))
+                (effects/apply-cookies-to-response {:status 204} pending)))
+            (catch Throwable e
+              (t/error! {:id   :hyper.error/upload-handler
+                         :msg  "Error executing upload handler"
+                         :data {:hyper/action-id action-id}}
+                        e)
+              {:status  500
+               :headers {"Content-Type" "application/json"}
+               :body    (json/generate-string {:error (.getMessage e)})})
+            (finally
+              (pop-thread-bindings))))))))
+
 (defn- extract-route-info
   "Extract route info from a reitit match and Ring request.
    Uses coerced parameters from reitit's coercion middleware when available,
@@ -666,6 +752,34 @@
       }
     }
     return p.join('&');
+  };
+  // Multipart upload via XMLHttpRequest so we get real upload progress
+  // (fetch does not expose request-body progress). fd is a FormData; opts has
+  // {url, start?, progress?(0-100), error?}. The signal callbacks are supplied
+  // by hyper.uploads/build-upload-expr so progress/phase land in a Datastar
+  // signal without a server round-trip; the server pushes processing/done over
+  // SSE. Same-origin, so the session cookie rides along automatically.
+  window.hyper.upload = function(fd, opts) {
+    opts = opts || {};
+    try { if (opts.start) opts.start(); } catch (e) {}
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', opts.url, true);
+    if (xhr.upload && opts.progress) {
+      xhr.upload.onprogress = function(e) {
+        if (e.lengthComputable) {
+          opts.progress(Math.round((e.loaded / e.total) * 100));
+        }
+      };
+    }
+    xhr.onreadystatechange = function() {
+      if (xhr.readyState === 4) {
+        if (xhr.status >= 400) { if (opts.error) opts.error(xhr.status); }
+        else if (opts.progress) { opts.progress(100); }
+      }
+    };
+    xhr.onerror = function() { if (opts.error) opts.error(0); };
+    xhr.send(fd);
+    return undefined;
   };
   var appEl = document.getElementById('hyper-app');
   if (appEl) {
@@ -1021,18 +1135,27 @@
                         the next write (so the disconnect grace window can
                         start).  Defaults to 25000 (25s); pass nil or 0 to
                         disable.
+   - :max-file-size     Max bytes allowed per uploaded file on the /hyper/upload
+                        route; a larger file gets a 413.  Default: no limit.
+   - :max-file-count    Max number of files allowed per upload request.
+                        Default: no limit.
+   - :upload-expires-in TTL (seconds) for upload temp files before they are
+                        reaped.  Default 3600 (1 hour).  Move/stream :tempfile
+                        to permanent storage in your handler.
 
    Routes should use :get handlers that return hiccup (Chassis vectors).
    Hyper will wrap them to provide full HTML responses and SSE connections."
   ([routes app-state*]
    (create-handler routes app-state* {:datastar-script (default-datastar-script)}))
   ([routes app-state* {:keys [watches head base-path middleware render-middleware render-error not-found render-guard
-                              disconnect-grace-ms heartbeat-ms]
+                              disconnect-grace-ms heartbeat-ms
+                              max-file-size max-file-count upload-expires-in]
                        :or   {render-error        render.error/minimal
                               not-found           render.error/not-found
                               render-guard        :warn
                               disconnect-grace-ms default-disconnect-grace-ms
-                              heartbeat-ms        default-heartbeat-ms}
+                              heartbeat-ms        default-heartbeat-ms
+                              upload-expires-in   3600}
                        :as   opts}]
    (let [base-path       (or base-path "")
          opts            (assoc opts :base-path base-path)
@@ -1044,8 +1167,19 @@
                            (ring/create-default-handler
                              {:not-found (not-found-handler app-state* opts)})
                            (ring/create-default-handler))
+         ;; Multipart middleware is scoped to the upload route only — action
+         ;; POSTs and SSE must not be run through multipart parsing.  The
+         ;; temp-file store streams each part to disk (Jetty streams the body),
+         ;; so large uploads never buffer in heap.
+         upload-mw       {:store          (temp-file/temp-file-store {:expires-in upload-expires-in})
+                          :max-file-size  max-file-size
+                          :max-file-count max-file-count}
+         upload-route    (multipart-params/wrap-multipart-params
+                           (upload-handler app-state*)
+                           (into {} (remove (comp nil? val)) upload-mw))
          system-routes   [[(str base-path "/hyper/events") {:get (sse-events-handler app-state*)}]
                           [(str base-path "/hyper/actions") {:post (action-handler app-state*)}]
+                          [(str base-path "/hyper/upload") {:post upload-route}]
                           [(str base-path "/hyper/navigate") {:post (navigate-handler app-state*)}]
                           [(str base-path "/hyper/components.js") {:get (components-js-handler app-state*)}]]
          ;; Store the routes source (Var or value) so title resolution can

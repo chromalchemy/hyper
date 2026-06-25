@@ -18,6 +18,8 @@
               $checked
               $detail
               $form-data
+              $form
+              $files
               $key
               $value}
            (params/defined-client-params)))))
@@ -31,6 +33,8 @@
           '{:defined-symbols #{$checked
                                $detail
                                $form-data
+                               $form
+                               $files
                                $key
                                $mouse-x-offset
                                $value}

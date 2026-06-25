@@ -22,6 +22,8 @@
     " · "
     [:a (h/navigate :effects) "Effects"]
     " · "
+    [:a (h/navigate :uploads) "Uploads"]
+    " · "
     [:a (h/navigate :components) "Components"]]
    [:h1 title]
    children])
@@ -280,6 +282,80 @@
                "Set cookie + run script"])))))
 
 ;; ---------------------------------------------------------------------------
+;; Uploads
+;; ---------------------------------------------------------------------------
+
+(defn- save-upload!
+  "Pretend to save an uploaded file.  Real apps would move (:tempfile f) to
+   permanent storage; here we just report its metadata back as the action
+   result (which becomes the status ref's :result)."
+  [f]
+  (when f
+    {:filename     (:filename f)
+     :size         (:size f)
+     :content-type (:content-type f)}))
+
+(defn uploads-page [_]
+  (letfn [(card [title desc & children]
+            [:div.card [:h3 title] [:p.muted desc] children])
+          ;; A map-valued signal holds {:phase :percent :result ...}.  In render
+          ;; @sig* is the Datastar expression string ("$formUpload"), so nested
+          ;; fields are reached by string-building the Datastar path — keyword
+          ;; access like (:phase @sig*) would be evaluated as Clojure, not
+          ;; compiled to "$formUpload.phase".
+          (field [sig* suffix] (str @sig* suffix))
+          (phase-is [sig* p] (str @sig* ".phase === '" p "'"))]
+    ;; A signal status ref gets both client-side transfer progress and
+    ;; server-side phase/result; a cursor ref would give server status only.
+    (let [form*  (h/signal :form-upload {:phase :idle :percent 0})
+          quick* (h/signal :quick-upload {:phase :idle :percent 0})]
+      (layout
+        "Uploads"
+        [:p "File uploads are just " [:code "h/action"] "s whose body uses "
+         [:code "$form"] " or " [:code "$files"] ". The action posts a real "
+         "multipart request; status + progress flow through an " [:code ":upload"]
+         " ref (a signal here, for live progress)."]
+
+        ;; $form — whole form (fields + file) on submit
+        (card "$form — submit a form with a file"
+              "Submit sends every named field plus the file as one multipart request."
+              [:form {:data-on:submit__prevent
+                      (h/action {:upload form*}
+                                (save-upload! (:avatar $form)))}
+               [:input {:name "name" :placeholder "Your name"}]
+               " "
+               [:input {:type "file" :name "avatar"}]
+               " "
+               [:button {:type "submit"} "Upload"]]
+              ;; Live transfer progress (client-side signal, no round-trip)
+              [:p {:data-show (phase-is form* "uploading")}
+               "Uploading… "
+               [:progress {:max 100 :data-attr:value (field form* ".percent")}]]
+              [:p {:data-show (phase-is form* "processing")} "Processing…"]
+              [:p {:data-show (phase-is form* "done")}
+               "✓ Saved "
+               [:strong {:data-text (field form* ".result.filename")}]
+               " ("
+               [:span {:data-text (field form* ".result.size")}]
+               " bytes)"]
+              [:p.muted "Live status: "
+               [:code {:data-text (str "JSON.stringify(" @form* ")")}]])
+
+        ;; $files — upload immediately when a file is chosen (input change)
+        (card "$files — upload on selection"
+              "Choosing a file fires data-on:change with $files (the input's files),
+               uploading immediately — no form, no submit button."
+              [:input {:type           "file"
+                       :data-on:change (h/action {:upload quick*}
+                                                 (save-upload! (first $files)))}]
+              [:p {:data-show (phase-is quick* "uploading")}
+               "Uploading… "
+               [:progress {:max 100 :data-attr:value (field quick* ".percent")}]]
+              [:p {:data-show (phase-is quick* "done")}
+               "✓ Saved "
+               [:strong {:data-text (field quick* ".result.filename")}]])))))
+
+;; ---------------------------------------------------------------------------
 ;; Client components (compiled via embedded Squint)
 ;; ---------------------------------------------------------------------------
 
@@ -439,6 +515,10 @@
     {:name  :effects
      :title "Effects"
      :get   #'effects-page}]
+   ["/uploads"
+    {:name  :uploads
+     :title "Uploads"
+     :get   #'uploads-page}]
    ["/components"
     {:name  :components
      :title "Client Components"

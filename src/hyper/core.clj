@@ -21,6 +21,7 @@
             [hyper.signal :as signal]
             [hyper.state :as state]
             [hyper.subview :as subview]
+            [hyper.uploads :as uploads]
             [hyper.utils :as utils]
             [reitit.core :as reitit]))
 
@@ -580,25 +581,40 @@
   [& args]
   (let [[maybe-opts & body] args
         opts-map?           (and (map? maybe-opts)
-                                 (some #{:when :as} (keys maybe-opts)))
-        [js as-name body]   (if opts-map?
-                              (let [guard (:when maybe-opts)
-                                    ;; String literals are validated here; any
-                                    ;; other form (e.g. (expr ...)) is deferred
-                                    ;; to runtime evaluation — sanitize-guard
-                                    ;; validates the result.
-                                    js    (cond
-                                            (string? guard) (when-not (str/blank? guard) guard)
-                                            (some? guard)   guard)]
-                                [js (:as maybe-opts) body])
-                              [nil nil args])
+                                 (some #{:when :as :upload} (keys maybe-opts)))
+        [js as-name upload-ref-form body]
+        (if opts-map?
+          (let [guard (:when maybe-opts)
+                ;; String literals are validated here; any other form
+                ;; (e.g. (expr ...)) is deferred to runtime evaluation —
+                ;; sanitize-guard validates the result.
+                js    (cond
+                        (string? guard) (when-not (str/blank? guard) guard)
+                        (some? guard)   guard)]
+            [js (:as maybe-opts) (:upload maybe-opts) body])
+          [nil nil nil args])
         used-params         (find-client-params body)
         param-syms          (keys used-params)
+        ;; Multipart params ($form/$files) switch the action to a file-upload
+        ;; transport (see hyper.uploads).  Validate the combination at macro
+        ;; time so misuse fails loudly with a clear message.
+        multipart-syms      (filter client-params/multipart-param? param-syms)
+        other-syms          (remove (set multipart-syms) param-syms)
+        _                   (when (> (count multipart-syms) 1)
+                              (throw (ex-info "An upload action may use at most one multipart param ($form or $files)."
+                                              {:params (vec multipart-syms)})))
+        _                   (when (and (seq multipart-syms) (seq other-syms))
+                              (throw (ex-info "Multipart upload params ($form/$files) cannot be combined with other client params."
+                                              {:multipart (vec multipart-syms) :others (vec other-syms)})))
+        _                   (when (and upload-ref-form (empty? multipart-syms))
+                              (throw (ex-info "action :upload requires a $form or $files param in the body."
+                                              {:upload upload-ref-form})))
         cp-sym              (gensym "client-params")]
     `(let [{session-id# :session-id
             tab-id#     :tab-id
             app-state*# :app-state*
             router#     :router}    (context/require-context! "action")
+           upload-ref#              ~upload-ref-form
            action-fn#               (fn [~cp-sym]
                                       (let [~@(mapcat (fn [sym]
                                                         (let [k (keyword (:key (client-params/client-param sym)))]
@@ -614,8 +630,12 @@
            action-id#               (str "a_" tab-id# "_" idx#)
            _#                       (actions/register-action! app-state*# session-id# tab-id# action-fn# action-id#
                                                               ~(when as-name {:as as-name}))
+           ;; Stash the upload status ref so the /hyper/upload handler can
+           ;; transition its phase/result; nil for non-upload actions.
+           _#                       (when upload-ref#
+                                      (swap! app-state*# assoc-in [:actions action-id# :upload-ref] upload-ref#))
            base-path#               (get @app-state*# :base-path "")]
-       (actions/build-action-expr action-id# '~used-params (actions/sanitize-guard ~js) base-path#))))
+       (uploads/build-expr action-id# '~used-params (actions/sanitize-guard ~js) base-path# upload-ref#))))
 
 ;; ---------------------------------------------------------------------------
 ;; Client-side expressions and components (re-exports)
@@ -805,7 +825,8 @@
      (stop! app)"
   [routes & {:keys [app-state head static-resources static-dir watches
                     datastar-script base-path middleware render-middleware
-                    render-error squint-core-url render-guard]
+                    render-error squint-core-url render-guard
+                    max-file-size max-file-count upload-expires-in]
              :or   {app-state       (atom (state/init-state))
                     datastar-script server/default-datastar-script}
              :as   opts}]
@@ -822,6 +843,10 @@
                            ;; Only forward when supplied so server defaults apply.
                            render-error (assoc :render-error render-error)
                            render-guard (assoc :render-guard render-guard)
+                           ;; File-upload limits for the /hyper/upload route.
+                           max-file-size (assoc :max-file-size max-file-size)
+                           max-file-count (assoc :max-file-count max-file-count)
+                           upload-expires-in (assoc :upload-expires-in upload-expires-in)
                            ;; `contains?` so an explicit `:not-found nil` (disable) is honored.
                            (contains? opts :not-found) (assoc :not-found (:not-found opts)))))
 
