@@ -2,7 +2,9 @@
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [hyper.core :as h]
-            [hyper.test :as ht]))
+            [hyper.effects :as effects]
+            [hyper.test :as ht]
+            [reitit.core :as reitit]))
 
 ;; ---------------------------------------------------------------------------
 ;; test-page
@@ -316,3 +318,96 @@
         (ht/test-action r2 "dec")
         (let [r3 (ht/test-page page-fn {:app-state (:app-state r2)})]
           (is (str/includes? (:body-html r3) "Count: 1")))))))
+
+;; ---------------------------------------------------------------------------
+;; Router injection — h/navigate (render) and effects/navigate! (action)
+;; ---------------------------------------------------------------------------
+
+(def ^:private nav-routes
+  [["/"          {:name :home :title "Home" :get (fn [_req] [:div "Home"])}]
+   ["/about"     {:name :about :title "About" :get (fn [_req] [:div "About"])}]
+   ["/users/:id" {:name :user-profile :get (fn [_req] [:div "User"])}]])
+
+(deftest test-page-navigate-renders-link
+  (testing "h/navigate inside test-page produces a usable link in the HTML"
+    (let [result (ht/test-page
+                   (fn [_req] [:a (h/navigate :about) "About"])
+                   {:routes nav-routes})]
+      (is (str/includes? (:body-html result) "href=\"/about\""))
+      (is (str/includes? (:body-html result) "/hyper/actions"))
+      (is (str/includes? (:body-html result) "pushState")))))
+
+(deftest test-page-navigate-resolves-named-routes
+  (testing "h/navigate resolves a bound router injected via :routes"
+    (let [captured (atom nil)]
+      (ht/test-page
+        (fn [_req]
+          (reset! captured (h/navigate :user-profile {:id "123"}))
+          [:div])
+        {:routes nav-routes})
+      (is (= "/users/123" (:href @captured)))
+      (is (str/includes? (str (:data-on:click__prevent @captured)) "pushState")))))
+
+(deftest test-page-navigate-query-params
+  (testing "h/navigate carries query params into the href"
+    (let [captured (atom nil)]
+      (ht/test-page
+        (fn [_req]
+          (reset! captured (h/navigate :home nil {:q "clojure"}))
+          [:div])
+        {:routes nav-routes})
+      (is (= "/?q=clojure" (:href @captured))))))
+
+(deftest test-page-navigate-unknown-route
+  (testing "h/navigate returns nil for an unknown route name"
+    (let [captured (atom :unset)]
+      (ht/test-page
+        (fn [_req]
+          (reset! captured (h/navigate :nonexistent))
+          [:div])
+        {:routes nav-routes})
+      (is (nil? @captured)))))
+
+(deftest test-page-navigate-prebuilt-router
+  (testing ":router opt accepts a pre-built reitit router"
+    (let [router   (reitit/router nav-routes)
+          captured (atom nil)]
+      (ht/test-page
+        (fn [_req]
+          (reset! captured (h/navigate :about))
+          [:div])
+        {:router router})
+      (is (= "/about" (:href @captured))))))
+
+(deftest test-page-navigate-router-persists-across-renders
+  (testing "router persists when threading :app-state without re-passing :routes"
+    (let [r1       (ht/test-page (fn [_req] [:div]) {:routes nav-routes})
+          captured (atom nil)]
+      ;; Second render reuses app-state from r1 — note: no :routes here.
+      (ht/test-page
+        (fn [_req]
+          (reset! captured (h/navigate :about))
+          [:div])
+        {:app-state (:app-state r1)})
+      (is (= "/about" (:href @captured))))))
+
+(deftest test-page-no-router-by-default
+  (testing "without :routes/:router, the request carries no router (backward compatible)"
+    (let [result (ht/test-page (fn [_req] [:div "Hi"]))]
+      (is (nil? (get @(:app-state result) :router))))))
+
+(deftest test-action-navigate-with-routes
+  (testing "effects/navigate! in an action resolves routes injected via :routes"
+    (let [home   (fn [_req]
+                   [:button {:data-on:click
+                             (h/action {:as "go-about"}
+                                       (effects/navigate! :about))}
+                    "Go About"])
+          result (ht/test-page home {:routes nav-routes})
+          after  (ht/test-action result "go-about")]
+      ;; Route state updated server-side without needing a full create-handler
+      (is (= :about (get-in after [:cursors :route :name])))
+      (is (= "/about" (get-in after [:cursors :route :path])))
+      ;; pushState script queued among effects
+      (is (some #(str/includes? % "pushState")
+                (get-in after [:effects :scripts]))))))
