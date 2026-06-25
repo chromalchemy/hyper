@@ -13,8 +13,14 @@
   ;; HTML generation
   dev.onionpancakes/chassis           {:mvn/version "1.0.365"}
 
-  ;; Server-sent events support
-  http-kit/http-kit                   {:mvn/version "2.9.0-beta3"}
+  ;; Web server — Jetty 12 via ring-jetty9-adapter.
+  ;; Chosen over http-kit because http-kit buffers the entire request body in
+  ;; heap (no streaming inbound bodies), making large multipart uploads
+  ;; impossible to stream to disk.  Jetty hands the body to Ring as an
+  ;; InputStream (multipart temp-file-store streams to disk), supports SSE via
+  ;; StreamableResponseBody, and runs the per-tab render loop cheaply on
+  ;; virtual threads.
+  info.sunng/ring-jetty9-adapter      {:mvn/version "0.39.4"}
 
  ;; Utilities
   org.clojure/core.memoize            {:mvn/version "1.2.281"}

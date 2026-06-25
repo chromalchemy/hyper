@@ -1,0 +1,221 @@
+(ns hyper.jetty-sse-test
+  "Integration tests for the live Jetty SSE transport: a real server, a real
+   HTTP client holding an SSE connection, exercising the push-after-initial
+   path that browser e2e tests depend on (but without a browser).
+
+   Not tagged :e2e — these need no browser, just a JVM + a socket."
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
+            [hyper.compress :as gz]
+            [hyper.core :as h]
+            [hyper.state :as state])
+  (:import [java.io ByteArrayOutputStream InputStream]
+           [java.net URI ServerSocket]
+           [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers
+            HttpResponse$BodyHandlers]))
+
+(defn- free-port ^long []
+  (with-open [s (ServerSocket. 0)] (.getLocalPort s)))
+
+(defn- sse-reader
+  "Drain an SSE InputStream into a StringBuilder on a background thread.
+   Returns {:text (fn [] accumulated) :stop (fn [])}."
+  [^InputStream is]
+  (let [sb  (StringBuilder.)
+        run (atom true)
+        fut (future
+              (let [buf (byte-array 4096)]
+                (try
+                  (loop []
+                    (when @run
+                      (let [n (.read is buf)]
+                        (when (>= n 0)
+                          (when (pos? n)
+                            (locking sb (.append sb (String. buf 0 n "UTF-8"))))
+                          (recur)))))
+                  (catch Exception _ nil))))]
+    {:text (fn [] (locking sb (.toString sb)))
+     :stop (fn [] (reset! run false) (future-cancel fut))}))
+
+(defn- wait-until
+  "Poll text-fn until pred matches or timeout-ms elapses. Returns the text."
+  [text-fn pred timeout-ms]
+  (let [deadline (+ (System/currentTimeMillis) (long timeout-ms))]
+    (loop []
+      (let [t (text-fn)]
+        (cond
+          (pred t)                                 t
+          (> (System/currentTimeMillis) deadline)  t
+          :else                                    (do (Thread/sleep 25) (recur)))))))
+
+(defn- GET [^HttpClient client url body-handler]
+  (.send client
+         (.. (HttpRequest/newBuilder (URI/create url)) (GET) (build))
+         body-handler))
+
+(defn- GET-gzip [^HttpClient client url body-handler]
+  (.send client
+         (.. (HttpRequest/newBuilder (URI/create url))
+             (header "Accept-Encoding" "gzip")
+             (GET) (build))
+         body-handler))
+
+(defn- sse-byte-reader
+  "Like sse-reader but accumulates raw bytes (for gzip streams)."
+  [^InputStream is]
+  (let [baos (ByteArrayOutputStream.)
+        run  (atom true)
+        fut  (future
+               (let [buf (byte-array 4096)]
+                 (try
+                   (loop []
+                     (when @run
+                       (let [n (.read is buf)]
+                         (when (>= n 0)
+                           (when (pos? n) (locking baos (.write baos buf 0 (int n))))
+                           (recur)))))
+                   (catch Exception _ nil))))]
+    {:bytes (fn [] (locking baos (.toByteArray baos)))
+     :stop  (fn [] (reset! run false) (future-cancel fut))}))
+
+(defn- decode-gzip-stream
+  "Best-effort incremental decode of a SYNC_FLUSH'd gzip stream prefix."
+  [^bytes bs]
+  (if (>= (alength bs) 11)
+    (try (gz/decompress-stream bs) (catch Exception _ ""))
+    ""))
+
+(deftest sse-push-after-initial-render
+  (testing "a re-render triggered after the SSE connection is live streams to the client"
+    (let [port    (free-port)
+          app*    (atom (state/init-state))
+          handler (h/create-handler
+                    [["/" {:name :home
+                           :get  (fn [_] [:div {:id "box"} "n=" @(h/global-cursor :n 0)])}]]
+                    :app-state app*)
+          stop    (h/start! handler {:port port})
+          client  (HttpClient/newHttpClient)
+          base    (str "http://localhost:" port)]
+      (try
+        ;; 1. Initial GET registers the render-fn for tab "T".
+        (is (= 200 (.statusCode (GET client (str base "/?tab-id=T")
+                                  (HttpResponse$BodyHandlers/ofString)))))
+        ;; 2. Open the SSE connection (no gzip, to assert on raw text).
+        (let [resp                (GET client (str base "/hyper/events?tab-id=T")
+                                    (HttpResponse$BodyHandlers/ofInputStream))
+              {:keys [text stop]} (sse-reader (.body ^java.net.http.HttpResponse resp))]
+          (try
+            ;; Initial full render must arrive with n=0.
+            (let [t (wait-until text #(str/includes? % "n=0") 5000)]
+              (is (str/includes? t "event: connected"))
+              (is (str/includes? t "datastar-patch-elements"))
+              (is (str/includes? t "n=0")))
+            ;; 3. Change server state — the app-state watcher must enqueue a
+            ;;    re-render that the live renderer pushes over the SAME stream.
+            (swap! app* assoc-in [:global :n] 42)
+            ;; 4. The push must arrive (this is what the browser depends on).
+            (let [t (wait-until text #(str/includes? % "n=42") 5000)]
+              (is (str/includes? t "n=42")
+                  "re-render after initial paint must stream to the client"))
+            (finally
+              (stop))))
+        (finally
+          (h/stop! stop))))))
+
+(deftest sse-push-with-gzip-after-initial-render
+  (testing "a gzip SSE stream delivers a re-render pushed after the initial paint"
+    (let [port    (free-port)
+          app*    (atom (state/init-state))
+          handler (h/create-handler
+                    [["/" {:name :home
+                           :get  (fn [_] [:div {:id "box"} "n=" @(h/global-cursor :n 0)])}]]
+                    :app-state app*)
+          stop    (h/start! handler {:port port})
+          client  (HttpClient/newHttpClient)
+          base    (str "http://localhost:" port)]
+      (try
+        (is (= 200 (.statusCode (GET client (str base "/?tab-id=T")
+                                  (HttpResponse$BodyHandlers/ofString)))))
+        (let [resp                 (GET-gzip client (str base "/hyper/events?tab-id=T")
+                                             (HttpResponse$BodyHandlers/ofInputStream))
+              enc                  (-> resp .headers (.firstValue "content-encoding")
+                                       (.orElse ""))
+              {:keys [bytes stop]} (sse-byte-reader (.body ^java.net.http.HttpResponse resp))]
+          (try
+            (is (= "gzip" enc) "the server should gzip the SSE stream")
+            (let [t (wait-until #(decode-gzip-stream (bytes)) #(str/includes? % "n=0") 5000)]
+              (is (str/includes? t "n=0") "initial gzip render decodes"))
+            (swap! app* assoc-in [:global :n] 42)
+            (let [t (wait-until #(decode-gzip-stream (bytes)) #(str/includes? % "n=42") 5000)]
+              (is (str/includes? t "n=42")
+                  "a re-render pushed onto a live gzip stream must decode on the client"))
+            (finally
+              (stop))))
+        (finally
+          (h/stop! stop))))))
+
+(deftest sse-push-via-action-post
+  (testing "an action POST (the browser-click path) triggers a re-render that
+            streams over the live SSE connection"
+    (let [port    (free-port)
+          app*    (atom (state/init-state))
+          handler (h/create-handler
+                    [["/" {:name :home
+                           :get  (fn [_]
+                                   [:div {:id "box"} "n=" @(h/tab-cursor :n 0)
+                                    [:button {:data-on:click
+                                              (h/action (swap! (h/tab-cursor :n 0) inc))}
+                                     "+"]])}]]
+                    :app-state app*)
+          stop    (h/start! handler {:port port})
+          client  (HttpClient/newHttpClient)
+          base    (str "http://localhost:" port)]
+      (try
+        ;; GET registers the render-fn + the action; grab its action-id.
+        (let [page      (.body ^java.net.http.HttpResponse
+                          (GET client (str base "/?tab-id=T")
+                            (HttpResponse$BodyHandlers/ofString)))
+              action-id (second (re-find #"action-id=(a_T_\d+)" page))]
+          (is (some? action-id) "the page renders an action with an id")
+          ;; Open SSE and wait for the initial render (n=0).
+          (let [resp                (GET client (str base "/hyper/events?tab-id=T")
+                                      (HttpResponse$BodyHandlers/ofInputStream))
+                {:keys [text stop]} (sse-reader (.body ^java.net.http.HttpResponse resp))]
+            (try
+              (wait-until text #(str/includes? % "n=0") 5000)
+              ;; POST the action exactly like Datastar's @post would.
+              (let [ar (.send client
+                              (.. (HttpRequest/newBuilder
+                                    (URI/create (str base "/hyper/actions?action-id=" action-id)))
+                                  (POST (HttpRequest$BodyPublishers/noBody))
+                                  (build))
+                              (HttpResponse$BodyHandlers/ofString))]
+                (is (= 204 (.statusCode ar)) "action POST returns 204"))
+              ;; The re-render must stream over the SAME SSE connection.
+              (let [t (wait-until text #(str/includes? % "n=1") 5000)]
+                (is (str/includes? t "n=1")
+                    "action-triggered re-render must reach the live SSE client"))
+              (finally
+                (stop)))))
+        (finally
+          (h/stop! stop))))))
+
+(deftest sse-stop-is-prompt-with-open-connection
+  (testing "stop! returns promptly even while an SSE connection is open"
+    (let [port    (free-port)
+          handler (h/create-handler [["/" {:name :home :get (fn [_] [:div "ok"])}]])
+          stop    (h/start! handler {:port port})
+          client  (HttpClient/newHttpClient)
+          base    (str "http://localhost:" port)]
+      (GET client (str base "/?tab-id=T") (HttpResponse$BodyHandlers/ofString))
+      (let [resp                (GET client (str base "/hyper/events?tab-id=T")
+                                  (HttpResponse$BodyHandlers/ofInputStream))
+            {:keys [text stop]} (sse-reader (.body ^java.net.http.HttpResponse resp))]
+        (wait-until text #(str/includes? % "event: connected") 5000)
+        ;; stop! must not hang on / throw from the open SSE request.
+        (let [t0      (System/currentTimeMillis)
+              _       (h/stop! stop)
+              elapsed (- (System/currentTimeMillis) t0)]
+          (is (< elapsed 5000)
+              "stop! should return well under the Jetty graceful-stop timeout"))
+        (stop)))))

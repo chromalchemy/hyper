@@ -16,7 +16,8 @@
             [hyper.watch :as watch]
             [matcher-combinators.matchers :as m]
             [matcher-combinators.test :refer [match?]]
-            [org.httpkit.server :as http-kit]))
+            [ring.core.protocols])
+  (:import [java.io OutputStream]))
 
 (deftest test-generate-session-id
   (testing "Session ID generation"
@@ -91,30 +92,25 @@
             script)))))
 
 (deftest test-initial-sse-response-headers
-  (testing "sends the expected initial SSE response headers"
-    (doseq [[compress? expected-headers]
-            [[false {"Content-Type"      "text/event-stream"
-                     "Cache-Control"     "no-cache, no-transform"
-                     "X-Accel-Buffering" "no"}]
-             [true  {"Content-Type"      "text/event-stream"
-                     "Cache-Control"     "no-cache, no-transform"
-                     "X-Accel-Buffering" "no"
-                     "Content-Encoding"  "gzip"}]]]
-      (let [captured-response (atom nil)
-            render-queue      (rq/make-queue)]
-        ;; Pre-enqueue a full render so drain! doesn't block forever
-        (rq/enqueue-full-render! render-queue)
-        (with-redefs [http-kit/send! (fn [_channel response _close-after-send?]
-                                       (reset! captured-response response)
-                                       false)]
-          (#'server/-renderer-loop! (atom (state/init-state))
-                                    "ses_test"
-                                    "tab_test"
-                                    ::channel
-                                    compress?
-                                    render-queue)
-          (is (= expected-headers
-                 (:headers @captured-response))))))))
+  (testing "the SSE handler sets the expected response headers + a streaming body"
+    (doseq [[accept-encoding expected-headers]
+            [[nil    {"Content-Type"      "text/event-stream"
+                      "Cache-Control"     "no-cache, no-transform"
+                      "X-Accel-Buffering" "no"}]
+             ["gzip" {"Content-Type"      "text/event-stream"
+                      "Cache-Control"     "no-cache, no-transform"
+                      "X-Accel-Buffering" "no"
+                      "Content-Encoding"  "gzip"}]]]
+      (let [app-state* (atom (state/init-state))
+            handler    (#'server/sse-events-handler app-state*)
+            req        (cond-> {:hyper/session-id "ses_test"
+                                :hyper/tab-id     "tab_test"}
+                         accept-encoding (assoc :headers {"accept-encoding" accept-encoding}))
+            response   (handler req)]
+        (is (= 200 (:status response)))
+        (is (= expected-headers (:headers response)))
+        ;; The body is a streaming response body, not a realized string.
+        (is (satisfies? ring.core.protocols/StreamableResponseBody (:body response)))))))
 
 (deftest test-create-handler
   (testing "Creates a working ring handler"
@@ -974,25 +970,32 @@
 
 (deftest test-heartbeat-sent-when-idle
   (testing "an idle renderer loop emits keepalive comments, and a closed
-            channel (send! -> false) exits the loop"
+            connection (a write that throws -> send-sse! false) exits the loop"
     (let [app-state* (atom (assoc (state/init-state) :heartbeat-ms 20))
           q          (rq/make-queue)
           sends      (atom [])
-          done       (promise)]
-      (with-redefs [http-kit/send! (fn [_ch payload _close?]
-                                     (swap! sends conj payload)
-                                     true)]
-        (let [_fut (future
-                     (#'server/-renderer-loop! app-state* "s" "t" ::ch false q)
-                     (deliver done true))]
-          (Thread/sleep 120)
-          ;; stop the loop
-          (rq/enqueue-shutdown! q)
-          (is (true? (deref done 1000 :timeout)) "loop exited on shutdown")
-          ;; at least one heartbeat comment was sent (string payloads only;
-          ;; the first send is the connected-event response map)
-          (is (some #(and (string? %) (string/starts-with? % ":")) @sends)
-              "a keepalive comment was emitted while idle"))))))
+          done       (promise)
+          ;; Capture each written chunk as a UTF-8 string, mirroring the SSE
+          ;; payloads the loop writes to the response output stream.  A proxy
+          ;; overrides every `write` overload by name, so handle both the
+          ;; byte[] form send-sse! uses and the 3-arg form.
+          os         (proxy [OutputStream] []
+                       (write
+                         ([b] (swap! sends conj (String. ^bytes b "UTF-8")))
+                         ([b off len]
+                          (swap! sends conj (String. ^bytes b (int off) (int len) "UTF-8"))))
+                       (flush []))]
+      (future
+        (#'server/-renderer-loop! app-state* "s" "t" os false q)
+        (deliver done true))
+      (Thread/sleep 120)
+      ;; stop the loop
+      (rq/enqueue-shutdown! q)
+      (is (true? (deref done 1000 :timeout)) "loop exited on shutdown")
+      ;; at least one heartbeat comment was written (the connected event is
+      ;; an SSE event, the heartbeat is a ":"-prefixed comment line)
+      (is (some #(and (string? %) (string/starts-with? % ":")) @sends)
+          "a keepalive comment was emitted while idle"))))
 
 (deftest test-components-js-handler-cache-headers
   (testing "components.js is only served immutable when ?v matches the
