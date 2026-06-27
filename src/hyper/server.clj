@@ -332,7 +332,7 @@
   "Returns the default Datastar CDN script tag."
   []
   [:script {:type "module"
-            :src  "https://cdn.jsdelivr.net/gh/starfederation/datastar@1.0.0-RC.7/bundles/datastar.js"}])
+            :src  "https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.2/bundles/datastar.js"}])
 
 (defn cleanup-tab!
   "Clean up all resources for a tab: watchers, reactive components, renderer thread, actions, and state."
