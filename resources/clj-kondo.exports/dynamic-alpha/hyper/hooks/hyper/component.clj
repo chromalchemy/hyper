@@ -249,7 +249,7 @@
 (defn defc
   "Rewrite (defc name docstring? [{:keys [...]}] segments...) into
 
-     (defn name docstring? [{:keys [...]}]
+     (defn name docstring? [{:keys [...]} & children]
        (let [emit (fn [& _] nil)]
          <event segments as fns>
          <render segment as do>))
@@ -279,15 +279,22 @@
                                         ;; in scope in every segment.
                                         (api/token-node 'ctx)
                                         (api/token-node nil)])
-                                     ;; Reference both once so components that
-                                     ;; don't use them avoid unused-binding noise.
+                                     ;; Reference all three once so components
+                                     ;; that don't use them avoid unused-binding
+                                     ;; noise.
                                      (list*
                                        (api/token-node 'emit)
                                        (api/token-node 'ctx)
+                                       (api/token-node 'children)
                                        (map rewrite-segment segments))))
+        arglist                  (api/vector-node
+                                   (concat (:children (or binding-vec
+                                                          (api/vector-node [])))
+                                           [(api/token-node '&)
+                                            (api/token-node 'children)]))
         new-node                 (api/list-node
                                    [(api/token-node 'defn)
                                     cname
-                                    (or binding-vec (api/vector-node []))
+                                    arglist
                                     let-node])]
     {:node new-node}))

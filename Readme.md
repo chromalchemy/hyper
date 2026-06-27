@@ -1660,6 +1660,14 @@ components like ordinary hiccup functions:
                   (h/action (handle-selection! $detail))})]))
 ```
 
+Trailing children are appended to the host element's light DOM (projected
+through any `<slot>` the component renders):
+
+```clojure
+(temp-gauge {:label "CPU"}
+  [:span "extra slotted content"])
+```
+
 ### Attributes are the boundary
 
 The server pushes data into the component through HTML attributes —

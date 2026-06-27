@@ -424,12 +424,19 @@
    Inside `event` bodies, `emit` is available as a function:
      (emit \"event-name\" detail-map)
 
-   The emitted server-side function accepts a single map argument.  Pass
-   your attribute values (including `data-on:*` action bindings) directly:
+   The emitted server-side function accepts a map argument followed by any
+   number of child elements.  Pass your attribute values (including
+   `data-on:*` action bindings) in the map; children are appended to the
+   host element's light DOM (projected through any `<slot>` the component
+   renders):
 
      (my-component {:value  @cursor*
                     :label  \"CPU\"
                     :data-on:selected (h/action (handle! $detail))})
+
+     (my-component {:label \"CPU\"}
+       [:span \"slotted child\"]
+       [:span \"another\"])
 
    Example:
      (defc temp-gauge
@@ -481,8 +488,8 @@
                                          :js       ~compiled-js})
        (defn ~cname
          ~@(when docstring [docstring])
-         [attr-map#]
-         [~tag-kw (attrs attr-map#)]))))
+         [attr-map# & children#]
+         (into [~tag-kw (attrs attr-map#)] children#)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Attribute serialization (server -> attribute boundary)
