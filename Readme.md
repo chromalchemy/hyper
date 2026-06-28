@@ -1788,11 +1788,24 @@ signal, or a test — components stay pure functions of their attributes.
 
 ### Styles
 
-Components render into shadow DOM (which also makes them invisible to
-Datastar's morph — internals are never clobbered). Document stylesheets
-are inherited into each shadow root automatically, so global CSS — e.g. a
-Tailwind build included via `:head` — styles component internals without
-extra wiring.
+Components render into shadow DOM, which keeps them invisible to Datastar's
+morph (internals are never clobbered). Document stylesheets are inherited
+into each shadow root automatically, so global CSS — e.g. a Tailwind build
+included via `:head` — styles component internals without extra wiring.
+
+Each shadow root also gets these base defaults, which global CSS and a
+component's own `<style>` can override:
+
+```css
+:host            { display: block; }
+[data-hyper-root]{ display: block; height: 100%; }
+```
+
+So `:host` is the component's box and your render output is plain HTML
+inside it. Set the box on `:host` (size, `display`, margin); lay out
+content on your own render elements. To fill the parent, give `:host` a
+definite height (`:host{height:100%}` or a flex/grid item) and it carries
+through to your output.
 
 ### Live reload
 
