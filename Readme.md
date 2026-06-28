@@ -1660,13 +1660,28 @@ components like ordinary hiccup functions:
                   (h/action (handle-selection! $detail))})]))
 ```
 
-Trailing children are appended to the host element's light DOM (projected
-through any `<slot>` the component renders):
+Trailing children are appended to the host element's light DOM. Render a
+`<slot>` inside the component to choose where that content appears:
 
 ```clojure
-(temp-gauge {:label "CPU"}
-  [:span "extra slotted content"])
+(h/defc info-card
+  [{:keys [title]}]
+  (render
+    [:div.card
+     [:h3 title]
+     [:slot]]))            ;; ← children are projected here
 ```
+
+```clojure
+;; in a page handler — children follow the attribute map
+(info-card {:title "CPU"}
+  [:p "Usage is nominal."]
+  [:p "All systems go."])
+```
+
+This renders `<info-card title="CPU">` with the two paragraphs in its light
+DOM, slotted into the component's shadow DOM where `<slot>` sits. A
+component with no `<slot>` simply ignores any children.
 
 ### Attributes are the boundary
 
