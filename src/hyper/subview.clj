@@ -37,18 +37,44 @@
   [app-state* tab-id sid]
   (get-in @app-state* [:tabs tab-id :subviews sid]))
 
-(defn- inject-id
-  "Inject a subview ID onto hiccup.  If the element already has an :id, uses
-   it as the html-id and leaves the hiccup unchanged.  Otherwise, adds the
-   subview-id as the :id.  Returns [html-id hiccup]."
-  [hiccup sid]
-  (let [[tag & rest] hiccup
-        has-attrs?   (map? (first rest))
-        attrs        (if has-attrs? (first rest) {})
-        children     (if has-attrs? (next rest) rest)]
-    (if-let [existing-id (:id attrs)]
-      [(str existing-id) hiccup]
-      [sid (into [tag (assoc attrs :id sid)] children)])))
+(defn key->token
+  "Derive a stable, id-safe token from a region `:key` value.  Simple values
+   pass through; anything else collapses to a hash."
+  [k]
+  (let [s (cond
+            (string? k)                 k
+            (keyword? k)                (subs (str k) 1)
+            (symbol? k)                 (str k)
+            (or (integer? k) (uuid? k)) (str k))]
+    (if (and s (re-matches #"[A-Za-z0-9_.-]+" s))
+      s
+      (format "%08x" (bit-and (hash k) 0xffffffff)))))
+
+(defn- resolve-region-id
+  "Resolve a region's id and ensure the hiccup root carries it as `:id` (the
+   morph anchor).  Precedence: `explicit-id` > the root element's `:id` >
+   `fallback-id`.  Returns `[id hiccup]`."
+  [explicit-id fallback-id hiccup]
+  (let [[tag & more] hiccup
+        has-attrs?   (map? (first more))
+        attrs        (if has-attrs? (first more) {})
+        children     (if has-attrs? (next more) more)
+        root-id      (some-> (:id attrs) str)
+        id           (or explicit-id root-id fallback-id)]
+    (if (= id root-id)
+      [id hiccup]
+      [id (into [tag (assoc attrs :id id)] children)])))
+
+(defn- check-region-unique!
+  "Throw when `id` was already registered by an earlier region in this render.
+   Positional ids are unique by construction, so a clash always means two
+   regions resolved to the same `:key`/`:id`."
+  [tab-id id]
+  (when-let [acc context/*registered-subview-ids*]
+    (when (contains? @acc id)
+      (throw (ex-info (str "Duplicate region id " (pr-str id)
+                           " in one render — :key/:id values must be unique.")
+                      {:hyper/region-id id :hyper/tab-id tab-id})))))
 
 ;; ---------------------------------------------------------------------------
 ;; Registration
@@ -95,18 +121,21 @@
    existing :id), caches the serialized HTML for later partial re-renders, and
    registers the subview as live.  Returns the hiccup.
 
-   `:on-change` defaults to `:partial` — a dep change re-renders only this
-   region."
-  [app-state* tab-id sid deps render-fn]
-  (let [body             (render-fn)
-        [html-id hiccup] (inject-id body sid)
-        html             (c/html hiccup)]
-    (register-subview! app-state* tab-id sid
+   Identity resolves as `explicit-id` (a `:key`) > the root element's `:id` >
+   `fallback-id` (the positional id), and keys the registry and morph anchor
+   alike.  `:on-change` defaults to `:partial` — a dep change re-renders only
+   this region."
+  [app-state* tab-id explicit-id fallback-id deps render-fn]
+  (let [body        (render-fn)
+        [id hiccup] (resolve-region-id explicit-id fallback-id body)
+        html        (c/html hiccup)]
+    (check-region-unique! tab-id id)
+    (register-subview! app-state* tab-id id
                        {:render-fn   render-fn
                         :deps        deps
                         :dep-vals    (mapv deref deps)
                         :cached-html html
-                        :html-id     html-id
+                        :html-id     id
                         :on-change   :partial})
     hiccup))
 
@@ -129,14 +158,14 @@
                         :hyper/router     (:router @app-state*)}]
         (push-thread-bindings (context/partial-render-bindings req))
         (try
-          (let [body             (render-fn)
-                [html-id hiccup] (inject-id body sid)
-                html             (c/html hiccup)]
+          (let [body        (render-fn)
+                [_id hiccup] (resolve-region-id sid sid body)
+                html        (c/html hiccup)]
             (swap! app-state* assoc-in [:tabs tab-id :subviews sid]
                    (assoc spec
                           :dep-vals    (mapv deref deps)
                           :cached-html html
-                          :html-id     html-id))
+                          :html-id     sid))
             html)
           (finally
             (pop-thread-bindings)))))))
@@ -421,8 +450,9 @@
                                             store-path user-deps fetch-fn)
         deps             (into [cell] user-deps)
         body             (render-fn @cell)
-        [html-id hiccup] (inject-id body component-id)
+        [id hiccup]      (resolve-region-id component-id component-id body)
         html             (c/html hiccup)
+        _                (check-region-unique! tab-id id)
         ;; The stored render-fn re-coordinates (so a partial re-render from a
         ;; user-dep change still refetches) then renders the current status.
         thunk            (fn []
@@ -434,7 +464,7 @@
                         :deps        deps
                         :dep-vals    (mapv deref deps)
                         :cached-html html
-                        :html-id     html-id
+                        :html-id     id
                         :on-change   :partial
                         :scope       :render
                         :unmount     (fn [_]

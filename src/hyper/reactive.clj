@@ -18,9 +18,14 @@
 
 (defn render-component
   "Render a reactive component during a full page render.  Delegates to
-   `subview/render-reactive!` (a render-bearing, partial-on-change subview)."
-  [app-state* tab-id component-id deps render-fn]
-  (subview/render-reactive! app-state* tab-id component-id deps render-fn))
+   `subview/render-reactive!` (a render-bearing, partial-on-change subview).
+   The 5-arity treats `component-id` as the fallback id (root `:id` still
+   wins); the 6-arity passes an `explicit-id` (from a `:key`) that takes
+   precedence."
+  ([app-state* tab-id component-id deps render-fn]
+   (subview/render-reactive! app-state* tab-id nil component-id deps render-fn))
+  ([app-state* tab-id explicit-id fallback-id deps render-fn]
+   (subview/render-reactive! app-state* tab-id explicit-id fallback-id deps render-fn)))
 
 (defn partial-render
   "Re-render a single reactive component and return the targeted-fragment HTML."

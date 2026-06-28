@@ -1,0 +1,103 @@
+(ns hyper.region-identity-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [hyper.context :as context]
+            [hyper.core :as h]
+            [hyper.state :as state]
+            [hyper.subview :as subview]))
+
+(defmacro ^:private rendering
+  "Evaluate body as a full render of `tab-id` (positional ids key off call
+   order; the subview-id accumulator tracks live regions)."
+  [app-state* tab-id & body]
+  `(binding [context/*request*                 {:hyper/session-id "s"
+                                                :hyper/tab-id     ~tab-id
+                                                :hyper/app-state  ~app-state*
+                                                :hyper/router     nil}
+             context/*action-idx*              (atom 0)
+             context/*registered-subview-ids*  (atom #{})]
+     ~@body))
+
+(defn- new-tab []
+  (let [app-state* (atom (state/init-state))]
+    (state/get-or-create-tab! app-state* "s" "t")
+    app-state*))
+
+(defn- async-cell-id [app-state* id]
+  (System/identityHashCode (get-in @app-state* [:tabs "t" :async id :cell])))
+
+(deftest test-anonymous-regions-stay-positional
+  (testing "without :key or a root :id, region ids are the positional fallback"
+    (let [app-state* (new-tab)]
+      (rendering app-state* "t"
+                 (h/reactive [(atom 0)] [:p "a"])
+                 (h/async [] :v {:keys [status]} [:div (str status)]))
+      (is (= #{"r_t_1" "async_t_2"}
+             (set (keys (get-in @app-state* [:tabs "t" :subviews]))))))))
+
+(deftest test-reactive-key-drives-registry-id
+  (testing ":key keys the subview registry and the morph anchor alike"
+    (let [app-state* (new-tab)
+          html       (rendering app-state* "t"
+                                (h/reactive {:key (str "node-" 42)} [(atom 0)]
+                                            [:div "grid"]))]
+      (is (= [:div {:id "r_t_node-42"} "grid"] html))
+      (is (some? (get-in @app-state* [:tabs "t" :subviews "r_t_node-42"]))))))
+
+(deftest test-reactive-root-id-drives-registry-id
+  (testing "a stable root :id is adopted as the registry key (no positional id)"
+    (let [app-state* (new-tab)]
+      (rendering app-state* "t"
+                 (h/reactive [(atom 0)] [:div {:id "node-42"} "grid"]))
+      (is (some? (get-in @app-state* [:tabs "t" :subviews "node-42"])))
+      (is (nil? (get-in @app-state* [:tabs "t" :subviews "r_t_1"]))))))
+
+(deftest test-async-key-survives-reorder
+  (testing "a keyed async region's in-flight fetch follows the item across a
+            re-sort; positional ids would reattach it to a different item"
+    (let [app-state* (new-tab)
+          render!    (fn [order]
+                       (rendering app-state* "t"
+                                  (doseq [node order]
+                                    (h/async {:key node}
+                                             [] (do (Thread/sleep 60000) :rows)
+                                             {:keys [status]} [:div (str status)])))
+                       (into {} (for [node order]
+                                  [node (async-cell-id app-state* (str "async_t_" (name node)))])))
+          r1         (render! [:A :B :C])
+          r2         (render! [:C :A :B])]
+      (is (= #{"async_t_A" "async_t_B" "async_t_C"}
+             (set (keys (get-in @app-state* [:tabs "t" :async])))))
+      (is (= (:A r1) (:A r2)) "node A keeps its fetch cell")
+      (is (= (:B r1) (:B r2)) "node B keeps its fetch cell")
+      (is (= (:C r1) (:C r2)) "node C keeps its fetch cell")
+      (subview/teardown-all! app-state* "t"))))
+
+(deftest test-duplicate-key-throws
+  (testing "two regions resolving to the same id in one render throw"
+    (let [app-state* (new-tab)]
+      (is (thrown-with-msg?
+            clojure.lang.ExceptionInfo #"Duplicate region id"
+            (rendering app-state* "t"
+                       (h/reactive {:key :dup} [(atom 0)] [:div "a"])
+                       (h/reactive {:key :dup} [(atom 0)] [:div "b"]))))
+      (is (thrown-with-msg?
+            clojure.lang.ExceptionInfo #"Duplicate region id"
+            (rendering app-state* "t"
+                       (h/async {:key :dup} [] :x {:keys [status]} [:div (str status)])
+                       (h/async {:key :dup} [] :y {:keys [status]} [:div (str status)]))))
+      (subview/teardown-all! app-state* "t"))))
+
+(deftest test-action-key-drives-action-id
+  (testing ":key gives an action a stable id independent of render order"
+    (let [app-state* (new-tab)]
+      (rendering app-state* "t"
+                 (h/action {:key "save"} (constantly :ok)))
+      (is (some? (get-in @app-state* [:actions "a_t_save"]))))))
+
+(deftest test-key->token
+  (testing "simple values pass through id-safe; complex values hash"
+    (is (= "save" (subview/key->token "save")))
+    (is (= "grid" (subview/key->token :grid)))
+    (is (= "42" (subview/key->token 42)))
+    (is (re-matches #"[0-9a-f]{8}" (subview/key->token :ns/qualified)))
+    (is (re-matches #"[0-9a-f]{8}" (subview/key->token [:a 1])))))

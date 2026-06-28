@@ -284,6 +284,12 @@
    Supports nesting — inner reactive blocks re-execute independently during
    partial renders triggered by their own deps.
 
+   An optional leading opts map accepts `:key` — a stable identity for the
+   region.  Give a `:key` (or a stable `:id` on the body's root element) to
+   any reactive in a dynamic/keyed list so its identity follows the item
+   across reorders and sibling shape changes; without one the region id is
+   positional.
+
    Usage:
      (let [clock* (h/global-cursor :clock)]
        (reactive [clock*]
@@ -293,14 +299,24 @@
      (let [x* (h/tab-cursor :x 0)
            y* (h/tab-cursor :y 0)]
        (reactive [x* y*]
-         [:p \"Position: \" @x* \", \" @y*]))"
-  [deps & body]
-  `(let [{tab-id# :tab-id app-state*# :app-state*} (context/require-context! "reactive")
-         idx#                                      (if context/*action-idx* (swap! context/*action-idx* inc) 0)
-         component-id#                             (str "r_" tab-id# "_" idx#)
-         deps#                                     ~deps
-         render-fn#                                (fn [] ~@body)]
-     (reactive/render-component app-state*# tab-id# component-id# deps# render-fn#)))
+         [:p \"Position: \" @x* \", \" @y*]))
+
+     ;; Keyed region in a list — identity follows the node
+     (reactive {:key (:id node)} [grid*]
+       [:div.grid (render-grid @grid*)])"
+  [& args]
+  (let [[opts deps body] (if (map? (first args))
+                           [(first args) (second args) (nnext args)]
+                           [nil (first args) (next args)])]
+    `(let [{tab-id# :tab-id app-state*# :app-state*} (context/require-context! "reactive")
+           idx#                                      (if context/*action-idx* (swap! context/*action-idx* inc) 0)
+           fallback-id#                              (str "r_" tab-id# "_" idx#)
+           key#                                      ~(:key opts)
+           explicit-id#                              (when (some? key#)
+                                                       (str "r_" tab-id# "_" (subview/key->token key#)))
+           deps#                                     ~deps
+           render-fn#                                (fn [] ~@body)]
+       (reactive/render-component app-state*# tab-id# explicit-id# fallback-id# deps# render-fn#))))
 
 (defmacro async
   "Render-time data loading with a placeholder.  Spawns the `fetch` on a
@@ -350,18 +366,36 @@
 
    Prefer `async` for leaf / region-local data that wants its own loading state
    co-located with its render.  For page-level data you want before first paint
-   or shared across regions, load it in a form-2 setup closure into a cursor."
-  [deps fetch-expr binding & render-body]
-  `(let [{tab-id#     :tab-id
-          app-state*# :app-state*
-          session-id# :session-id
-          router#     :router}    (context/require-context! "async")
-         idx#                     (if context/*action-idx* (swap! context/*action-idx* inc) 0)
-         component-id#            (str "async_" tab-id# "_" idx#)]
-     (subview/render-async! app-state*# tab-id# session-id# router# component-id#
-                            ~deps
-                            (fn [] ~fetch-expr)
-                            (fn [~binding] ~@render-body))))
+   or shared across regions, load it in a form-2 setup closure into a cursor.
+
+   An optional leading opts map accepts `:key` — a stable identity for the
+   region.  Give a `:key` to any async in a dynamic/keyed list so its in-flight
+   fetch and store follow the item across reorders and sibling shape changes;
+   without one the region id is positional.
+
+   Example with a key:
+     (h/async {:key (:id node)} [user-id*]
+       (db/fetch-rows @user-id*)
+       {:keys [status result]}
+       ...)"
+  [& args]
+  (let [[opts deps fetch-expr binding render-body]
+        (if (map? (first args))
+          [(first args) (second args) (nth args 2) (nth args 3) (drop 4 args)]
+          [nil (first args) (second args) (nth args 2) (drop 3 args)])]
+    `(let [{tab-id#     :tab-id
+            app-state*# :app-state*
+            session-id# :session-id
+            router#     :router}    (context/require-context! "async")
+           idx#                     (if context/*action-idx* (swap! context/*action-idx* inc) 0)
+           key#                     ~(:key opts)
+           component-id#            (if (some? key#)
+                                      (str "async_" tab-id# "_" (subview/key->token key#))
+                                      (str "async_" tab-id# "_" idx#))]
+       (subview/render-async! app-state*# tab-id# session-id# router# component-id#
+                              ~deps
+                              (fn [] ~fetch-expr)
+                              (fn [~binding] ~@render-body)))))
 
 ;; ---------------------------------------------------------------------------
 ;; View lifecycle (form-3)
@@ -567,6 +601,12 @@
                                 (swap! (tab-cursor :count) inc))}
       \"Increment\"]
 
+     ;; :key gives the action a stable id (independent of render order) — the
+     ;; same identity story as reactive/async, for actions in keyed lists
+     [:button {:data-on:click (action {:key (:id node)}
+                                (delete! (:id node)))}
+      \"Delete\"]
+
      ;; Checkbox
      [:input {:type \"checkbox\"
               :data-on:change (action (reset! (tab-cursor :dark?) $checked))}]
@@ -581,8 +621,8 @@
   [& args]
   (let [[maybe-opts & body] args
         opts-map?           (and (map? maybe-opts)
-                                 (some #{:when :as :upload} (keys maybe-opts)))
-        [js as-name upload-ref-form body]
+                                 (some #{:when :as :upload :key} (keys maybe-opts)))
+        [js as-name upload-ref-form key-form body]
         (if opts-map?
           (let [guard (:when maybe-opts)
                 ;; String literals are validated here; any other form
@@ -591,8 +631,8 @@
                 js    (cond
                         (string? guard) (when-not (str/blank? guard) guard)
                         (some? guard)   guard)]
-            [js (:as maybe-opts) (:upload maybe-opts) body])
-          [nil nil nil args])
+            [js (:as maybe-opts) (:upload maybe-opts) (:key maybe-opts) body])
+          [nil nil nil nil args])
         used-params         (find-client-params body)
         param-syms          (keys used-params)
         ;; Multipart params ($form/$files) switch the action to a file-upload
@@ -627,7 +667,10 @@
                                                                      :hyper/env        (get-in @app-state*# [:tabs tab-id# :env])}]
                                           ~@body)))
            idx#                     (if context/*action-idx* (swap! context/*action-idx* inc) (hash action-fn#))
-           action-id#               (str "a_" tab-id# "_" idx#)
+           key#                     ~key-form
+           action-id#               (if (some? key#)
+                                      (str "a_" tab-id# "_" (subview/key->token key#))
+                                      (str "a_" tab-id# "_" idx#))
            _#                       (actions/register-action! app-state*# session-id# tab-id# action-fn# action-id#
                                                               ~(when as-name {:as as-name}))
            ;; Stash the upload status ref so the /hyper/upload handler can

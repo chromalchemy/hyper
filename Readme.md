@@ -1465,8 +1465,9 @@ expensive stats section is not re-executed.
 `reactive` takes a vector of deps (any `Watchable` source — atoms, cursors,
 etc.) and a body. It:
 
-1. Injects a stable ID onto the returned element (or uses an existing `:id` if
-   present)
+1. Resolves the region's identity — an explicit `:key` > the root element's
+   `:id` > a positional fallback — and uses it as both the morph anchor and the
+   server-side registry key
 2. Registers watches on the deps
 3. **On dep change**: re-renders only this component and sends a targeted
    Datastar fragment — no full page re-render
@@ -1482,6 +1483,36 @@ etc.) and a body. It:
 (h/reactive [clock*]
   [:p {:id "my-clock"} "Time: " @clock*])
 ```
+
+### Identity in dynamic lists
+
+Region identity is positional by default: it's stable as long as every render
+emits the same sequence of regions. In a **dynamic or reordered list of
+stateful regions**, that breaks — an item changing shape or moving shifts the
+positional ids of later items, so they remount (scroll resets, in-flight
+`async` fetches interrupted).
+
+Give such a region a stable identity and it follows the item instead. The
+identity drives both the morph anchor and the server-side region state, so the
+DOM and any in-flight work move together:
+
+```clojure
+;; A stable root :id is enough — identity rides the id idiomorph already keys on
+(for [node (sort-by :order @nodes*)]
+  (h/reactive [(grid-cursor node)]
+    [:div {:id (str "grid-" (:id node))} (render-grid node)]))
+
+;; Or an explicit :key — the escape hatch when the root can't carry a stable
+;; :id (e.g. an async region whose body shape-shifts between states)
+(h/async {:key (:id node)} [(fold-cursor node)]
+  (fetch-fold node)
+  {:keys [status result]}
+  (case status :ready (render-fold result) [:p "Loading…"]))
+```
+
+`:key` accepts any value (a hash is derived for non-trivial ones). Two regions
+resolving to the same id in one render is an error. Anonymous regions keep the
+positional fallback, which is fine for static layouts.
 
 ### Nesting
 
@@ -1554,9 +1585,12 @@ render body wherever the data is shown.
 The shape is a sibling of `reactive`:
 
 ```
-(h/async [deps] fetch-expr binding & render-body)
+(h/async {opts}? [deps] fetch-expr binding & render-body)
 ```
 
+- **`opts`** — an optional leading map. `:key` gives the region a stable
+  identity so its in-flight fetch follows the item in a dynamic/keyed list (see
+  [Identity in dynamic lists](#identity-in-dynamic-lists)).
 - **`deps`** — a vector of `Watchable` sources. `[]` fetches once per mount;
   otherwise a change to a dep refetches (see `:reloading`).
 - **`fetch-expr`** — a single expression evaluated on a background virtual

@@ -120,9 +120,12 @@
 ;; ---------------------------------------------------------------------------
 
 (defn async
-  "Validate + rewrite (async [deps] fetch binding & render-body)."
+  "Validate + rewrite (async {opts}? [deps] fetch binding & render-body)."
   [{:keys [node]}]
-  (let [[_ deps fetch binding & render-body] (:children node)]
+  (let [[_ & args]                          (:children node)
+        opts                                (when (and (first args) (api/map-node? (first args)))
+                                              (first args))
+        [deps fetch binding & render-body]  (if opts (rest args) args)]
     ;; --- shape validation ---
     (when-not (and deps (api/vector-node? deps))
       (finding! (or deps node) :error
@@ -152,11 +155,12 @@
                     (list*
                      (api/token-node 'let)
                      (api/vector-node
-                      [(or binding (api/token-node '_)) (api/token-node nil)
-                       (api/token-node '_deps)          (or deps (api/vector-node []))
-                       (api/token-node '_fetch)         (api/list-node
-                                                         [(api/token-node 'fn)
-                                                          (api/vector-node [])
-                                                          (or fetch (api/token-node nil))])])
+                      (cond-> [(or binding (api/token-node '_)) (api/token-node nil)
+                               (api/token-node '_deps)          (or deps (api/vector-node []))
+                               (api/token-node '_fetch)         (api/list-node
+                                                                 [(api/token-node 'fn)
+                                                                  (api/vector-node [])
+                                                                  (or fetch (api/token-node nil))])]
+                        opts (conj (api/token-node '_opts) opts)))
                      render-body))]
       {:node new-node})))
