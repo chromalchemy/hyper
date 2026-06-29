@@ -13,6 +13,13 @@
 ;; enabling effective gzip streaming compression.
 (def ^:dynamic *action-idx* nil)
 
+;; Ambient key-path of the enclosing keyed regions. A keyed `reactive`/`async`
+;; pushes its key token while rendering its body, so a nested region's `:key`
+;; only has to be unique among its siblings (its id is the full path). Bound to
+;; [] at the root of a full render; restored from the region's stored path on a
+;; partial re-render.
+(def ^:dynamic *region-path* [])
+
 ;; Datastar signal values parsed from the @post() request body during
 ;; action execution.  Bound to a keyword-keyed map by the action handler
 ;; so that Signal/deref can return the live client-side value.  nil
@@ -135,6 +142,7 @@
   [req app-state*]
   {#'*request*                req
    #'*action-idx*             (atom 0)
+   #'*region-path*            []
    #'*declared-signals*       (atom [])
    #'*registered-action-ids*  (atom #{})
    #'*registered-subview-ids* (atom #{})
@@ -149,6 +157,7 @@
   [req]
   {#'*request*                req
    #'*action-idx*             (atom 0)
+   #'*region-path*            []
    #'*declared-signals*       (atom [])
    #'*registered-action-ids*  (atom #{})
    #'*registered-subview-ids* (atom #{})

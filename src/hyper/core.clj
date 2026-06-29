@@ -311,12 +311,9 @@
     `(let [{tab-id# :tab-id app-state*# :app-state*} (context/require-context! "reactive")
            idx#                                      (if context/*action-idx* (swap! context/*action-idx* inc) 0)
            fallback-id#                              (str "r_" tab-id# "_" idx#)
-           key#                                      ~(:key opts)
-           explicit-id#                              (when (some? key#)
-                                                       (str "r_" tab-id# "_" (subview/key->token key#)))
            deps#                                     ~deps
            render-fn#                                (fn [] ~@body)]
-       (reactive/render-component app-state*# tab-id# explicit-id# fallback-id# deps# render-fn#))))
+       (reactive/render-component app-state*# tab-id# ~(:key opts) fallback-id# deps# render-fn#))))
 
 (defmacro async
   "Render-time data loading with a placeholder.  Spawns the `fetch` on a
@@ -388,11 +385,8 @@
             session-id# :session-id
             router#     :router}    (context/require-context! "async")
            idx#                     (if context/*action-idx* (swap! context/*action-idx* inc) 0)
-           key#                     ~(:key opts)
-           component-id#            (if (some? key#)
-                                      (str "async_" tab-id# "_" (subview/key->token key#))
-                                      (str "async_" tab-id# "_" idx#))]
-       (subview/render-async! app-state*# tab-id# session-id# router# component-id#
+           fallback-id#             (str "async_" tab-id# "_" idx#)]
+       (subview/render-async! app-state*# tab-id# session-id# router# ~(:key opts) fallback-id#
                               ~deps
                               (fn [] ~fetch-expr)
                               (fn [~binding] ~@render-body)))))
@@ -669,7 +663,7 @@
            idx#                     (if context/*action-idx* (swap! context/*action-idx* inc) (hash action-fn#))
            key#                     ~key-form
            action-id#               (if (some? key#)
-                                      (str "a_" tab-id# "_" (subview/key->token key#))
+                                      (subview/scoped-id "a_" tab-id# (subview/key->token key#))
                                       (str "a_" tab-id# "_" idx#))
            _#                       (actions/register-action! app-state*# session-id# tab-id# action-fn# action-id#
                                                               ~(when as-name {:as as-name}))

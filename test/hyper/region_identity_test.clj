@@ -9,12 +9,13 @@
   "Evaluate body as a full render of `tab-id` (positional ids key off call
    order; the subview-id accumulator tracks live regions)."
   [app-state* tab-id & body]
-  `(binding [context/*request*                 {:hyper/session-id "s"
-                                                :hyper/tab-id     ~tab-id
-                                                :hyper/app-state  ~app-state*
-                                                :hyper/router     nil}
-             context/*action-idx*              (atom 0)
-             context/*registered-subview-ids*  (atom #{})]
+  `(binding [context/*request*                {:hyper/session-id "s"
+                                               :hyper/tab-id     ~tab-id
+                                               :hyper/app-state  ~app-state*
+                                               :hyper/router     nil}
+             context/*action-idx*             (atom 0)
+             context/*region-path*            []
+             context/*registered-subview-ids* (atom #{})]
      ~@body))
 
 (defn- new-tab []
@@ -71,6 +72,33 @@
       (is (= (:B r1) (:B r2)) "node B keeps its fetch cell")
       (is (= (:C r1) (:C r2)) "node C keeps its fetch cell")
       (subview/teardown-all! app-state* "t"))))
+
+(deftest test-nested-keys-are-scoped
+  (testing "an inner :key is namespaced by its enclosing keyed region, so a
+            locally-unique key does not collide across sibling parents"
+    (let [app-state* (new-tab)]
+      (rendering app-state* "t"
+                 (doall
+                   (for [node [:A :B]]
+                     (h/reactive {:key node} [(atom 0)]
+                                 [:div
+                                  (h/reactive {:key :body} [(atom 0)]
+                                              [:span "inner"])]))))
+      (is (= #{"r_t_A" "r_t_A/body" "r_t_B" "r_t_B/body"}
+             (set (keys (get-in @app-state* [:tabs "t" :subviews]))))))))
+
+(deftest test-partial-render-restores-nested-path
+  (testing "partially re-rendering a nested region restores its path, so a
+            keyed descendant keeps the same id (the morph anchor matches)"
+    (let [app-state* (new-tab)]
+      (rendering app-state* "t"
+                 (h/reactive {:key :A} [(atom 0)]
+                             [:div (h/reactive {:key :mid} [(atom 0)]
+                                               [:div (h/reactive {:key :leaf} [(atom 0)] [:span "x"])])]))
+      (is (= ["A" "mid"] (:region-path (get-in @app-state* [:tabs "t" :subviews "r_t_A/mid"]))))
+      (let [frag (subview/partial-render app-state* "t" "r_t_A/mid")]
+        (is (re-find #"id=\"r_t_A/mid/leaf\"" frag)
+            "the keyed descendant keeps its full-render id")))))
 
 (deftest test-duplicate-key-throws
   (testing "two regions resolving to the same id in one render throw"

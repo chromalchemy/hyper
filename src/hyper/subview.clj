@@ -22,6 +22,7 @@
    re-renders just this subview (a targeted Datastar fragment), `:full`
    triggers a full page re-render."
   (:require [clojure.set]
+            [clojure.string :as str]
             [dev.onionpancakes.chassis.core :as c]
             [hyper.context :as context]
             [hyper.protocols :as proto]
@@ -49,6 +50,12 @@
     (if (and s (re-matches #"[A-Za-z0-9_.-]+" s))
       s
       (format "%08x" (bit-and (hash k) 0xffffffff)))))
+
+(defn scoped-id
+  "Compose a region id from `prefix`, `tab-id`, the ambient `*region-path*`,
+   and `token` (key tokens cannot contain `/`, so the join is unambiguous)."
+  [prefix tab-id token]
+  (str prefix tab-id "_" (str/join "/" (conj context/*region-path* token))))
 
 (defn- resolve-region-id
   "Resolve a region's id and ensure the hiccup root carries it as `:id` (the
@@ -121,12 +128,16 @@
    existing :id), caches the serialized HTML for later partial re-renders, and
    registers the subview as live.  Returns the hiccup.
 
-   Identity resolves as `explicit-id` (a `:key`) > the root element's `:id` >
+   Identity resolves as `key` (path-scoped) > the root element's `:id` >
    `fallback-id` (the positional id), and keys the registry and morph anchor
-   alike.  `:on-change` defaults to `:partial` — a dep change re-renders only
-   this region."
-  [app-state* tab-id explicit-id fallback-id deps render-fn]
-  (let [body        (render-fn)
+   alike.  A `key` also scopes the region path for nested regions.
+   `:on-change` defaults to `:partial` — a dep change re-renders only this
+   region."
+  [app-state* tab-id key fallback-id deps render-fn]
+  (let [token       (when (some? key) (key->token key))
+        explicit-id (when token (scoped-id "r_" tab-id token))
+        path        (cond-> context/*region-path* token (conj token))
+        body        (binding [context/*region-path* path] (render-fn))
         [id hiccup] (resolve-region-id explicit-id fallback-id body)
         html        (c/html hiccup)]
     (check-region-unique! tab-id id)
@@ -136,6 +147,7 @@
                         :dep-vals    (mapv deref deps)
                         :cached-html html
                         :html-id     id
+                        :region-path path
                         :on-change   :partial})
     hiccup))
 
@@ -158,9 +170,10 @@
                         :hyper/router     (:router @app-state*)}]
         (push-thread-bindings (context/partial-render-bindings req))
         (try
-          (let [body        (render-fn)
+          (let [body         (binding [context/*region-path* (:region-path spec [])]
+                               (render-fn))
                 [_id hiccup] (resolve-region-id sid sid body)
-                html        (c/html hiccup)]
+                html         (c/html hiccup)]
             (swap! app-state* assoc-in [:tabs tab-id :subviews sid]
                    (assoc spec
                           :dep-vals    (mapv deref deps)
@@ -444,27 +457,31 @@
    coordination store.  The render body must return a single rooted hiccup
    element (as with `reactive`), so the id can be injected.  Returns the
    hiccup."
-  [app-state* tab-id session-id router component-id user-deps fetch-fn render-fn]
-  (let [store-path       [:tabs tab-id :async component-id]
-        cell             (coordinate-async! app-state* tab-id session-id router
-                                            store-path user-deps fetch-fn)
-        deps             (into [cell] user-deps)
-        body             (render-fn @cell)
-        [id hiccup]      (resolve-region-id component-id component-id body)
-        html             (c/html hiccup)
-        _                (check-region-unique! tab-id id)
+  [app-state* tab-id session-id router key fallback-id user-deps fetch-fn render-fn]
+  (let [token        (when (some? key) (key->token key))
+        component-id (if token (scoped-id "async_" tab-id token) fallback-id)
+        path         (cond-> context/*region-path* token (conj token))
+        store-path   [:tabs tab-id :async component-id]
+        cell         (coordinate-async! app-state* tab-id session-id router
+                                        store-path user-deps fetch-fn)
+        deps         (into [cell] user-deps)
+        body         (binding [context/*region-path* path] (render-fn @cell))
+        [id hiccup]  (resolve-region-id component-id component-id body)
+        html         (c/html hiccup)
+        _            (check-region-unique! tab-id id)
         ;; The stored render-fn re-coordinates (so a partial re-render from a
         ;; user-dep change still refetches) then renders the current status.
-        thunk            (fn []
-                           (let [cell (coordinate-async! app-state* tab-id session-id router
-                                                         store-path user-deps fetch-fn)]
-                             (render-fn @cell)))]
+        thunk        (fn []
+                       (let [cell (coordinate-async! app-state* tab-id session-id router
+                                                     store-path user-deps fetch-fn)]
+                         (render-fn @cell)))]
     (register-subview! app-state* tab-id component-id
                        {:render-fn   thunk
                         :deps        deps
                         :dep-vals    (mapv deref deps)
                         :cached-html html
                         :html-id     id
+                        :region-path path
                         :on-change   :partial
                         :scope       :render
                         :unmount     (fn [_]

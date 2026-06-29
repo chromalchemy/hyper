@@ -1510,9 +1510,11 @@ DOM and any in-flight work move together:
   (case status :ready (render-fold result) [:p "Loading…"]))
 ```
 
-`:key` accepts any value (a hash is derived for non-trivial ones). Two regions
-resolving to the same id in one render is an error. Anonymous regions keep the
-positional fallback, which is fine for static layouts.
+`:key` accepts any value (a hash is derived for non-trivial ones). Keys nest:
+a region's `:key` is scoped by its enclosing keyed region, so a key only has to
+be unique among its siblings (like React keys). Two regions resolving to the
+same id in one render is an error. Anonymous regions keep the positional
+fallback, which is fine for static layouts.
 
 ### Nesting
 
