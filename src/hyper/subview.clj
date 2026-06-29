@@ -22,7 +22,6 @@
    re-renders just this subview (a targeted Datastar fragment), `:full`
    triggers a full page re-render."
   (:require [clojure.set]
-            [clojure.string :as str]
             [dev.onionpancakes.chassis.core :as c]
             [hyper.context :as context]
             [hyper.protocols :as proto]
@@ -47,15 +46,22 @@
             (keyword? k)                (subs (str k) 1)
             (symbol? k)                 (str k)
             (or (integer? k) (uuid? k)) (str k))]
-    (if (and s (re-matches #"[A-Za-z0-9_.-]+" s))
+    ;; Tokens must be CSS-identifier-safe — they land in element ids that
+    ;; Datastar resolves as `#id`. Anything else collapses to a hex hash.
+    (if (and s (re-matches #"[A-Za-z0-9_-]+" s))
       s
       (format "%08x" (bit-and (hash k) 0xffffffff)))))
 
 (defn scoped-id
-  "Compose a region id from `prefix`, `tab-id`, the ambient `*region-path*`,
-   and `token` (key tokens cannot contain `/`, so the join is unambiguous)."
+  "Compose a CSS-safe region id from `prefix`, `tab-id`, the ambient
+   `*region-path*`, and `token`.  A nested region encodes its parent path as a
+   hex hash segment rather than a path-joined string, so the id stays a valid
+   `#id` selector for Datastar morphing."
   [prefix tab-id token]
-  (str prefix tab-id "_" (str/join "/" (conj context/*region-path* token))))
+  (let [parent context/*region-path*]
+    (if (empty? parent)
+      (str prefix tab-id "_" token)
+      (str prefix tab-id "_" (format "%08x" (bit-and (hash parent) 0xffffffff)) "_" token))))
 
 (defn- resolve-region-id
   "Resolve a region's id and ensure the hiccup root carries it as `:id` (the

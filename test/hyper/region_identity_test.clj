@@ -75,7 +75,8 @@
 
 (deftest test-nested-keys-are-scoped
   (testing "an inner :key is namespaced by its enclosing keyed region, so a
-            locally-unique key does not collide across sibling parents"
+            locally-unique key does not collide across sibling parents, and
+            every id is a valid CSS id selector (no '/')"
     (let [app-state* (new-tab)]
       (rendering app-state* "t"
                  (doall
@@ -84,8 +85,14 @@
                                  [:div
                                   (h/reactive {:key :body} [(atom 0)]
                                               [:span "inner"])]))))
-      (is (= #{"r_t_A" "r_t_A/body" "r_t_B" "r_t_B/body"}
-             (set (keys (get-in @app-state* [:tabs "t" :subviews]))))))))
+      (let [ids (set (keys (get-in @app-state* [:tabs "t" :subviews])))]
+        (is (= 4 (count ids)) "no collision across sibling parents")
+        (is (contains? ids "r_t_A"))
+        (is (contains? ids "r_t_B"))
+        (is (= 2 (count (filter #(re-find #"_body$" %) ids)))
+            "the two inner regions get distinct, scoped ids")
+        (is (every? #(re-matches #"[A-Za-z0-9_-]+" %) ids)
+            "all ids are valid CSS id selectors (Datastar morphs by #id)")))))
 
 (deftest test-partial-render-restores-nested-path
   (testing "partially re-rendering a nested region restores its path, so a
@@ -95,10 +102,13 @@
                  (h/reactive {:key :A} [(atom 0)]
                              [:div (h/reactive {:key :mid} [(atom 0)]
                                                [:div (h/reactive {:key :leaf} [(atom 0)] [:span "x"])])]))
-      (is (= ["A" "mid"] (:region-path (get-in @app-state* [:tabs "t" :subviews "r_t_A/mid"]))))
-      (let [frag (subview/partial-render app-state* "t" "r_t_A/mid")]
-        (is (re-find #"id=\"r_t_A/mid/leaf\"" frag)
-            "the keyed descendant keeps its full-render id")))))
+      (let [subviews (get-in @app-state* [:tabs "t" :subviews])
+            mid-id   (first (filter #(re-find #"_mid$" %) (keys subviews)))
+            leaf-id  (first (filter #(re-find #"_leaf$" %) (keys subviews)))]
+        (is (= ["A" "mid"] (:region-path (subviews mid-id))))
+        (let [frag (subview/partial-render app-state* "t" mid-id)]
+          (is (re-find (re-pattern (str "id=\"" leaf-id "\"")) frag)
+              "the keyed descendant keeps its full-render id"))))))
 
 (deftest test-duplicate-key-throws
   (testing "two regions resolving to the same id in one render throw"
