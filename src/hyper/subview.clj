@@ -93,9 +93,13 @@
 ;; Registration
 ;; ---------------------------------------------------------------------------
 
+(declare wire-subview!)
+
 (defn register-subview!
   "Record/refresh a subview during a render, marking it live for this render
-   cycle so it survives the post-render sweep.  Idempotent.
+   cycle so it survives the post-render sweep, and wire its dep watches when a
+   renderer is present (see `wire-subview!`).  Wiring can enqueue a partial
+   render if a dep already changed.  Idempotent.
 
    `spec` keys (all optional unless noted):
    - :deps        vector of Watchable sources to subscribe (ref-counted)
@@ -123,6 +127,7 @@
                  (update :on-change #(or % :partial))
                  (update :scope #(or % :render)))]
     (swap! app-state* assoc-in [:tabs tab-id :subviews sid] spec)
+    (wire-subview! app-state* tab-id sid)
     spec))
 
 (defn render-reactive!
@@ -143,6 +148,7 @@
   (let [token       (when (some? key) (key->token key))
         explicit-id (when token (scoped-id "r_" tab-id token))
         path        (cond-> context/*region-path* token (conj token))
+        dep-vals    (mapv deref deps)
         body        (binding [context/*region-path* path] (render-fn))
         [id hiccup] (resolve-region-id explicit-id fallback-id body)
         html        (c/html hiccup)]
@@ -150,7 +156,7 @@
     (register-subview! app-state* tab-id id
                        {:render-fn   render-fn
                         :deps        deps
-                        :dep-vals    (mapv deref deps)
+                        :dep-vals    dep-vals
                         :cached-html html
                         :html-id     id
                         :region-path path
@@ -307,16 +313,26 @@
      sid)))
 
 (defn wire-subview!
-  "Wire a single subview's dep watches immediately, if it has deps and is not
-   already wired (dedup against :subview-watches).  Used by h/watch! to attach
-   the watch the moment it is registered when a renderer is already present;
-   otherwise `setup-new-watches!` wires it on the next full render."
-  [app-state* tab-id sid trigger-render! enqueue-partial!]
-  (when-let [{:keys [deps on-change]} (get-subview app-state* tab-id sid)]
-    (when (and (seq deps)
-               (not (contains? (get-in @app-state* [:tabs tab-id :subview-watches]) sid)))
-      (setup-subview-watches! app-state* tab-id sid deps (or on-change :partial)
-                              trigger-render! enqueue-partial!))))
+  "Wire a subview's dep watches when an SSE renderer is present and the subview
+   has deps not already wired.  A no-op before a renderer exists — the first
+   full render's `setup-new-watches!` wires it then.
+
+   If a dep changed between the render and this wiring (e.g. an async fetch that
+   landed before the watch was attached), fires the change once so the update is
+   not missed."
+  [app-state* tab-id sid]
+  (when-let [{:keys [trigger-render! trigger-partial!]} (get-in @app-state* [:tabs tab-id :renderer])]
+    (when-let [{:keys [deps on-change dep-vals]} (get-subview app-state* tab-id sid)]
+      (when (and (seq deps)
+                 (not (contains? (get-in @app-state* [:tabs tab-id :subview-watches]) sid)))
+        (setup-subview-watches! app-state* tab-id sid deps (or on-change :partial)
+                                trigger-render! trigger-partial!)
+        ;; A fetch landing here can trip both the just-attached watch and this
+        ;; check, firing two partials — that is deliberate: a redundant partial
+        ;; is idempotent, whereas dropping the check would reopen a lost-update
+        ;; race for a fetch that landed before the watch was attached.
+        (when (and dep-vals (not= dep-vals (mapv deref deps)))
+          (if (= on-change :full) (trigger-render!) (trigger-partial! sid)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Worker subviews (h/spawn!)
@@ -471,7 +487,11 @@
         cell         (coordinate-async! app-state* tab-id session-id router
                                         store-path user-deps fetch-fn)
         deps         (into [cell] user-deps)
-        body         (binding [context/*region-path* path] (render-fn @cell))
+        ;; Snapshot deps before rendering, and render against the snapshot, so
+        ;; the cached :dep-vals matches what the body shows.  A fetch that lands
+        ;; after this is then a genuine change the watch (or wiring) reacts to.
+        dep-vals     (mapv deref deps)
+        body         (binding [context/*region-path* path] (render-fn (first dep-vals)))
         [id hiccup]  (resolve-region-id component-id component-id body)
         html         (c/html hiccup)
         _            (check-region-unique! tab-id id)
@@ -484,7 +504,7 @@
     (register-subview! app-state* tab-id component-id
                        {:render-fn   thunk
                         :deps        deps
-                        :dep-vals    (mapv deref deps)
+                        :dep-vals    dep-vals
                         :cached-html html
                         :html-id     id
                         :region-path path

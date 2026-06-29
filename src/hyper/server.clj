@@ -168,9 +168,11 @@
         ;; Sweep stale actions + render-scoped subviews (reactive regions)
         (actions/sweep-stale-tab-actions! app-state* tab-id registered-action-ids)
         (subview/sweep-stale! app-state* tab-id registered-subview-ids)
-        ;; Wire watches for new subviews — reactive regions (partial) and any
-        ;; not-yet-wired user watches (full), e.g. registered during the
-        ;; initial HTTP render before this SSE renderer existed.
+        ;; Catch-up wiring for subviews registered before this renderer existed
+        ;; (mount-scoped h/watch! in the initial HTTP render's form-2 setup,
+        ;; which does not re-register on SSE renders).  Subviews registered
+        ;; during an SSE render are already wired by register-subview!, so for
+        ;; them this is a no-op.
         (subview/setup-new-watches! app-state* tab-id trigger-render! enqueue-partial!)
         (let [head-event   (render/format-head-update title head-html)
               sig-attrs    (signal/format-signal-attrs declared-signals)
@@ -230,11 +232,11 @@
         ;; restoring the plain blocking drain.
         heartbeat-ms     (let [hb (get @app-state* :heartbeat-ms default-heartbeat-ms)]
                            (when (and hb (pos? (long hb))) (long hb)))
-        ;; Stable triggers (indirect through app-state) so subview watches
-        ;; wired during this connection keep driving the renderer that is
-        ;; attached after a reconnect.
-        enqueue-partial! (tab-trigger-partial! app-state* tab-id)
-        trigger-render!  (tab-trigger-render! app-state* tab-id)]
+        ;; The same stable triggers subview watches were wired with — resolved
+        ;; from the renderer published before this loop runs.
+        renderer         (get-in @app-state* [:tabs tab-id :renderer])
+        enqueue-partial! (:trigger-partial! renderer)
+        trigger-render!  (:trigger-render! renderer)]
     (try
       ;; Write the connected event as the first chunk of the SSE body.
       (let [connected-msg (render/format-connected-event tab-id)
@@ -477,8 +479,7 @@
         (let [{:keys [routes-source head]} @app-state*]
           (doseq [source (conj (filterv var? [routes-source head])
                                component/registry*)]
-            (let [sid (subview/register-watch! app-state* tab-id source :tab)]
-              (subview/wire-subview! app-state* tab-id sid trigger-render! nil))))))
+            (subview/register-watch! app-state* tab-id source :tab)))))
     ;; Kick the initial full render, then run the loop until shutdown/disconnect.
     (rq/enqueue-full-render! render-queue)
     (try

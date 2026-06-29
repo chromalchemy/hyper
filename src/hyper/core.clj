@@ -123,17 +123,13 @@
    Watches are cleaned up on remount and tab disconnect."
   [source]
   (context/guard-effect! :watch "h/watch!")
-  (let [{:keys [tab-id app-state*]} (context/require-context! "watch!")
-        ;; A user watch is a mount-scoped, full-render subview: registered once
-        ;; per mount (form-2 setup) or idempotently each render (form-1 body),
-        ;; keyed by source identity for dedup.  Torn down on navigation
-        ;; (page-view remount) and tab disconnect — never by the per-render sweep.
-        sid                         (subview/register-watch! app-state* tab-id source)
-        trigger-render!             (get-in @app-state* [:tabs tab-id :renderer :trigger-render!])]
-    ;; Wire immediately when an SSE renderer already exists; otherwise the
-    ;; first full render's setup-new-watches! wires it (initial HTTP render).
-    (when trigger-render!
-      (subview/wire-subview! app-state* tab-id sid trigger-render! nil))
+  (let [{:keys [tab-id app-state*]} (context/require-context! "watch!")]
+    ;; A user watch is a mount-scoped, full-render subview: registered once
+    ;; per mount (form-2 setup) or idempotently each render (form-1 body),
+    ;; keyed by source identity for dedup.  Torn down on navigation
+    ;; (page-view remount) and tab disconnect — never by the per-render sweep.
+    ;; register-watch! wires it immediately when a renderer is present.
+    (subview/register-watch! app-state* tab-id source)
     nil))
 
 (defn spawn!

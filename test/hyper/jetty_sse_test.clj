@@ -219,3 +219,89 @@
           (is (< elapsed 5000)
               "stop! should return well under the Jetty graceful-stop timeout"))
         (stop)))))
+
+(deftest sse-async-revealed-by-partial-flushes
+  (testing "an async region first revealed during a PARTIAL re-render of its
+            parent has its cell watch wired, so the fetch landing streams a
+            fragment without waiting for a full render"
+    (let [port    (free-port)
+          show?*  (atom false)            ; plain atom dep -> partial-only re-render
+          gate    (promise)               ; gates the async fetch
+          app*    (atom (state/init-state))
+          handler (h/create-handler
+                    [["/" {:name :home
+                           :get  (fn [_]
+                                   [:div {:id "page"}
+                                    (h/reactive {:key :node} [show?*]
+                                                (if @show?*
+                                                  [:div
+                                                   (h/async {:key :fold} []
+                                                            (do @gate :rows)
+                                                            {:keys [status result]}
+                                                            [:div "fold=" (str status) "/" (str result)])]
+                                                  [:div "collapsed"]))])}]]
+                    :app-state app*)
+          stop    (h/start! handler {:port port})
+          client  (HttpClient/newHttpClient)
+          base    (str "http://localhost:" port)]
+      (try
+        (GET client (str base "/?tab-id=T") (HttpResponse$BodyHandlers/ofString))
+        (let [resp                (GET client (str base "/hyper/events?tab-id=T")
+                                    (HttpResponse$BodyHandlers/ofInputStream))
+              {:keys [text stop]} (sse-reader (.body ^java.net.http.HttpResponse resp))]
+          (try
+            (wait-until text #(str/includes? % "collapsed") 5000)
+            ;; Reveal the async child via a partial-only re-render of the parent.
+            (reset! show?* true)
+            (wait-until text #(str/includes? % "fold=:loading") 5000)
+            (let [mark (count (text))]
+              ;; Land the fetch — the ready fragment must stream on its own.
+              (deliver gate true)
+              (let [t (wait-until #(subs (text) (min mark (count (text))))
+                                  #(str/includes? % "fold=:ready") 5000)]
+                (is (str/includes? t "fold=:ready")
+                    "async revealed by a partial render must flush when its fetch lands")))
+            (finally
+              (stop))))
+        (finally
+          (h/stop! stop))))))
+
+(deftest sse-instant-async-revealed-by-partial-flushes
+  (testing "an async whose fetch completes synchronously, revealed by a partial
+            render, still streams its ready fragment (the register->wire race)"
+    (let [port    (free-port)
+          show?*  (atom false)
+          app*    (atom (state/init-state))
+          handler (h/create-handler
+                    [["/" {:name :home
+                           :get  (fn [_]
+                                   [:div {:id "page"}
+                                    (h/reactive {:key :node} [show?*]
+                                                (if @show?*
+                                                  [:div
+                                                   (h/async {:key :fold} []
+                                                            :rows               ; completes immediately
+                                                            {:keys [status result]}
+                                                            [:div "fold=" (str status) "/" (str result)])]
+                                                  [:div "collapsed"]))])}]]
+                    :app-state app*)
+          stop    (h/start! handler {:port port})
+          client  (HttpClient/newHttpClient)
+          base    (str "http://localhost:" port)]
+      (try
+        (GET client (str base "/?tab-id=T") (HttpResponse$BodyHandlers/ofString))
+        (let [resp                (GET client (str base "/hyper/events?tab-id=T")
+                                    (HttpResponse$BodyHandlers/ofInputStream))
+              {:keys [text stop]} (sse-reader (.body ^java.net.http.HttpResponse resp))]
+          (try
+            (wait-until text #(str/includes? % "collapsed") 5000)
+            (let [mark (count (text))]
+              (reset! show?* true)
+              (let [t (wait-until #(subs (text) (min mark (count (text))))
+                                  #(str/includes? % "fold=:ready") 5000)]
+                (is (str/includes? t "fold=:ready")
+                    "a synchronously-completing async must still stream its ready fragment")))
+            (finally
+              (stop))))
+        (finally
+          (h/stop! stop))))))
