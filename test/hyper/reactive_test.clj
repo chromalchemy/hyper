@@ -64,6 +64,24 @@
       (is (not (re-find #"r_" (:body-html result)))
           "should use the existing ID, not generate one"))))
 
+(deftest test-reactive-nil-body
+  (testing "a nil body renders an empty anchor, not leaked internals"
+    (let [result (ht/test-page
+                   (fn [_req]
+                     (let [count* (h/tab-cursor :count 0)]
+                       [:div "before"
+                        (h/reactive [count*]
+                                    (when false [:p "never"]))
+                        "after"])))
+          html   (:body-html result)]
+      ;; The internal attribute map must never appear in the output.
+      (is (not (str/includes? html "{:id"))
+          "must not leak the internal attribute map")
+      ;; A stable empty anchor carrying the region id must remain so a later
+      ;; dep change can target it with a partial fragment.
+      (is (re-find #"<div id=\"r_test-tab_\d+\"></div>" html)
+          "should emit an empty anchor div carrying the region id"))))
+
 (deftest test-reactive-caching
   (testing "reactive returns cached HTML when deps unchanged"
     (let [counter*  (atom 0)

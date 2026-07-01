@@ -66,17 +66,22 @@
 (defn- resolve-region-id
   "Resolve a region's id and ensure the hiccup root carries it as `:id` (the
    morph anchor).  Precedence: `explicit-id` > the root element's `:id` >
-   `fallback-id`.  Returns `[id hiccup]`."
+   `fallback-id`.  A nil body renders nothing but the region still needs a
+   stable anchor for later partial fragments, so an empty element carrying the
+   id is returned.  Returns `[id hiccup]`."
   [explicit-id fallback-id hiccup]
-  (let [[tag & more] hiccup
-        has-attrs?   (map? (first more))
-        attrs        (if has-attrs? (first more) {})
-        children     (if has-attrs? (next more) more)
-        root-id      (some-> (:id attrs) str)
-        id           (or explicit-id root-id fallback-id)]
-    (if (= id root-id)
-      [id hiccup]
-      [id (into [tag (assoc attrs :id id)] children)])))
+  (if (nil? hiccup)
+    (let [id (or explicit-id fallback-id)]
+      [id [:div {:id id}]])
+    (let [[tag & more] hiccup
+          has-attrs?   (map? (first more))
+          attrs        (if has-attrs? (first more) {})
+          children     (if has-attrs? (next more) more)
+          root-id      (some-> (:id attrs) str)
+          id           (or explicit-id root-id fallback-id)]
+      (if (= id root-id)
+        [id hiccup]
+        [id (into [tag (assoc attrs :id id)] children)]))))
 
 (defn- check-region-unique!
   "Throw when `id` was already registered by an earlier region in this render.
