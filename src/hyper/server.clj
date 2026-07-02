@@ -3,13 +3,14 @@
 
    Provides Ring handler creation for hyper applications."
   (:require [cheshire.core :as json]
+            [clojure.java.io :as io]
             [clojure.string]
             [compact-uuids.core :as uuid]
             [dev.onionpancakes.chassis.core :as c]
             [hyper.actions :as actions]
+            [hyper.brotli :as br]
             [hyper.component :as component]
             [hyper.component.bundle :as component.bundle]
-            [hyper.brotli :as br]
             [hyper.context :as context]
             [hyper.effects :as effects]
             [hyper.lifecycle :as lifecycle]
@@ -335,6 +336,24 @@
   []
   [:script {:type "module"
             :src  "https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.2/bundles/datastar.js"}])
+
+(def ^:private webkit-sse-shim-js
+  "Inline JS injected into <head> for WebKit/Safari clients: routes the GET SSE
+   render stream through a native EventSource (which does not strand) instead of
+   fetch + ReadableStream.  See resources/hyper/webkit_sse_shim.js.  nil if the
+   resource is missing (injection is then skipped)."
+  (some-> (io/resource "hyper/webkit_sse_shim.js") slurp))
+
+(defn safari-request?
+  "True when the request's User-Agent is WebKit-on-Apple (desktop Safari or any
+   iOS browser — all of which use WebKit and are affected by the fetch-streaming
+   strand), and not a desktop Blink/Gecko browser that merely carries the legacy
+   `Safari` token (Chrome, Edge, Opera, Android WebView)."
+  [req]
+  (let [ua (get-in req [:headers "user-agent"] "")]
+    (boolean
+      (and (re-find #"Safari/" ua)
+           (not (re-find #"Chrome/|Chromium|Edg/|OPR/|Android|SamsungBrowser" ua))))))
 
 (defn cleanup-tab!
   "Clean up all resources for a tab: watchers, reactive components, renderer thread, actions, and state."
@@ -832,14 +851,23 @@
    Shared by page-handler and not-found-handler so both emit identical document
    scaffolding, differing only in `status` and `fallback-title` (the <title>
    used when the result has no :title)."
-  [result {:keys [datastar-script open-when-hidden? base-path] :or {open-when-hidden? true
-                                                                    base-path         ""}}
-   tab-id status fallback-title]
+  [result {:keys [datastar-script open-when-hidden? base-path webkit-sse-shim?]
+           :or   {open-when-hidden? true
+                  base-path         ""
+                  webkit-sse-shim?  true}}
+   req tab-id status fallback-title]
   (let [{:keys [title head-html body-html declared-signals]} result
         title                                                (or title fallback-title)
         sig-attrs                                            (signal/format-signal-attrs declared-signals)
         div-attrs                                            (cond-> {:id "hyper-app"}
                                                                sig-attrs (merge sig-attrs))
+        ;; WebKit/Safari fetch-streaming strand workaround: inject the
+        ;; EventSource shim only for affected user agents, before the datastar
+        ;; script so window.fetch is patched before datastar opens the stream.
+        webkit-shim                                          (when (and webkit-sse-shim?
+                                                                        webkit-sse-shim-js
+                                                                        (safari-request? req))
+                                                               [:script (c/raw webkit-sse-shim-js)])
         html                                                 (c/html
                                                                [c/doctype-html5
                                                                 [:html
@@ -847,6 +875,7 @@
                                                                   [:meta {:charset "UTF-8"}]
                                                                   [:meta {:name "viewport" :content "width=device-width, initial-scale=1"}]
                                                                   [:title title]
+                                                                  webkit-shim
                                                                   datastar-script
                                                                   (when head-html (c/raw head-html))]
                                                                  [:body
@@ -887,7 +916,7 @@
           ;; Ring response passthrough (e.g. a 302 redirect)
           (if (:status result)
             result
-            (page-response result opts tab-id 200 "Hyper App")))))))
+            (page-response result opts req tab-id 200 "Hyper App")))))))
 
 (defn- not-found-handler
   "Reitit default-handler for unmatched routes: renders the configured
@@ -913,7 +942,7 @@
         ;; Ring response passthrough (e.g. a redirect from render middleware)
         (if (:status result)
           result
-          (page-response result opts tab-id 404 "Not Found"))))))
+          (page-response result opts req tab-id 404 "Not Found"))))))
 
 (defn- components-js-handler
   "Serve the assembled client-components ES module bundle.
@@ -1087,6 +1116,13 @@
    - :open-when-hidden? Keep the SSE connection open when the browser tab is hidden
                         (default true). When false, Datastar closes the connection
                         on tab hide and reopens it when the tab becomes visible.
+   - :webkit-sse-shim?  Inject a small client shim (into <head>, only for
+                        WebKit/Safari user agents) that routes the GET render
+                        stream through a native EventSource instead of
+                        fetch+ReadableStream, working around a WebKit bug where a
+                        large isolated SSE patch is held back until the next
+                        write.  Other browsers are unaffected and never receive
+                        it.  Default true; pass false to disable.
    - :base-path         URL path prefix for reverse-proxy deployments where the app
                         is served under a subfolder (e.g. \"/my-app\"). When set,
                         all internal hyper endpoints (/hyper/events, /hyper/actions,

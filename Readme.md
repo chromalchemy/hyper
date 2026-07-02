@@ -2067,6 +2067,29 @@ Hyper's built-in `/hyper/events` endpoint automatically sends SSE-friendly
 headers, including `Cache-Control: no-cache, no-transform` and
 `X-Accel-Buffering: no`, to improve compatibility with reverse proxies.
 
+### WebKit/Safari SSE shim
+
+WebKit/Safari's `fetch` + `ReadableStream` delivery holds back the trailing
+bytes of a large SSE write until the next read wakeup, so a large isolated DOM
+patch can render one write behind and a quiet connection can appear frozen until
+the next update or heartbeat. Native `EventSource` does not have this problem.
+
+To work around it, Hyper injects a tiny client shim into the `<head>` — **only
+for WebKit/Safari user agents** — that routes the GET render stream through a
+native `EventSource` instead of `fetch`. It fails open (falls back to the real
+fetch if `EventSource` can't be used), lets Datastar drive reconnection on drop,
+and tears the connection down cleanly on navigation so nothing leaks. Other
+browsers never receive it.
+
+It's on by default; pass `:webkit-sse-shim? false` to disable:
+
+```clojure
+(def handler
+  (h/create-handler
+    #'routes
+    :webkit-sse-shim? false))
+```
+
 ### Heartbeat keepalive
 
 An otherwise-idle SSE connection (no state changes for a while) sends a periodic

@@ -137,7 +137,7 @@
         (is (= 200 (.statusCode (GET client (str base "/?tab-id=T")
                                   (HttpResponse$BodyHandlers/ofString)))))
         (let [resp                 (GET-br client (str base "/hyper/events?tab-id=T")
-                                            (HttpResponse$BodyHandlers/ofInputStream))
+                                           (HttpResponse$BodyHandlers/ofInputStream))
               enc                  (-> resp .headers (.firstValue "content-encoding")
                                        (.orElse ""))
               {:keys [bytes stop]} (sse-byte-reader (.body ^java.net.http.HttpResponse resp))]
@@ -204,7 +204,7 @@
   (testing "stop! returns promptly even while an SSE connection is open"
     (let [port    (free-port)
           handler (h/create-handler [["/" {:name :home :get (fn [_] [:div "ok"])}]])
-          stop    (h/start! handler {:port port})
+          _stop   (h/start! handler {:port port})
           client  (HttpClient/newHttpClient)
           base    (str "http://localhost:" port)]
       (GET client (str base "/?tab-id=T") (HttpResponse$BodyHandlers/ofString))

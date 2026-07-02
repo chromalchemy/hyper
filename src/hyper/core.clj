@@ -791,6 +791,12 @@
                           components bundle (default: version-matched jsDelivr CDN).
                           Point at a self-hosted copy for offline/air-gapped deploys.
    - :head              — Hiccup nodes appended to the HTML <head>, or (fn [req] ...) -> hiccup
+   - :webkit-sse-shim?  — Inject a small client shim (into <head>, only for WebKit/Safari
+                          user agents) that routes the GET render stream through a native
+                          EventSource instead of fetch+ReadableStream, working around a
+                          WebKit bug where a large isolated SSE patch is held back until
+                          the next write.  Other browsers never receive it.  Default true;
+                          pass false to disable.
    - :base-path         — URL path prefix for reverse-proxy deployments where the app is served
                           under a subfolder (e.g. \"/my-app\"). When set, all internal hyper
                           endpoints (/hyper/events, /hyper/actions, /hyper/navigate) are mounted
@@ -880,6 +886,9 @@
                            max-file-size (assoc :max-file-size max-file-size)
                            max-file-count (assoc :max-file-count max-file-count)
                            upload-expires-in (assoc :upload-expires-in upload-expires-in)
+                           ;; `contains?` so an explicit `false` is honored while
+                           ;; absence lets the server default (true) apply.
+                           (contains? opts :webkit-sse-shim?) (assoc :webkit-sse-shim? (:webkit-sse-shim? opts))
                            ;; `contains?` so an explicit `:not-found nil` (disable) is honored.
                            (contains? opts :not-found) (assoc :not-found (:not-found opts)))))
 
