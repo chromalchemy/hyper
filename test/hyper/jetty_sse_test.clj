@@ -6,7 +6,7 @@
    Not tagged :e2e — these need no browser, just a JVM + a socket."
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
-            [hyper.compress :as gz]
+            [hyper.brotli :as br]
             [hyper.core :as h]
             [hyper.state :as state])
   (:import [java.io ByteArrayOutputStream InputStream]
@@ -53,15 +53,15 @@
          (.. (HttpRequest/newBuilder (URI/create url)) (GET) (build))
          body-handler))
 
-(defn- GET-gzip [^HttpClient client url body-handler]
+(defn- GET-br [^HttpClient client url body-handler]
   (.send client
          (.. (HttpRequest/newBuilder (URI/create url))
-             (header "Accept-Encoding" "gzip")
+             (header "Accept-Encoding" "br")
              (GET) (build))
          body-handler))
 
 (defn- sse-byte-reader
-  "Like sse-reader but accumulates raw bytes (for gzip streams)."
+  "Like sse-reader but accumulates raw bytes (for compressed streams)."
   [^InputStream is]
   (let [baos (ByteArrayOutputStream.)
         run  (atom true)
@@ -78,11 +78,11 @@
     {:bytes (fn [] (locking baos (.toByteArray baos)))
      :stop  (fn [] (reset! run false) (future-cancel fut))}))
 
-(defn- decode-gzip-stream
-  "Best-effort incremental decode of a SYNC_FLUSH'd gzip stream prefix."
+(defn- decode-br-stream
+  "Best-effort incremental decode of a flushed brotli stream prefix."
   [^bytes bs]
-  (if (>= (alength bs) 11)
-    (try (gz/decompress-stream bs) (catch Exception _ ""))
+  (if (pos? (alength bs))
+    (try (br/decompress-stream bs) (catch Exception _ ""))
     ""))
 
 (deftest sse-push-after-initial-render
@@ -100,7 +100,7 @@
         ;; 1. Initial GET registers the render-fn for tab "T".
         (is (= 200 (.statusCode (GET client (str base "/?tab-id=T")
                                   (HttpResponse$BodyHandlers/ofString)))))
-        ;; 2. Open the SSE connection (no gzip, to assert on raw text).
+        ;; 2. Open the SSE connection (no compression, to assert on raw text).
         (let [resp                (GET client (str base "/hyper/events?tab-id=T")
                                     (HttpResponse$BodyHandlers/ofInputStream))
               {:keys [text stop]} (sse-reader (.body ^java.net.http.HttpResponse resp))]
@@ -122,8 +122,8 @@
         (finally
           (h/stop! stop))))))
 
-(deftest sse-push-with-gzip-after-initial-render
-  (testing "a gzip SSE stream delivers a re-render pushed after the initial paint"
+(deftest sse-push-with-brotli-after-initial-render
+  (testing "a brotli SSE stream delivers a re-render pushed after the initial paint"
     (let [port    (free-port)
           app*    (atom (state/init-state))
           handler (h/create-handler
@@ -136,19 +136,19 @@
       (try
         (is (= 200 (.statusCode (GET client (str base "/?tab-id=T")
                                   (HttpResponse$BodyHandlers/ofString)))))
-        (let [resp                 (GET-gzip client (str base "/hyper/events?tab-id=T")
-                                             (HttpResponse$BodyHandlers/ofInputStream))
+        (let [resp                 (GET-br client (str base "/hyper/events?tab-id=T")
+                                            (HttpResponse$BodyHandlers/ofInputStream))
               enc                  (-> resp .headers (.firstValue "content-encoding")
                                        (.orElse ""))
               {:keys [bytes stop]} (sse-byte-reader (.body ^java.net.http.HttpResponse resp))]
           (try
-            (is (= "gzip" enc) "the server should gzip the SSE stream")
-            (let [t (wait-until #(decode-gzip-stream (bytes)) #(str/includes? % "n=0") 5000)]
-              (is (str/includes? t "n=0") "initial gzip render decodes"))
+            (is (= "br" enc) "the server should brotli-compress the SSE stream")
+            (let [t (wait-until #(decode-br-stream (bytes)) #(str/includes? % "n=0") 5000)]
+              (is (str/includes? t "n=0") "initial brotli render decodes"))
             (swap! app* assoc-in [:global :n] 42)
-            (let [t (wait-until #(decode-gzip-stream (bytes)) #(str/includes? % "n=42") 5000)]
+            (let [t (wait-until #(decode-br-stream (bytes)) #(str/includes? % "n=42") 5000)]
               (is (str/includes? t "n=42")
-                  "a re-render pushed onto a live gzip stream must decode on the client"))
+                  "a re-render pushed onto a live brotli stream must decode on the client"))
             (finally
               (stop))))
         (finally

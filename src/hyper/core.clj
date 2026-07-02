@@ -562,7 +562,7 @@
    The action is registered with the current session/tab context
    and can access state via cursors. Action IDs are deterministic
    (derived from a per-render counter + tab-id) so that re-renders
-   produce identical HTML, enabling effective gzip streaming compression.
+   produce identical HTML, enabling effective brotli streaming compression.
 
    Supports client-side special forms that transmit DOM values to the server:
    - $value     — the value of the input/select/textarea that fired the event

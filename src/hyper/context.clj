@@ -10,7 +10,7 @@
 
 ;; Per-render action counter. Bound to (atom 0) before each render so that
 ;; deterministic render functions produce the same action IDs every time,
-;; enabling effective gzip streaming compression.
+;; enabling effective brotli streaming compression.
 (def ^:dynamic *action-idx* nil)
 
 ;; Ambient key-path of the enclosing keyed regions. A keyed `reactive`/`async`

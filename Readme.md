@@ -873,7 +873,7 @@ The execution order for `:middleware` is:
 
 ```
 Request arrives
-  → Hyper built-ins: cookies → params → keyword-params → gzip → hyper-context
+  → Hyper built-ins: cookies → params → keyword-params → brotli → hyper-context
   → Your :middleware (first in vector = outermost, runs first)
   → Router dispatch (page-handler, action-handler, etc.)
 ```
@@ -2216,31 +2216,10 @@ after a server redeploy where client code may have changed).
 > reconnecting starts a fresh tab — the connection comes back, but tab-local
 > state does not. Word any "Retry" copy accordingly.
 
-## Gzip compression
+## Brotli compression
 
-Hyper compresses both initial page responses and streaming SSE updates with
-gzip, using only `java.util.zip` (no native dependency).
-
-- **Initial page responses** are compressed one-shot at maximum level
-  (`Deflater/BEST_COMPRESSION`) by the built-in `wrap-gzip` middleware.
-- **SSE updates** are compressed with a single streaming `GZIPOutputStream`
-  per connection (so the deflate window is shared across patches for better
-  ratios), flushed after every patch with `SYNC_FLUSH` so the browser paints
-  each patch the moment it is written.
-
-Compression is enabled whenever the client advertises `Accept-Encoding: gzip`,
-which every browser does over both HTTP and HTTPS.
-
-### Why gzip and not brotli?
-
-hyper streams SSE patches compressed, flushing after each one. A brotli flush
-emits a block that is only surfaced by an *eager* decoder — and WebKit/Safari's
-decoder is not eager, so a flushed-but-not-final brotli block stays buffered
-until the *next* write arrives. The visible symptom is Safari rendering each SSE
-patch one event behind (most noticeable with large, discrete patches). gzip's
-`SYNC_FLUSH` boundary (the `00 00 FF FF` marker) is surfaced mid-stream by every
-browser, so patches paint immediately. Standardising on gzip also lets hyper
-drop the brotli4j JNI native dependency entirely.
+Hyper uses [brotli4j](https://github.com/hyperxpro/Brotli4j) to compress both
+initial page responses and streaming SSE updates.
 
 ## clj-kondo
 
@@ -2411,7 +2390,7 @@ clojure -M:test
 ### Unit tests
 
 Unit tests live in `test/hyper/` and cover cursors, actions, navigation, routing,
-rendering, state management, effects, render middleware, and gzip compression.
+rendering, state management, effects, render middleware, and brotli compression.
 They run in-process with no server or browser — just bind `*request*` and
 exercise the API directly.
 

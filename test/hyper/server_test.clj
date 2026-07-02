@@ -97,10 +97,10 @@
             [[nil    {"Content-Type"      "text/event-stream"
                       "Cache-Control"     "no-cache, no-transform"
                       "X-Accel-Buffering" "no"}]
-             ["gzip" {"Content-Type"      "text/event-stream"
-                      "Cache-Control"     "no-cache, no-transform"
-                      "X-Accel-Buffering" "no"
-                      "Content-Encoding"  "gzip"}]]]
+             ["br"  {"Content-Type"      "text/event-stream"
+                     "Cache-Control"     "no-cache, no-transform"
+                     "X-Accel-Buffering" "no"
+                     "Content-Encoding"  "br"}]]]
       (let [app-state* (atom (state/init-state))
             handler    (#'server/sse-events-handler app-state*)
             req        (cond-> {:hyper/session-id "ses_test"

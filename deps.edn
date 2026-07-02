@@ -13,6 +13,10 @@
   ;; HTML generation
   dev.onionpancakes/chassis           {:mvn/version "1.0.365"}
 
+  ;; Compression
+  com.aayushatharva.brotli4j/brotli4j {:mvn/version "1.20.0"}
+  io.netty/netty-buffer               {:mvn/version "4.2.10.Final"}
+
   ;; Web server — Jetty 12 via ring-jetty9-adapter.
   ;; Chosen over http-kit because http-kit buffers the entire request body in
   ;; heap (no streaming inbound bodies), making large multipart uploads

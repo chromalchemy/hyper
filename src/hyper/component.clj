@@ -498,7 +498,7 @@
 (defn- deep-sort
   "Recursively convert maps to sorted maps so JSON encoding is deterministic.
    Determinism matters twice: the client change gate compares raw attribute
-   strings, and stable output maximizes gzip streaming compression."
+   strings, and stable output maximizes brotli streaming compression."
   [v]
   (walk/postwalk
     (fn [x]
