@@ -5,10 +5,11 @@
    and streaming compression (for SSE connections where the LZ77 window is
    maintained across chunks for better ratios)."
   (:import (com.aayushatharva.brotli4j Brotli4jLoader)
-           (com.aayushatharva.brotli4j.decoder BrotliInputStream)
+           (com.aayushatharva.brotli4j.decoder BrotliInputStream
+                                               DecoderJNI$Status DecoderJNI$Wrapper)
            (com.aayushatharva.brotli4j.encoder Encoder Encoder$Parameters
                                                Encoder$Mode BrotliOutputStream)
-           (java.io ByteArrayInputStream ByteArrayOutputStream IOException)))
+           (java.io ByteArrayInputStream ByteArrayOutputStream)))
 
 (defonce ensure-br
   (Brotli4jLoader/ensureAvailability))
@@ -77,20 +78,29 @@
 
 (defn decompress-stream
   "Decompress brotli data that may be an incomplete stream (e.g. flushed
-   streaming chunks). Uses eager output and catches IOException at EOF
-   so partial data is still returned."
+   streaming chunks that lack a final block)."
   [^bytes data]
-  (with-open [in  (BrotliInputStream. (ByteArrayInputStream. data))
-              out (ByteArrayOutputStream.)]
-    (.enableEagerOutput in)
-    (try
-      (let [buf (byte-array 4096)]
-        (loop [n (.read in buf)]
-          (when (pos? n)
-            (.write out buf 0 n)
-            (recur (.read in buf)))))
-      (catch IOException _))
-    (.toString out "UTF-8")))
+  (if (zero? (alength data))
+    ""
+    (let [w (DecoderJNI$Wrapper. (alength data))]
+      (try
+        (.put (.getInputBuffer w) data)
+        (.push w (alength data))
+        (with-open [out (ByteArrayOutputStream.)]
+          (loop []
+            (cond
+              (.hasOutput w)
+              (let [bb (.pull w)
+                    ba (byte-array (.remaining bb))]
+                (.get bb ba)
+                (.write out ba 0 (alength ba))
+                (recur))
+
+              (= (.getStatus w) DecoderJNI$Status/OK)
+              (do (.push w 0) (recur))))
+          (.toString out "UTF-8"))
+        (finally
+          (.destroy w))))))
 
 (defn close-stream
   "Close the brotli output stream. Safe to call on nil."
