@@ -332,6 +332,19 @@
         (let [cursor (hy/path-cursor :q "")]
           (is (= "clojure" @cursor))))))
 
+  (testing "path-cursor stamps :hyper/scope and :hyper/path metadata"
+    (let [app-state* (atom (state/init-state))
+          session-id "test-session-path-meta"
+          tab-id     "test_tab_path_meta"]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (state/set-tab-route! app-state* tab-id
+                            {:name :home :path "/" :path-params {} :query-params {}})
+      (binding [context/*request* {:hyper/session-id session-id
+                                   :hyper/tab-id     tab-id
+                                   :hyper/app-state  app-state*}]
+        (is (= {:hyper/scope :path :hyper/path [:page]}
+               (meta (hy/path-cursor :page 1)))))))
+
   (testing "path-cursor swap! works"
     (let [app-state* (atom (state/init-state))
           session-id "test-session-path-3"

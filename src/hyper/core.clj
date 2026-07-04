@@ -90,13 +90,11 @@
      (path-cursor :search \"\")   ;; URL: /?search=hello"
   ([path]
    (let [{:keys [tab-id app-state*]} (context/require-context! "path-cursor")]
-     (state/create-cursor app-state* [:tabs tab-id :route :query-params] path)))
+     (state/stamp-scope!
+       (state/create-cursor app-state* [:tabs tab-id :route :query-params] path)
+       :path path)))
   ([path default-value]
-   (let [{:keys [tab-id app-state*]} (context/require-context! "path-cursor")
-         cursor                      (state/create-cursor
-                                       app-state*
-                                       [:tabs tab-id :route :query-params]
-                                       path)]
+   (let [cursor (path-cursor path)]
      ;; cas so the default init yields to a concurrent write (see state/Cursor).
      (compare-and-set! cursor nil default-value)
      cursor)))
@@ -486,6 +484,46 @@
    (local-signal path nil))
   ([path default-value]
    (signal/create-local-signal path default-value)))
+
+(defn optimistic
+  "Pair a scoped cursor with a client-side signal.  The client is
+   authoritative while the user interacts; the cursor is authoritative at
+   rest.  Use for continuous gestures (resize, drag, sliders) whose result
+   should persist and propagate like any cursor.
+
+   The signal name derives from the cursor's scope and path:
+     (optimistic (session-cursor [:cols 0 :width] 240))  ;; → $sessionCols0Width
+
+   During render, `@opt*` returns the Datastar expression string; during an
+   action it returns the live client-reported value.  `reset!`/`swap!` in an
+   action write the cursor — the authoritative value — and the client is
+   patched on the next render.  `commit!` makes the client's value official.
+
+   opts:
+   - :auto-commit? — commit the client-reported value on every action POST
+   - :on-conflict  — :client-wins (default) | :server-wins |
+                     (fn [{:keys [base committed reported]}] → value to commit);
+                     :server-wins and fn policies track the base value the
+                     client's edit was based on via a companion signal."
+  ([cursor]
+   (optimistic cursor {}))
+  ([cursor opts]
+   (let [{:keys [tab-id app-state*]} (context/require-context! "optimistic")]
+     (signal/create-optimistic app-state* tab-id cursor opts))))
+
+(defn commit!
+  "Make the client-reported value of an optimistic official: run its
+   conflict policy and write the result to the backing cursor.  Returns
+   the committed value.  Action-only.
+
+     [:div.handle {:data-on:pointerup (action (commit! w*))}]
+
+   Equivalent to `(reset! opt* @opt*)` plus conflict detection.  To
+   validate or transform on the way in, skip the sugar:
+
+     (action (reset! w* (clamp @w* 80 640)))"
+  [opt*]
+  (signal/commit! opt*))
 
 ;; ---------------------------------------------------------------------------
 ;; Connection status signals (client-only, maintained by Datastar)

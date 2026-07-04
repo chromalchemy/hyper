@@ -155,6 +155,31 @@
   Object
   (toString [_] sig-name))
 
+(deftype Optimistic [^Signal signal ;; the paired client signal
+                     cursor        ;; the authoritative scoped cursor
+                     opts]         ;; {:auto-commit? bool :on-conflict policy}
+  clojure.lang.IDeref
+  ;; Deref reads what the client sees; writes decree what the server says.
+  (deref [_]
+    (if-let [signals context/*signals*]
+      ;; Action context — the live client-reported value, falling back to
+      ;; the committed value when the signal did not ride the request.
+      (let [v (get-in signals (.-store-path signal) ::absent)]
+        (if (identical? ::absent v) @cursor v))
+      ;; Render context — the Datastar expression string
+      (str "$" (.-sig-name signal))))
+
+  clojure.lang.IAtom
+  (reset [_ newv] (reset! cursor newv))
+  (swap [_ f] (swap! cursor f))
+  (swap [_ f arg] (swap! cursor f arg))
+  (swap [_ f arg1 arg2] (swap! cursor f arg1 arg2))
+  (swap [_ f arg1 arg2 args] (apply swap! cursor f arg1 arg2 args))
+  (compareAndSet [_ oldv newv] (compare-and-set! cursor oldv newv))
+
+  Object
+  (toString [_] (.-sig-name signal)))
+
 ;; ---------------------------------------------------------------------------
 ;; Signal introspection
 ;; ---------------------------------------------------------------------------
@@ -172,10 +197,20 @@
   [x]
   (instance? LocalSignal x))
 
-(defn any-signal?
-  "True when x is any signal object — Signal or LocalSignal."
+(defn optimistic?
+  "True when x is an Optimistic (a cursor paired with a client signal)."
   [x]
-  (or (signal? x) (local-signal? x)))
+  (instance? Optimistic x))
+
+(defn any-signal?
+  "True when x is any signal object — Signal, LocalSignal, or Optimistic."
+  [x]
+  (or (signal? x) (local-signal? x) (optimistic? x)))
+
+(defn optimistic-signal
+  "The client Signal paired inside an Optimistic."
+  ^Signal [^Optimistic o]
+  (.-signal o))
 
 (defn js-name
   "The signal's Datastar JS name, e.g. \"userName\", \"user.name\" or
@@ -184,6 +219,7 @@
   (cond
     (signal? sig)       (.-sig-name ^Signal sig)
     (local-signal? sig) (.-sig-name ^LocalSignal sig)
+    (optimistic? sig)   (.-sig-name (optimistic-signal sig))
     :else (throw (ex-info "Not a signal" {:value sig}))))
 
 (defn js-ref
@@ -218,7 +254,10 @@
     (.-sig-name this))
   LocalSignal
   (attribute-value-fragment [this]
-    (.-sig-name this)))
+    (.-sig-name this))
+  Optimistic
+  (attribute-value-fragment [this]
+    (.-sig-name (optimistic-signal this))))
 
 ;; ---------------------------------------------------------------------------
 ;; Signal construction
@@ -260,6 +299,190 @@
                        :default-val default-val
                        :local?      true}))
     signal))
+
+;; ---------------------------------------------------------------------------
+;; Optimistic construction
+;; ---------------------------------------------------------------------------
+
+(defn derived-signal-path
+  "The flat signal path derived from a cursor's scope and logical path.
+   (:session, [:cols 0 :width]) → :session-cols-0-width ($sessionCols0Width)."
+  [scope path]
+  ;; Canonicalize through one camelCase→kebab round trip so the path always
+  ;; matches what parse-signals produces for the wire name — segments not
+  ;; already in kebab form (e.g. mixed-case strings) would otherwise come
+  ;; back from a Datastar request under a different keyword and miss the
+  ;; store path.
+  (keyword
+    (-memoized->kebab-case-string
+      (-memoized->camelCaseString
+        (str/join "-" (map #(if (keyword? %) (name %) (str %))
+                           (cons scope path)))))))
+
+(defn- versioned-policy?
+  "True when the conflict policy needs base tracking (a companion signal
+   echoing the committed value the client's edit was based on)."
+  [policy]
+  (or (= :server-wins policy) (fn? policy)))
+
+(defn base-sig-path
+  "The companion base-signal path for a derived signal path.
+   :session-col-w → :session-col-w-base ($sessionColWBase)."
+  [sig-path]
+  (keyword (str (name sig-path) "-base")))
+
+(defn resolve-commit
+  "The value to commit for an optimistic, given its conflict policy and the
+   commit context {:base :committed :reported}.  A commit is clean when
+   base = committed; a nil base with a differing committed value counts as
+   a conflict (unknown base cannot prove freshness)."
+  [policy {:keys [base committed reported] :as ctx}]
+  (if (or (nil? policy)
+          (= :client-wins policy)
+          (= base committed))
+    reported
+    (case policy
+      :server-wins committed
+      (policy ctx))))
+
+(def ^:private optimistic-opt-keys #{:auto-commit? :on-conflict})
+
+(defn- validate-optimistic-opts!
+  [opts]
+  (when-let [unknown (seq (remove optimistic-opt-keys (keys opts)))]
+    (throw (ex-info (str "h/optimistic: unknown option(s) " (pr-str (vec unknown)))
+                    {:opts opts :allowed optimistic-opt-keys})))
+  (let [policy (:on-conflict opts)]
+    (when-not (or (nil? policy)
+                  (#{:client-wins :server-wins} policy)
+                  (fn? policy))
+      (throw (ex-info "h/optimistic: :on-conflict must be :client-wins, :server-wins, or a fn"
+                      {:on-conflict policy})))))
+
+(defn- sync-optimistic!
+  "Reconcile the tab's client signal with the cursor's committed value.
+   When the committed value changed since this tab last synced, write it
+   (and the base companion, when tracked) into tab signal state — the
+   renderer patches the client — and record it as synced."
+  [app-state* tab-id st-path base-st-path cursor-val]
+  (swap! app-state*
+         (fn [state]
+           (let [synced (get-in state [:tabs tab-id :optimistic-synced st-path] ::none)]
+             (cond
+               ;; First render for this tab — the signal was just initialized
+               ;; to the committed value; nothing to patch.
+               (identical? ::none synced)
+               (assoc-in state [:tabs tab-id :optimistic-synced st-path] cursor-val)
+
+               (not= synced cursor-val)
+               (cond-> (-> state
+                           (assoc-in (into [:tabs tab-id :signals] st-path) cursor-val)
+                           (assoc-in [:tabs tab-id :optimistic-synced st-path] cursor-val))
+                 base-st-path
+                 (assoc-in (into [:tabs tab-id :signals] base-st-path) cursor-val))
+
+               :else state))))
+  nil)
+
+(defn create-optimistic
+  "Create an Optimistic pairing a scoped cursor with a derived client signal,
+   registering the signal declaration and the pairing in tab state."
+  [app-state* tab-id cursor opts]
+  (let [{:hyper/keys [scope path]} (meta cursor)
+        opts                       (or opts {})]
+    (when-not scope
+      (throw (ex-info (str "h/optimistic requires a scoped cursor — one created by "
+                           "global-cursor, session-cursor, tab-cursor, or path-cursor")
+                      {:cursor-meta (meta cursor)})))
+    (validate-optimistic-opts! opts)
+    (let [sig-path (derived-signal-path scope path)
+          st-path  (signal-store-path sig-path)]
+      ;; The same cursor wrapped again in this render must carry the same
+      ;; opts; the declaration accumulator scopes the check to this render.
+      (when-let [acc context/*declared-signals*]
+        (when (some #(= sig-path (:path %)) @acc)
+          (let [existing (get-in @app-state* [:tabs tab-id :optimistics st-path :opts])]
+            (when (not= existing opts)
+              (throw (ex-info "h/optimistic: cursor already wrapped with different options"
+                              {:signal sig-path :existing existing :opts opts}))))))
+      (let [cursor-val   @cursor
+            signal       (create-signal app-state* tab-id sig-path cursor-val)
+            base-st-path (when (versioned-policy? (:on-conflict opts))
+                           (let [base-path (base-sig-path sig-path)]
+                             (create-signal app-state* tab-id base-path cursor-val)
+                             (signal-store-path base-path)))]
+        (swap! app-state* assoc-in [:tabs tab-id :optimistics st-path]
+               {:opts opts :cursor cursor :base-st-path base-st-path})
+        (sync-optimistic! app-state* tab-id st-path base-st-path cursor-val)
+        (->Optimistic signal cursor opts)))))
+
+;; ---------------------------------------------------------------------------
+;; Committing
+;; ---------------------------------------------------------------------------
+
+(defn- override-client!
+  "Write `resolved` into the tab's client signal state (and base companion),
+   replacing the value the client reported."
+  [app-state* tab-id st-path base-st-path resolved]
+  (swap! app-state*
+         (fn [state]
+           (cond-> (-> state
+                       (assoc-in (into [:tabs tab-id :signals] st-path) resolved)
+                       (assoc-in [:tabs tab-id :optimistic-synced st-path] resolved))
+             base-st-path
+             (assoc-in (into [:tabs tab-id :signals] base-st-path) resolved))))
+  nil)
+
+(defn- commit-reported!
+  "Resolve `reported` against the optimistic's conflict policy, write the
+   result to `cursor`, and correct the client when the result differs from
+   what it reported.  Returns the committed value."
+  [app-state* tab-id st-path base-st-path cursor opts signals reported]
+  (let [base      (when base-st-path (get-in signals base-st-path))
+        committed @cursor
+        resolved  (resolve-commit (:on-conflict opts)
+                                  {:base base :committed committed :reported reported})]
+    (when (not= resolved committed)
+      (reset! cursor resolved))
+    ;; A pure rejection leaves the cursor untouched, so down-sync alone would
+    ;; never patch — override the client here.
+    (when (not= resolved reported)
+      (override-client! app-state* tab-id st-path base-st-path resolved))
+    resolved))
+
+(defn commit!
+  "Make the client-reported value of an optimistic official: run its
+   conflict policy and write the result to the backing cursor.  Returns
+   the committed value.  Action-only."
+  [^Optimistic o]
+  (let [signals context/*signals*]
+    (when-not signals
+      (throw (ex-info "commit! must be called inside an action — there are no client signals in context"
+                      {:signal (str o)})))
+    (let [sig      ^Signal (.-signal o)
+          st-path  (.-store-path sig)
+          reported (get-in signals st-path ::absent)]
+      (when (identical? ::absent reported)
+        (throw (ex-info (str "commit!: signal " o " did not accompany this request. "
+                             "File-upload actions carry form fields, not Datastar signals.")
+                        {:signal (str o) :signals (keys signals)})))
+      (let [tab-id                 (.-tab-id sig)
+            {:keys [base-st-path]} (get-in @(.-app-state* sig)
+                                           [:tabs tab-id :optimistics st-path])]
+        (commit-reported! (.-app-state* sig) tab-id st-path base-st-path
+                          (.-cursor o) (.-opts o) signals reported)))))
+
+(defn auto-commit!
+  "Commit the client-reported value for every registered auto-commit
+   optimistic whose signal rode this request's signals map."
+  [app-state* tab-id signals]
+  (doseq [[st-path {:keys [opts cursor base-st-path]}]
+          (get-in @app-state* [:tabs tab-id :optimistics])
+          :when                                        (:auto-commit? opts)]
+    (let [reported (get-in signals st-path ::absent)]
+      (when-not (identical? ::absent reported)
+        (commit-reported! app-state* tab-id st-path base-st-path
+                          cursor opts signals reported)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Connection status (static, client-only signals)

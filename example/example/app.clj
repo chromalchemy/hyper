@@ -20,6 +20,8 @@
     " · "
     [:a (h/navigate :signals) "Signals"]
     " · "
+    [:a (h/navigate :optimistic) "Optimistic"]
+    " · "
     [:a (h/navigate :effects) "Effects"]
     " · "
     [:a (h/navigate :uploads) "Uploads"]
@@ -210,6 +212,42 @@
               [:button {:data-on:click (h/expr (swap! open?* not))} "Toggle"]
               [:div {:data-show @open?* :style "display:none"}
                [:p "👋 This content is toggled by a local signal."]])))))
+
+;; ---------------------------------------------------------------------------
+;; Optimistic
+;; ---------------------------------------------------------------------------
+
+(defn optimistic-page [_]
+  (letfn [(card [title desc & children]
+            [:div.card [:h3 title] [:p.muted desc] children])]
+    (let [bar* (h/session-cursor :bar-width 40)
+          w*   (h/optimistic bar*)
+          hue* (h/optimistic (h/session-cursor :hue 200) {:auto-commit? true})]
+      (layout
+        "Optimistic"
+        [:p [:code "h/optimistic"] " pairs a cursor with a client-side signal: "
+         "the client is authoritative while you interact, the cursor at rest. "
+         "Open a second tab to watch committed values converge."]
+
+        (card "Drag, then commit on release"
+              "The bar tracks the slider every frame with zero server traffic;
+               releasing commits to the session cursor."
+              [:input {:type              "range"                   :min 0 :max 100
+                       :data-bind         w*
+                       :data-on:pointerup (h/action (h/commit! w*))}]
+              [:div {:data-attr:style
+                     (h/expr (str "width:" @w* "%;height:20px;background:#369;border-radius:4px"))}]
+              [:p "Committed (server-rendered): " [:strong @bar*] "%"])
+
+        (card "Auto-commit"
+              "With :auto-commit? every action POST persists the riding value —
+               a throttled no-op action is the entire write path."
+              [:input {:type                          "range"        :min 0 :max 360
+                       :data-bind                     hue*
+                       :data-on:input__throttle.200ms (h/action nil)}]
+              [:div {:data-attr:style
+                     (h/expr (str "height:20px;border-radius:4px;background:hsl("
+                                  @hue* ",70%,50%)"))}])))))
 
 ;; ---------------------------------------------------------------------------
 ;; Effects
@@ -511,6 +549,10 @@
     {:name  :signals
      :title "Signals"
      :get   #'signals-page}]
+   ["/optimistic"
+    {:name  :optimistic
+     :title "Optimistic"
+     :get   #'optimistic-page}]
    ["/effects"
     {:name  :effects
      :title "Effects"

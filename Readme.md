@@ -419,6 +419,131 @@ All actions use Datastar's `@post()` under the hood, so signal values are
 always available — even in actions that also use client params like `$value`,
 `$key`, etc.
 
+## Optimistic values
+
+`h/optimistic` pairs a cursor with a client-side signal: the **client is
+authoritative while the user is interacting, the cursor is authoritative at
+rest**. Use it for continuous gestures — column resize, drag positions,
+sliders — where the UI must update every frame with no server round trip,
+but the result should persist (and propagate to other tabs) like any cursor.
+
+```clojure
+(defn column [i]
+  (let [w* (h/optimistic (h/session-cursor [:cols i :width] 240))]
+    [:div.col {:data-attr:style (h/expr (str "--col-w:" @w* "px"))}
+     [:div.handle
+      {:data-on:pointermove__throttle.16ms
+       (h/expr (when $_dragging (reset! w* evt.clientX)))
+       :data-on:pointerup
+       (h/action (h/commit! w*))}]]))
+```
+
+The drag updates the signal every frame — instant paint, zero server
+traffic — and `h/commit!` persists the final value to the cursor. Because
+the DOM is driven by a signal-bound attribute, a server re-render landing
+mid-gesture cannot clobber the in-flight value.
+
+### Naming
+
+The signal name derives from the cursor — scope plus path, flattened:
+`(h/session-cursor [:cols 0 :width])` → `$sessionCols0Width`. Scope makes
+derived names collision-free (a tab and a session cursor at `:theme` yield
+`$tabTheme` and `$sessionTheme`), and self-documenting in devtools. Wrapping
+the same cursor twice yields the same signal; wrapping it with different
+options throws.
+
+### Reading and writing
+
+One rule everywhere: **deref reads what the client sees; writes decree what
+the server says.**
+
+| Context | `@opt*` | `(reset!/swap! opt* v)` |
+|---|---|---|
+| render | Datastar expression string (`"$sessionColW"`) | not allowed (render is pure) |
+| action | live client-reported value | writes the **cursor** (authoritative) |
+
+Server writes never touch the signal directly — the next render notices the
+cursor changed and patches the client. Validation is therefore a one-liner,
+commit and clamp in one motion:
+
+```clojure
+(h/action (reset! w* (clamp @w* 80 640)))
+```
+
+If the clamped value differs from what the client had, the correction flows
+down and the UI converges on the server's answer.
+
+### Committing
+
+`(h/commit! opt*)` makes the client's value official — it is
+`(reset! opt* @opt*)` plus conflict detection (below). Plain `reset!`/`swap!`
+skip detection: they are server decrees, and a decree has no base to
+conflict with. `commit!` throws if the signal did not accompany the request
+(e.g. in a file-upload action, which carries form fields instead).
+
+Pass `:auto-commit? true` to commit the reported value on **every** action
+POST from the tab. For a continuous gesture, a throttled no-op action is
+enough — the signal rides the POST:
+
+```clojure
+(let [w* (h/optimistic (h/session-cursor :sidebar-width 300)
+                       {:auto-commit? true})]
+  ...
+  {:data-on:pointermove__throttle.100ms (h/action nil)})
+```
+
+Auto-commit is trusted, raw persistence. If you need to validate or
+transform, use an explicit commit action instead.
+
+### Conflicts
+
+Commits are last-write-wins by default. Pass `:on-conflict` to handle a
+commit based on a stale value — another tab (or the server) changed the
+cursor after this client last synced:
+
+```clojure
+(h/optimistic (h/session-cursor :title "")
+              {:on-conflict :server-wins})
+```
+
+| policy | on conflict |
+|---|---|
+| `:client-wins` | reported value wins — the default, spelled out |
+| `:server-wins` | committed value wins; the client is corrected automatically |
+| `(fn [{:keys [base committed reported]}] …)` | return the value to commit |
+
+where
+
+- `:base` — the committed value the client's edit was based on
+- `:committed` — the cursor's current value
+- `:reported` — the value the client wants
+
+A conflict is `base ≠ committed`; a nil base counts as a conflict (an
+unknown base cannot prove freshness). Whenever the resolved value differs
+from what the client reported — a rejection or an adjustment — the client
+is patched back to it automatically.
+
+Detection works by value echo: hyper generates a companion signal
+(`$…Base`) holding the last committed value synced to that client; it rides
+every request like any signal, and advances automatically after each clean
+commit so the next commit stays clean. `:server-wins` and fn policies pay
+this (small) cost; `:client-wins` and the default do not.
+
+### How it works
+
+- The signal is declared with `__ifmissing` set to the cursor's **current**
+  value, so a fresh page paints committed state with no patch.
+- Every render compares the cursor against the last value synced to that
+  tab; when the server changed it (another tab's commit, a clamp, a
+  background job), a signal patch flows. Tabs sharing a session or global
+  cursor converge automatically — optimistics are multiplayer by default.
+- Values a client itself reported are never echoed back, so round-trips
+  can't snap a fast-moving gesture backwards.
+
+A tab-scoped optimistic works but adds little over a plain signal — reach
+for `h/optimistic` when the value should outlive the tab or be visible
+beyond it.
+
 ## Expressions
 
 `expr` compiles Clojure s-expressions into

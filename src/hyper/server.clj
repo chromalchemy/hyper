@@ -631,7 +631,10 @@
                    (fn [tab]
                      (-> tab
                          (update :signals merge signals)
-                         (update :client-signals merge signals)))))
+                         (update :client-signals merge signals))))
+            ;; Persist auto-commit optimistics before the action body runs,
+            ;; so cursor reads in the action see the committed value.
+            (signal/auto-commit! app-state* tab-id signals))
           (when-let [env (:hyper/env req)]
             (when tab-id
               (swap! app-state* assoc-in [:tabs tab-id :env] env)))

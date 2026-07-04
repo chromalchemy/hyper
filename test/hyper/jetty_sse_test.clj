@@ -10,12 +10,21 @@
             [hyper.core :as h]
             [hyper.state :as state])
   (:import [java.io ByteArrayOutputStream InputStream]
-           [java.net URI ServerSocket]
+           [java.net CookieManager URI ServerSocket]
            [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers
             HttpResponse$BodyHandlers]))
 
 (defn- free-port ^long []
   (with-open [s (ServerSocket. 0)] (.getLocalPort s)))
+
+(defn- cookie-client
+  "An HttpClient with a cookie jar, so page GET, SSE connect, and action
+   POSTs share one hyper session — like a real browser.  Required for any
+   test exercising session-scoped state."
+  ^HttpClient []
+  (-> (HttpClient/newBuilder)
+      (.cookieHandler (CookieManager.))
+      (.build)))
 
 (defn- sse-reader
   "Drain an SSE InputStream into a StringBuilder on a background thread.
@@ -257,6 +266,232 @@
                     "a server write back to a previously client-reported value must patch"))
               (finally
                 (stop)))))
+        (finally
+          (h/stop! stop))))))
+
+(deftest sse-optimistic-down-sync
+  (testing "a server-side cursor write behind an optimistic patches the derived
+            signal down; the initial connect carries no redundant patch"
+    (let [port    (free-port)
+          app*    (atom (state/init-state))
+          handler (h/create-handler
+                    [["/" {:name :home
+                           :get  (fn [_]
+                                   (let [w* (h/optimistic (h/session-cursor :col-w 100))]
+                                     [:div {:id "box"}
+                                      [:span {:data-text @w*}]]))}]]
+                    :app-state app*)
+          stop    (h/start! handler {:port port})
+          client  (cookie-client)
+          base    (str "http://localhost:" port)]
+      (try
+        (let [page (.body ^java.net.http.HttpResponse
+                     (GET client (str base "/?tab-id=T")
+                       (HttpResponse$BodyHandlers/ofString)))]
+          (is (str/includes? page "data-signals:session-col-w__ifmissing=\"100\"")
+              "the declaration seeds a fresh client with the committed value"))
+        (let [resp                (GET client (str base "/hyper/events?tab-id=T")
+                                    (HttpResponse$BodyHandlers/ofInputStream))
+              {:keys [text stop]} (sse-reader (.body ^java.net.http.HttpResponse resp))]
+          (try
+            (wait-until text #(str/includes? % "sessionColW") 5000)
+            ;; Server-side write to the backing session cursor.  With a
+            ;; cookie client every request shares the one session.
+            (let [session-id (first (keys (:sessions @app*)))]
+              (swap! app* assoc-in [:sessions session-id :data :col-w] 200))
+            (let [t (wait-until text #(str/includes? % "data: signals {\"sessionColW\":200}") 5000)]
+              (is (str/includes? t "data: signals {\"sessionColW\":200}")
+                  "the cursor change must patch the derived signal")
+              ;; Ordered stream: a redundant initial patch (100) would have
+              ;; arrived before the 200 patch, so its absence now is final.
+              (is (not (str/includes? t "data: signals {\"sessionColW\":100}"))
+                  "__ifmissing covers the fresh client — no redundant patch"))
+            (finally
+              (stop))))
+        (finally
+          (h/stop! stop))))))
+
+(defn- signal-events
+  "All datastar-patch-signals payload lines in an SSE transcript."
+  [t]
+  (re-seq #"data: signals \{[^\n]*\}" t))
+
+(defn- post-signals!
+  "POST an action with a JSON signal body, as Datastar's @post does."
+  [^HttpClient client base action-id body]
+  (.send client
+         (.. (HttpRequest/newBuilder
+               (URI/create (str base "/hyper/actions?action-id=" action-id)))
+             (POST (HttpRequest$BodyPublishers/ofString body))
+             (build))
+         (HttpResponse$BodyHandlers/ofString)))
+
+(defn- poll-until
+  "Poll f until pred matches or timeout; returns the last value."
+  [f pred timeout-ms]
+  (let [deadline (+ (System/currentTimeMillis) (long timeout-ms))]
+    (loop []
+      (let [v (f)]
+        (cond
+          (pred v)                                v
+          (> (System/currentTimeMillis) deadline) v
+          :else (do (Thread/sleep 25) (recur)))))))
+
+(deftest sse-optimistic-commit-and-clamp
+  (testing "a commit round trip produces no signal patch; a clamped commit
+            pushes the correction down"
+    (let [port    (free-port)
+          app*    (atom (state/init-state))
+          handler (h/create-handler
+                    [["/" {:name :home
+                           :get  (fn [_]
+                                   (let [w* (h/optimistic (h/session-cursor :col-w 100))]
+                                     [:div {:id "box"}
+                                      [:span {:data-text @w*}]
+                                      [:button {:data-on:click (h/action (h/commit! w*))} "commit"]
+                                      [:button {:data-on:click (h/action (reset! w* (min @w* 300)))} "clamp"]]))}]]
+                    :app-state app*)
+          stop    (h/start! handler {:port port})
+          client  (cookie-client)
+          base    (str "http://localhost:" port)]
+      (try
+        (let [page                 (.body ^java.net.http.HttpResponse
+                                     (GET client (str base "/?tab-id=T")
+                                       (HttpResponse$BodyHandlers/ofString)))
+              [commit-id clamp-id] (distinct (map second (re-seq #"action-id=(a_T_\d+)" page)))
+              session-id           (first (keys (:sessions @app*)))
+              resp                 (GET client (str base "/hyper/events?tab-id=T")
+                                     (HttpResponse$BodyHandlers/ofInputStream))
+              {:keys [text stop]}  (sse-reader (.body ^java.net.http.HttpResponse resp))]
+          (is (and commit-id clamp-id) "both actions render with ids")
+          (try
+            (wait-until text #(str/includes? % "sessionColW") 5000)
+            ;; 1. Clean commit — cursor moves, nothing patches back.
+            (post-signals! client base commit-id "{\"sessionColW\": 150}")
+            (is (= 150 (poll-until #(get-in @app* [:sessions session-id :data :col-w])
+                                   #(= 150 %) 5000))
+                "commit! persists the reported value")
+            ;; 2. Clamped commit — reported 900, committed (min 900 300) = 300.
+            (post-signals! client base clamp-id "{\"sessionColW\": 900}")
+            (let [t (wait-until text #(some (fn [e] (str/includes? e ":300")) (signal-events %)) 5000)]
+              (is (some #(str/includes? % ":300") (signal-events t))
+                  "the clamped value is patched down")
+              ;; Ordered stream: any echo would precede the 300 patch.
+              (is (not (some #(or (str/includes? % ":150") (str/includes? % ":900"))
+                             (signal-events t)))
+                  "neither round-tripped value is echoed back"))
+            (finally
+              (stop))))
+        (finally
+          (h/stop! stop))))))
+
+(deftest sse-optimistic-auto-commit
+  (testing "an auto-commit optimistic persists from a no-op action POST"
+    (let [port    (free-port)
+          app*    (atom (state/init-state))
+          handler (h/create-handler
+                    [["/" {:name :home
+                           :get  (fn [_]
+                                   (let [w* (h/optimistic (h/session-cursor :col-w 100)
+                                                          {:auto-commit? true})]
+                                     [:div {:id "box"}
+                                      [:span {:data-text @w*}]
+                                      [:button {:data-on:click (h/action nil)} "touch"]]))}]]
+                    :app-state app*)
+          stop    (h/start! handler {:port port})
+          client  (cookie-client)
+          base    (str "http://localhost:" port)]
+      (try
+        (let [page                (.body ^java.net.http.HttpResponse
+                                    (GET client (str base "/?tab-id=T")
+                                      (HttpResponse$BodyHandlers/ofString)))
+              action-id           (second (re-find #"action-id=(a_T_\d+)" page))
+              session-id          (first (keys (:sessions @app*)))
+              resp                (GET client (str base "/hyper/events?tab-id=T")
+                                    (HttpResponse$BodyHandlers/ofInputStream))
+              {:keys [text stop]} (sse-reader (.body ^java.net.http.HttpResponse resp))]
+          (try
+            (wait-until text #(str/includes? % "sessionColW") 5000)
+            ;; The action body is empty — the signal riding the POST is the payload.
+            (post-signals! client base action-id "{\"sessionColW\": 175}")
+            (is (= 175 (poll-until #(get-in @app* [:sessions session-id :data :col-w])
+                                   #(= 175 %) 5000))
+                "auto-commit persists without commit! in the action body")
+            ;; Fence: a server write must still patch, and no 175 echo precedes it.
+            (swap! app* assoc-in [:sessions session-id :data :col-w] 500)
+            (let [t (wait-until text #(some (fn [e] (str/includes? e ":500")) (signal-events %)) 5000)]
+              (is (some #(str/includes? % ":500") (signal-events t)))
+              (is (not (some #(str/includes? % ":175") (signal-events t)))
+                  "the auto-committed round trip is not echoed"))
+            (finally
+              (stop))))
+        (finally
+          (h/stop! stop))))))
+
+(deftest sse-optimistic-multiplayer-and-conflict
+  (testing "a commit patches other tabs on the session but never the committer;
+            a stale commit under :server-wins is rejected and the client corrected"
+    (let [port    (free-port)
+          app*    (atom (state/init-state))
+          handler (h/create-handler
+                    [["/" {:name :home
+                           :get  (fn [_]
+                                   (let [w* (h/optimistic (h/session-cursor :col-w 100)
+                                                          {:on-conflict :server-wins})]
+                                     [:div {:id "box"}
+                                      [:span {:data-text @w*}]
+                                      [:button {:data-on:click (h/action (h/commit! w*))} "commit"]]))}]]
+                    :app-state app*)
+          stop    (h/start! handler {:port port})
+          client  (cookie-client)
+          base    (str "http://localhost:" port)]
+      (try
+        (let [page-a     (.body ^java.net.http.HttpResponse
+                           (GET client (str base "/?tab-id=TA")
+                             (HttpResponse$BodyHandlers/ofString)))
+              _page-b    (GET client (str base "/?tab-id=TB")
+                           (HttpResponse$BodyHandlers/ofString))
+              commit-a   (second (re-find #"action-id=(a_TA_\d+)" page-a))
+              session-id (first (keys (:sessions @app*)))
+              resp-a     (GET client (str base "/hyper/events?tab-id=TA")
+                           (HttpResponse$BodyHandlers/ofInputStream))
+              sse-a      (sse-reader (.body ^java.net.http.HttpResponse resp-a))
+              resp-b     (GET client (str base "/hyper/events?tab-id=TB")
+                           (HttpResponse$BodyHandlers/ofInputStream))
+              sse-b      (sse-reader (.body ^java.net.http.HttpResponse resp-b))]
+          (try
+            (wait-until (:text sse-a) #(str/includes? % "sessionColW") 5000)
+            (wait-until (:text sse-b) #(str/includes? % "sessionColW") 5000)
+            ;; 1. TA commits cleanly (base = committed = 100) → 250.
+            (post-signals! client base commit-a
+                           "{\"sessionColW\": 250, \"sessionColWBase\": 100}")
+            (let [tb (wait-until (:text sse-b)
+                                 #(some (fn [e] (str/includes? e "\"sessionColW\":250")) (signal-events %)) 5000)]
+              (is (some #(str/includes? % "\"sessionColW\":250") (signal-events tb))
+                  "the other tab on the session receives the committed value"))
+            ;; 2. Fence TA with a server write; any echo of 250 would precede it.
+            (swap! app* assoc-in [:sessions session-id :data :col-w] 260)
+            (let [ta (wait-until (:text sse-a)
+                                 #(some (fn [e] (str/includes? e "\"sessionColW\":260")) (signal-events %)) 5000)]
+              (is (some #(str/includes? % "\"sessionColW\":260") (signal-events ta)))
+              (is (not (some #(str/includes? % "\"sessionColW\":250") (signal-events ta)))
+                  "the committing tab's value signal is never echoed back")
+              (is (some #(str/includes? % "\"sessionColWBase\":250") (signal-events ta))
+                  "but its base signal advances, keeping the next commit clean"))
+            ;; 3. TA commits off a stale base (100, committed now 260) → rejected.
+            (let [mark (count ((:text sse-a)))]
+              (post-signals! client base commit-a
+                             "{\"sessionColW\": 400, \"sessionColWBase\": 100}")
+              (let [tail (wait-until #(subs ((:text sse-a)) (min mark (count ((:text sse-a)))))
+                                     #(some (fn [e] (str/includes? e "\"sessionColW\":260")) (signal-events %)) 5000)]
+                (is (some #(str/includes? % "\"sessionColW\":260") (signal-events tail))
+                    "the rejected client is corrected back to the committed value")
+                (is (not (some #(str/includes? % "\"sessionColW\":400") (signal-events tail)))))
+              (is (= 260 (get-in @app* [:sessions session-id :data :col-w]))
+                  "the stale commit never lands"))
+            (finally
+              ((:stop sse-a))
+              ((:stop sse-b)))))
         (finally
           (h/stop! stop))))))
 
