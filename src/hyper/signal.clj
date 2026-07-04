@@ -454,8 +454,8 @@
 
    - `sig-patches`      map of {kebab-keyword → value} about to be sent
    - `declared-signals` declared-signal maps for this render
-   - `sent-signals`     the signals map last sent to the client (nil on
-                        the first render)"
+   - `sent-signals`     signals the client already holds — last sent merged
+                        with client-reported (nil on first render)"
   [sig-patches declared-signals sent-signals]
   (if (seq sig-patches)
     (reduce (fn [patches {:keys [path default-val]}]

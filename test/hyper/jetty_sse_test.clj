@@ -200,6 +200,66 @@
         (finally
           (h/stop! stop))))))
 
+(deftest sse-client-reported-signals-are-not-echoed
+  (testing "signal values round-tripped from an action POST are not echoed back
+            as patches, while server-initiated writes still patch down"
+    (let [port    (free-port)
+          app*    (atom (state/init-state))
+          handler (h/create-handler
+                    [["/" {:name :home
+                           :get  (fn [_]
+                                   (let [w* (h/signal :col-w 100)
+                                         n* (h/tab-cursor :n 0)]
+                                     [:div {:id "box"} "n=" @n*
+                                      [:span {:data-text @w*}]
+                                      [:button {:data-on:click (h/action (swap! n* inc))}
+                                       "+"]]))}]]
+                    :app-state app*)
+          stop    (h/start! handler {:port port})
+          client  (HttpClient/newHttpClient)
+          base    (str "http://localhost:" port)]
+      (try
+        (let [page      (.body ^java.net.http.HttpResponse
+                          (GET client (str base "/?tab-id=T")
+                            (HttpResponse$BodyHandlers/ofString)))
+              action-id (second (re-find #"action-id=(a_T_\d+)" page))]
+          (is (some? action-id) "the page renders an action with an id")
+          (let [resp                (GET client (str base "/hyper/events?tab-id=T")
+                                      (HttpResponse$BodyHandlers/ofInputStream))
+                {:keys [text stop]} (sse-reader (.body ^java.net.http.HttpResponse resp))]
+            (try
+              (wait-until text #(str/includes? % "n=0") 5000)
+              ;; 1. POST the action with a signal body, exactly like Datastar's
+              ;;    @post: the client reports colW=110 (e.g. a drag in flight).
+              (let [ar (.send client
+                              (.. (HttpRequest/newBuilder
+                                    (URI/create (str base "/hyper/actions?action-id=" action-id)))
+                                  (POST (HttpRequest$BodyPublishers/ofString "{\"colW\": 110}"))
+                                  (build))
+                              (HttpResponse$BodyHandlers/ofString))]
+                (is (= 204 (.statusCode ar)) "action POST returns 204"))
+              (wait-until text #(str/includes? % "n=1") 5000)
+              ;; 2. A server-initiated signal write must still patch down.
+              (swap! app* assoc-in [:tabs "T" :signals :col-w] 120)
+              (let [t (wait-until text #(str/includes? % "data: signals {\"colW\":120}") 5000)]
+                (is (str/includes? t "data: signals {\"colW\":120}")
+                    "a server-initiated signal write must reach the client")
+                ;; SSE is ordered: an echo of the client's own 110 would have
+                ;; arrived before the 120 patch, so its absence now is final.
+                (is (not (str/includes? t "data: signals {\"colW\":110}"))
+                    "the client-reported value must not be echoed back"))
+              ;; 3. The server writing a value the client once reported must
+              ;;    still patch — the client has since been moved to 120, so a
+              ;;    stale record of the old report must not suppress this.
+              (swap! app* assoc-in [:tabs "T" :signals :col-w] 110)
+              (let [t (wait-until text #(str/includes? % "data: signals {\"colW\":110}") 5000)]
+                (is (str/includes? t "data: signals {\"colW\":110}")
+                    "a server write back to a previously client-reported value must patch"))
+              (finally
+                (stop)))))
+        (finally
+          (h/stop! stop))))))
+
 (deftest sse-stop-is-prompt-with-open-connection
   (testing "stop! returns promptly even while an SSE connection is open"
     (let [port    (free-port)

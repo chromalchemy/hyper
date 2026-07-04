@@ -151,12 +151,10 @@
    body fragment, signal patches).  Sweeps stale actions/reactive components
    and wires up watches for new reactive components.
 
-   `last-sent-signals` is the signal snapshot last delivered to the client
-   (nil on the first render); it lets us send only the signal patches that
-   add information beyond the body fragment's `data-signals:NAME__ifmissing`
-   declarations.
+   `known-signals` is what the client already holds (last sent merged with
+   client-reported; nil on first render) — only patches beyond it are sent.
    Returns true/nil on success, false when the connection is closed."
-  [app-state* session-id tab-id sig-patches last-sent-signals
+  [app-state* session-id tab-id sig-patches known-signals
    trigger-render! enqueue-partial! os br-out br-stream]
   (when-let [render-result (render/render-tab app-state* session-id tab-id)]
     (if (:status render-result)
@@ -187,7 +185,7 @@
               ;; client-side state it builds from the DOM (e.g. checkbox-array
               ;; signals, issue #44).
               sig-patches  (signal/drop-ifmissing-covered-patches
-                             sig-patches declared-signals last-sent-signals)
+                             sig-patches declared-signals known-signals)
               sig-event    (when (seq sig-patches)
                              (signal/format-patch-signals-event sig-patches))
               sse-payload  (str head-event body-event sig-event)]
@@ -207,6 +205,20 @@
                  :data {:hyper/tab-id tab-id}}
                 e)
       nil)))
+
+(defn- drain-client-signals!
+  "Atomically remove and return this tab's client-reported signals together
+   with its current signal state.  Returns [client-reported current-signals]."
+  [app-state* tab-id]
+  ;; Consumed, not kept — a stale report must not suppress a later server
+  ;; write back to the same value.
+  (let [[old new] (swap-vals! app-state*
+                              (fn [state]
+                                (if (get-in state [:tabs tab-id :client-signals])
+                                  (update-in state [:tabs tab-id] dissoc :client-signals)
+                                  state)))]
+    [(get-in old [:tabs tab-id :client-signals])
+     (get-in new [:tabs tab-id :signals])]))
 
 (defn- -renderer-loop!
   "Render loop for a single tab, run inside the SSE response's
@@ -263,33 +275,39 @@
                     (recur last-sent-signals)))
 
                 :else
-                (let [current-signals (get-in @app-state* [:tabs tab-id :signals])
-                      sig-patches     (when (and current-signals
-                                                 (not= current-signals last-sent-signals))
-                                        (signal/changed-signals last-sent-signals current-signals))
-                      sent?           (try
-                                        (if (and (seq dirty-ids)
-                                                 (not full-render?)
-                                                 (not (seq sig-patches)))
-                                          (handle-partial-render app-state* tab-id dirty-ids
-                                                                 os br-out br-stream)
-                                          (handle-full-render app-state* session-id tab-id sig-patches
-                                                              last-sent-signals
-                                                              trigger-render! enqueue-partial!
-                                                              os br-out br-stream))
-                                        (catch Throwable e
-                                          (t/error! {:id   :hyper.error/renderer
-                                                     :msg  "Error rendering page"
-                                                     :data {:hyper/tab-id tab-id}}
-                                                    e)
-                                          nil))
-                      script-sent?    (send-pending-scripts! scripts tab-id
-                                                             os br-out br-stream)]
+                (let [[client-reported
+                       current-signals] (drain-client-signals! app-state* tab-id)
+                      ;; Diff against what the client already holds (last sent
+                      ;; + client-reported) so round-trips aren't echoed back.
+                      known-signals     (if client-reported
+                                          (merge last-sent-signals client-reported)
+                                          last-sent-signals)
+                      sig-patches       (when (and current-signals
+                                                   (not= current-signals known-signals))
+                                          (signal/changed-signals known-signals current-signals))
+                      sent?             (try
+                                          (if (and (seq dirty-ids)
+                                                   (not full-render?)
+                                                   (not (seq sig-patches)))
+                                            (handle-partial-render app-state* tab-id dirty-ids
+                                                                   os br-out br-stream)
+                                            (handle-full-render app-state* session-id tab-id sig-patches
+                                                                known-signals
+                                                                trigger-render! enqueue-partial!
+                                                                os br-out br-stream))
+                                          (catch Throwable e
+                                            (t/error! {:id   :hyper.error/renderer
+                                                       :msg  "Error rendering page"
+                                                       :data {:hyper/tab-id tab-id}}
+                                                      e)
+                                            nil))
+                      script-sent?      (send-pending-scripts! scripts tab-id
+                                                               os br-out br-stream)]
                   ;; sent? is true (ok), nil (no render-fn or error), false (connection closed)
                   ;; script-sent? follows the same convention
                   (when-not (or (false? sent?) (false? script-sent?))
                     (Thread/sleep throttle-ms)
-                    (recur (or current-signals last-sent-signals)))))))))
+                    (recur (or current-signals known-signals)))))))))
       (catch Throwable e
         (t/error! {:id   :hyper.error/renderer
                    :msg  "Error rendering page"
@@ -603,13 +621,17 @@
               ;; Sync client signal values into server state so the
               ;; render loop can detect changes (e.g. when a user types
               ;; into a data-bind input, the server needs to know the
-              ;; latest value for changed-signals diffing).
+              ;; latest value for changed-signals diffing).  Recording
+              ;; them under :client-signals too keeps the render loop
+              ;; from echoing them back as patches.
               action-data    (get-in @app-state* [:actions action-id])
               tab-id         (:tab-id action-data)]
           (when (and signals tab-id)
-            (swap! app-state* update-in [:tabs tab-id :signals]
-                   (fn [server-sigs]
-                     (merge server-sigs signals))))
+            (swap! app-state* update-in [:tabs tab-id]
+                   (fn [tab]
+                     (-> tab
+                         (update :signals merge signals)
+                         (update :client-signals merge signals)))))
           (when-let [env (:hyper/env req)]
             (when tab-id
               (swap! app-state* assoc-in [:tabs tab-id :env] env)))
