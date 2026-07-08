@@ -593,7 +593,7 @@
                    (assoc m sym (client-params/client-param sym)))
                  {}))))
 
-(defmacro action
+(defmacro ^{:hyper/datastar-expr true} action
   "Create a server action expression for use in Datastar event attributes.
    Returns a Datastar expression string that can be bound to any event.
 
@@ -622,6 +622,11 @@
      ;; ... with client side check
      [:input {:data-on:keydown (action {:when \"evt.key === 'Enter'\"}
                                  (search!))}]
+
+     ;; :when is sugar — an action returns a Datastar expression that composes
+     ;; inside `expr`, so the guard above is equivalent to:
+     [:input {:data-on:keydown (expr (when (= evt.key \"Enter\")
+                                       (action (search!))))}]
 
      ;; Named action for testing — :as gives the action a human-readable name
      ;; that hyper.test/test-page uses as the key in its :actions map
@@ -661,6 +666,8 @@
                         (some? guard)   guard)]
             [js (:as maybe-opts) (:upload maybe-opts) (:key maybe-opts) body])
           [nil nil nil nil args])
+        _                   (when (and opts-map? (contains? maybe-opts :when))
+                              (actions/warn-deprecated-when!))
         used-params         (find-client-params body)
         param-syms          (keys used-params)
         ;; Multipart params ($form/$files) switch the action to a file-upload
@@ -726,6 +733,13 @@
 
      [:input {:data-on:keydown
               (expr (when (= evt.key \"Enter\") (@post \"/search\")))}]
+
+   A server `action` composes as a client-side value — it registers at render
+   time and contributes its raw @post(...), so it can be gated by client-side
+   control flow (subsuming the action `:when` guard):
+
+     [:input {:data-on:keydown
+              (expr (when (= evt.key \"Enter\") (action (search! @query*))))}]
 
    Locals splice automatically; evt/el/$signals/JS interop pass through
    to the client.  Canonical documentation: hyper.expr/->expr."

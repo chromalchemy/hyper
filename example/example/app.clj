@@ -128,7 +128,8 @@
               "Await the Enter keystroke to send the input value to the server."
               [:input {:type            "text"
                        :placeholder     "Type something…"
-                       :data-on:keydown (h/action {:when "evt.key === 'Enter'"} (reset! (h/tab-cursor :value) $value))}]
+                       :data-on:keydown (h/expr (when (= $key "Enter")
+                                                  (h/action (reset! (h/tab-cursor :value) $value))))}]
               (result "Server sees: " (if (seq @value*) @value* "nothing yet")))
 
         ;; $form-data — form submission

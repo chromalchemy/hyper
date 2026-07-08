@@ -19,6 +19,7 @@
             [clojure.string :as str]
             [dev.onionpancakes.chassis.core :as c]
             [hyper.context :as context]
+            [hyper.datastar :as datastar]
             [hyper.utils :as utils]))
 
 ;; ---------------------------------------------------------------------------
@@ -258,6 +259,21 @@
   Optimistic
   (attribute-value-fragment [this]
     (.-sig-name (optimistic-signal this))))
+
+;; ---------------------------------------------------------------------------
+;; Datastar expression protocol
+;; ---------------------------------------------------------------------------
+;; A signal spliced into an `h/expr` contributes its Datastar reference
+;; ("$userName"), the same string `js-ref` yields.  Implementing DatastarExpr
+;; lets `hyper.expr/splice` treat signals and actions through one dispatch.
+
+(extend-protocol datastar/DatastarExpr
+  Signal
+  (-datastar-js [this] (js-ref this))
+  LocalSignal
+  (-datastar-js [this] (js-ref this))
+  Optimistic
+  (-datastar-js [this] (js-ref this)))
 
 ;; ---------------------------------------------------------------------------
 ;; Signal construction

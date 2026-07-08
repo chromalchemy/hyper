@@ -262,18 +262,21 @@ an EDN map with keys :x and :y.
 
 ### Client-side guards
 
-Pass a `:when` option to `action` to inject a client-side Datastar expression.
-The guard runs before the action fires, letting you filter events at the browser level without a server round-trip.
+Gate an action with a client-side condition by embedding it in
+[`expr`](#expressions): the action only fires when the condition holds, with
+no network traffic otherwise.
 
 ```clojure
 ;; Only POST when Enter is pressed — no network traffic on other keystrokes
 [:input {:type "text"
-         :data-on:keydown (h/action {:when (h/expr (= evt.key "Enter"))}
-                           (reset! (h/tab-cursor :value) $value))}]
+         :data-on:keydown (h/expr (when (= $key "Enter")
+                                    (h/action (reset! (h/tab-cursor :value) $value))))}]
 ```
 
-The guard is any Datastar expression — build it with [`expr`](#expressions)
-as above, or pass a raw string (`{:when "evt.key === 'Enter'"}`).
+`expr` understands the same client-param vocabulary as `action` (`$key`,
+`$value`, …), so the guard reads naturally. The embedded action registers at
+render time and contributes its `@post(…)` — see
+[Actions inside expressions](#actions-inside-expressions).
 
 ## Signals
 
@@ -581,6 +584,8 @@ decides where code runs, not the syntax.
 | `@sig` | Signal reference (`$name`) |
 | `(:kw m)` keyword calls | Evaluated as Clojure, spliced as literals |
 | `~form` | Explicit splice (escape hatch for arbitrary Clojure) |
+| `(h/action …)` | Registers at render time; contributes its raw `@post(…)` |
+| Client params (`$value`, `$key`, `$checked`, `$detail`, `$form-data`) | Expand to their client-side JS accessor — e.g. `$key` → `evt.key` |
 | `$signals`, `evt`, `el`, `(@post "/x")`, JS interop | Pass through to the client |
 
 Compilation happens at macro-expansion time (via the same embedded
@@ -589,12 +594,47 @@ Compilation happens at macro-expansion time (via the same embedded
 string interpolation of spliced values only. Output is dependency-free
 JavaScript suitable for Datastar's sandboxed evaluator.
 
-`expr` also works in `action`'s `:when` guard:
+### Actions inside expressions
+
+A server `action` composes as a client-side value: embedded in `expr`, it
+registers at render time and contributes its `@post(…)`, so you can gate it
+with ordinary client-side control flow — no server round-trip until the
+condition holds:
 
 ```clojure
-[:input {:data-on:keydown (h/action {:when (h/expr (= evt.key "Enter"))}
-                            (search! $value))}]
+[:input {:data-on:keydown (h/expr (when (= $key "Enter")
+                                    (h/action (search! $value))))}]
 ```
+
+This is the idiomatic way to guard an action — see
+[Client-side guards](#client-side-guards).
+
+### Client params in expressions
+
+`expr` understands the same **client-param** vocabulary as `action` — the
+`$`-symbols that read from the DOM event: `$value`, `$checked`, `$key`,
+`$detail`, `$form-data`, plus any you register via
+`hyper.client-params/client-param`. Inside `expr` they expand to their
+client-side JS accessor (there is no server round-trip, so only the accessor
+is emitted):
+
+```clojure
+(h/expr (= $key "Enter"))        ;; → (evt.key) === ("Enter")
+(h/expr (reset! query* $value))  ;; → $query = evt.target.value
+```
+
+Each layer keeps its own semantics when they nest — the guard's `$key` is
+client-side, while the embedded action's `$value` still rides the server
+round-trip:
+
+```clojure
+[:input {:data-on:keydown (h/expr (when (= $key "Enter")
+                                    (h/action (reset! (h/tab-cursor :q) $value))))}]
+```
+
+> **Precedence:** these registry names win over the raw `$signal`
+> passthrough, so a signal literally named `value` must be referenced via its
+> signal object (`@value*`), not the raw `$value` symbol.
 
 It covers the simple, obvious expressions a human would write; it is
 possible to construct forms that compile to broken JavaScript. Raw strings
@@ -2453,11 +2493,14 @@ making it easy to find and invoke specific actions in tests:
 ```
 
 Without `:as`, actions are keyed by their auto-generated action ID. `:as` can
-be combined with `:when`:
+be combined with other options such as `:key`:
 
 ```clojure
-(h/action {:as "search" :when (h/expr (= evt.key "Enter"))} (search! $value))
+(h/action {:as "delete" :key (:id node)} (delete! (:id node)))
 ```
+
+To gate an action on a client-side condition, embed it in `expr` — see
+[Client-side guards](#client-side-guards).
 
 ### `test-action`
 

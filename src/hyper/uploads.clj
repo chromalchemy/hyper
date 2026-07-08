@@ -37,6 +37,7 @@
    directly for richer (e.g. per-file) status."
   (:require [camel-snake-kebab.core :as csk]
             [hyper.actions :as actions]
+            [hyper.datastar :as datastar]
             [hyper.signal :as signal]))
 
 ;; ---------------------------------------------------------------------------
@@ -88,11 +89,15 @@
   "Dispatch used by the `action` macro: when the body uses a multipart param
    ($form/$files) emit an upload expression; otherwise the normal @post action
    expression.  `used-params` is the sym->definition map collected by the
-   macro."
+   macro.
+
+   Returns a `hyper.datastar/RawExpr` so the result both renders as an HTML
+   attribute value and splices as raw JS inside `h/expr`."
   [action-id used-params guard-js base-path upload-ref]
-  (if-let [mp (some (fn [[_ d]] (when (:multipart? d) d)) used-params)]
-    (build-upload-expr action-id (:js mp) upload-ref base-path guard-js)
-    (actions/build-action-expr action-id used-params guard-js base-path)))
+  (datastar/raw-expr
+    (if-let [mp (some (fn [[_ d]] (when (:multipart? d) d)) used-params)]
+      (build-upload-expr action-id (:js mp) upload-ref base-path guard-js)
+      (actions/build-action-expr action-id used-params guard-js base-path))))
 
 ;; ---------------------------------------------------------------------------
 ;; Server-side multipart parsing
