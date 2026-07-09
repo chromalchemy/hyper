@@ -36,8 +36,7 @@
   cheshire/cheshire                   {:mvn/version "6.1.0"}
 
   ;; Client-side component compilation (CLJS-dialect -> JS)
-  io.github.squint-cljs/squint        {:git/tag "v0.9.184"
-                                       :git/sha "cfcfe020a2e220f371189188f5c305e6705a84f6"}
+  io.github.squint-cljs/squint        {:mvn/version "0.14.203"}
 
   ;; Logging
   com.taoensso/telemere               {:mvn/version "1.2.1"}}
