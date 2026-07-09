@@ -1,0 +1,7 @@
+{:min-bb-version "1.0.0"
+ :paths ["bb"]
+ :tasks
+ {release
+  {:doc "Stamp CHANGELOG.md, commit, and tag a release. Usage: bb release <patch|minor|major|X.Y.Z> [--retag] [--push]"
+   :requires ([release])
+   :task (release/-main *command-line-args*)}}}

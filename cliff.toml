@@ -2,16 +2,11 @@
 # Docs: https://git-cliff.org/docs/configuration
 
 [changelog]
-# The header is emitted once at the top of CHANGELOG.md. Release notes
-# generated for GitHub use `--strip header`, so this preamble is excluded
-# from the per-release output.
-header = """
-# Changelog
-
-All notable changes to hyper are documented here.
-Commit messages follow [Conventional Commits](https://conventionalcommits.org).
-
-"""
+# No generated header. CHANGELOG.md keeps its own hand-written preamble, and
+# the release task (`bb release`) inserts each new section beneath it. An empty
+# header stops git-cliff from duplicating a preamble every time it stamps a
+# release.
+header = ""
 body = """
 {% if version %}\
 ## {{ version | trim_start_matches(pat="v") }} — {{ timestamp | date(format="%Y-%m-%d") }}
@@ -42,6 +37,9 @@ sort_commits = "newest"
 # Map commit-message prefixes to changelog sections.
 # Anything unmatched falls through into "Other".
 commit_parsers = [
+  # Drop the release task's own changelog commits so they never show up as
+  # entries in a later release.
+  { message = "^docs: changelog for v", skip = true },
   { message = "^feat",         group = "Features" },
   { message = "^fix",          group = "Bug Fixes" },
   { message = "^perf",         group = "Performance" },
