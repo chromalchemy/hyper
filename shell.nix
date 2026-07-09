@@ -23,6 +23,9 @@ mkShell {
     cljfmt
     clj-kondo
     neil
+    # Renders Conventional Commits into CHANGELOG.md / release notes.
+    # Preview locally with: `git cliff --unreleased` or `git cliff --latest`.
+    git-cliff
   ];
   PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.browsers}";
   PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH = "${pkgs.playwright-driver.browsers}/chromium_headless_shell-${pkgs.playwright-driver.browsersJSON.chromium-headless-shell.revision}/chrome-headless-shell-${suffix}/chrome-headless-shell";
