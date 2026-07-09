@@ -70,6 +70,12 @@ Hyper is in active alpha development and used in internal projects at Dynamic
 Alpha. The API is evolving rapidly — expect bugs and breakage until a 1.0
 release.
 
+**Versioning:** until `1.0.0`, hyper does not follow semantic versioning.
+We are still exploring the best API, so any `0.x` release may introduce
+breaking changes as it stabilizes. We'll call out breaking changes in the
+[CHANGELOG](CHANGELOG.md), but pin an exact version and read the changelog
+before upgrading. Once the API settles we'll ship `1.0.0` and adopt semver.
+
 We're building in the open to share with the Clojure community. Feedback and
 contributions are welcome.
 
