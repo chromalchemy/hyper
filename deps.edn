@@ -52,4 +52,11 @@
          :exec-fn     kaocha.runner/exec-fn
          :exec-args   {:randomize? false
                        :fail-fast? true}}
-  :dev  {:extra-deps {io.github.tonsky/clj-reload {:mvn/version "1.0.0"}}}}}
+  :dev  {:extra-deps {io.github.tonsky/clj-reload {:mvn/version "1.0.0"}}}
+
+  ;; Build, install, deploy. See dev/build.clj.
+  ;; Invoke with: clj -T:build <task>
+  :build {:deps       {io.github.clojure/tools.build {:git/tag "v0.10.7" :git/sha "573711e"}
+                       slipset/deps-deploy           {:mvn/version "0.2.3"}}
+          :paths      ["dev"]
+          :ns-default build}}}

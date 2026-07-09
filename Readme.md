@@ -1,6 +1,8 @@
 # Hyper
 
 [![CI](https://github.com/dynamic-alpha/hyper/actions/workflows/ci.yaml/badge.svg)](https://github.com/dynamic-alpha/hyper/actions/workflows/ci.yaml)
+[![Clojars Project](https://img.shields.io/clojars/v/ai.dyal/hyper.svg)](https://clojars.org/ai.dyal/hyper)
+[![cljdoc](https://cljdoc.org/badge/ai.dyal/hyper)](https://cljdoc.org/d/ai.dyal/hyper)
 
 A reactive server-rendered web framework for Clojure built on
 [Datastar](https://data-star.dev/) and
@@ -73,13 +75,19 @@ contributions are welcome.
 
 ## Installation
 
-We eventually intend to publish to Clojars, however while we are rapidly
-evolving the project we recommend to install via a :git/url instead. Make sure
-to grab the latest SHA.
+Hyper is published to [Clojars](https://clojars.org/ai.dyal/hyper). Add it to
+your `deps.edn`:
 
 ```clojure
-{dynamic-alpha/hyper {:git/url "https://github.com/dynamic-alpha/hyper"
-                      :git/sha "..."}}
+ai.dyal/hyper {:mvn/version "0.1.0"}
+```
+
+The project is evolving rapidly — if you want to track unreleased changes, you
+can depend on a `:git/sha` instead (grab the latest SHA):
+
+```clojure
+{ai.dyal/hyper {:git/url "https://github.com/dynamic-alpha/hyper"
+                :git/sha "..."}}
 ```
 
 ## Requirements

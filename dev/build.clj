@@ -1,0 +1,115 @@
+(ns build
+  "Build, install, and deploy tasks for ai.dyal/hyper.
+
+  Common entry points:
+    clj -T:build jar         ; build target/hyper-<version>.jar
+    clj -T:build install     ; install to ~/.m2 for local consumption
+    clj -T:build deploy      ; publish to Clojars
+    clj -T:build clean       ; rm -rf target
+
+  Version resolution order:
+    1. :version key on the CLI (e.g. clj -T:build deploy :version '\"0.1.0\"')
+    2. VERSION env var
+    3. default-version below (snapshot)
+
+  Deploy credentials (only required for `deploy`):
+    CLOJARS_USERNAME — your Clojars username
+    CLOJARS_PASSWORD — a Clojars deploy token (NOT your account password).
+                       Create one at https://clojars.org/tokens and scope it
+                       to ai.dyal/* for least-privilege."
+  (:require [clojure.string :as str]
+            [clojure.tools.build.api :as b]
+            [deps-deploy.deps-deploy :as dd]))
+
+(def lib              'ai.dyal/hyper)
+(def default-version  "0.1.0-SNAPSHOT")
+(def class-dir        "target/classes")
+(def src-dirs         ["src" "resources"])
+(def github-url       "https://github.com/dynamic-alpha/hyper")
+
+(defn- resolve-version [opts]
+  (or (:version opts)
+      (System/getenv "VERSION")
+      default-version))
+
+(defn- jar-file [version]
+  (format "target/%s-%s.jar" (name lib) version))
+
+(defn- scm-tag
+  "Resolve the value for the pom's <scm><tag>.
+
+  For tagged releases (non-SNAPSHOT) we use the conventional `v<version>` tag —
+  the Release workflow pushes that tag, so cljdoc can clone the repo at the
+  exact source published to Clojars.
+
+  For SNAPSHOT builds there is no matching tag in git, so we fall back to the
+  current commit SHA. That keeps the <scm> block resolvable on every deploy
+  (cljdoc otherwise reports SCM info as broken/missing when the tag 404s on
+  GitHub)."
+  [version]
+  (if (str/ends-with? version "-SNAPSHOT")
+    (b/git-process {:git-args "rev-parse HEAD"})
+    (str "v" version)))
+
+(defn- pom-data [version]
+  [[:description "A reactive server-rendered web framework for Clojure built on Datastar and Reitit."]
+   [:url         github-url]
+   [:licenses
+    [:license
+     [:name "MIT License"]
+     [:url  "https://opensource.org/licenses/MIT"]]]
+   [:developers
+    [:developer
+     [:name "Dynamic Alpha Technologies Inc."]]]
+   [:scm
+    [:url                 github-url]
+    [:connection          "scm:git:https://github.com/dynamic-alpha/hyper.git"]
+    [:developerConnection "scm:git:ssh://git@github.com/dynamic-alpha/hyper.git"]
+    [:tag                 (scm-tag version)]]])
+
+(defn clean
+  "Remove the build output directory."
+  [_]
+  (b/delete {:path "target"}))
+
+(defn jar
+  "Build the library jar in target/. Returns opts augmented with :version and :jar-file."
+  [opts]
+  (let [version (resolve-version opts)
+        jar     (jar-file version)
+        basis   (b/create-basis {:project "deps.edn"})]
+    (clean nil)
+    (b/write-pom {:class-dir class-dir
+                  :lib       lib
+                  :version   version
+                  :basis     basis
+                  :src-dirs  src-dirs
+                  :pom-data  (pom-data version)})
+    (b/copy-dir {:src-dirs   src-dirs
+                 :target-dir class-dir})
+    (b/jar {:class-dir class-dir
+            :jar-file  jar})
+    (println "Built" jar)
+    (assoc opts :version version :jar-file jar)))
+
+(defn install
+  "Install the jar into the local Maven repo (~/.m2)."
+  [opts]
+  (let [{:keys [version jar-file]} (jar opts)
+        basis                      (b/create-basis {:project "deps.edn"})]
+    (b/install {:basis     basis
+                :lib       lib
+                :version   version
+                :jar-file  jar-file
+                :class-dir class-dir})
+    (println "Installed" lib version "→ ~/.m2")))
+
+(defn deploy
+  "Build and deploy the jar to Clojars.
+  Requires CLOJARS_USERNAME and CLOJARS_PASSWORD in the environment."
+  [opts]
+  (let [{:keys [version jar-file]} (jar opts)]
+    (dd/deploy {:installer :remote
+                :artifact  jar-file
+                :pom-file  (b/pom-path {:lib lib :class-dir class-dir})})
+    (println "Deployed" lib version "→ Clojars")))

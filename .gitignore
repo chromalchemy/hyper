@@ -5,3 +5,5 @@
 .envrc
 /.lsp/
 .direnv/
+/target/
+/classes/
