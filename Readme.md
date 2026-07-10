@@ -199,16 +199,14 @@ resulting state changes trigger re-renders for the appropriate tabs.
 
 ### Action identity
 
-During action execution, `context/*action-name*` is bound to the `:as` value of
-the currently running action (or `nil` if the action was not given an `:as`
-name). This lets utility functions identify which action is running without the
-caller having to pass the name explicitly:
+During action execution, `(h/action-name)` returns the `:as` value of the
+currently running action (or `nil` if the action was not given an `:as`
+name). This lets utility functions identify which action is running without
+the caller having to pass the name explicitly:
 
 ```clojure
-(require '[hyper.context :as context])
-
 (defn audit! []
-  (log/info "Action executed" {:action context/*action-name*
+  (log/info "Action executed" {:action (h/action-name)
                                 :user   @(h/session-cursor :user)}))
 
 (h/action {:as "delete-user"}
@@ -255,13 +253,13 @@ Example usage:
 
 When `$` symbols appear in the action body, the macro automatically generates a `fetch()` call instead of `@post()`, sending the extracted values as a JSON body. On the server, the action function receives these values bound to the corresponding `$` symbols.
 
-Additional symbols can be defined by extending the `hyper.client-params/client-param` multimethod.
+Additional symbols can be defined by extending the `h/client-param` multimethod.
 
 For example, if you were handling mouse events, you might want to create support for tracking
 the x and y offset.
 
 ```clojure
-(defmethod hyper.client-params/client-param '$mouse-offset
+(defmethod h/client-param '$mouse-offset
   [_]
   {:js "{x:evt.offsetX, y:evt.offsetY}"
    :key "mouseOffset"})
@@ -627,8 +625,8 @@ This is the idiomatic way to guard an action — see
 
 `expr` understands the same **client-param** vocabulary as `action` — the
 `$`-symbols that read from the DOM event: `$value`, `$checked`, `$key`,
-`$detail`, `$form-data`, plus any you register via
-`hyper.client-params/client-param`. Inside `expr` they expand to their
+`$detail`, `$form-data`, plus any you register via `h/client-param`.
+Inside `expr` they expand to their
 client-side JS accessor (there is no server round-trip, so only the accessor
 is emitted):
 
@@ -652,8 +650,7 @@ round-trip:
 
 It covers the simple, obvious expressions a human would write; it is
 possible to construct forms that compile to broken JavaScript. Raw strings
-remain supported everywhere expressions are accepted. The canonical
-namespace is `hyper.expr` (`->expr`); `h/expr` is a re-export.
+remain supported everywhere expressions are accepted.
 
 ## Effects
 
@@ -816,8 +813,8 @@ to upload the moment a file is chosen:
 
 You may use at most one file param per action, and not mixed with other client
 params (`$value`, etc.). File extraction is extensible like any client param —
-define a `:multipart? true` method on `hyper.client-params/client-param` whose
-`:js` returns a `FormData` (e.g. a drop zone reading `evt.dataTransfer.files`).
+define a `:multipart? true` method on `h/client-param` whose `:js` returns a
+`FormData` (e.g. a drop zone reading `evt.dataTransfer.files`).
 
 ### Status and progress — the `:upload` ref
 
@@ -923,10 +920,10 @@ should run before (or around) the render function. Middleware follows the same
       {:status 302 :headers {"Location" "/login"} :body ""})))
 ```
 
-Middleware runs inside the render context — `context/*request*` is bound, cursors
-work, and the full Ring request (cookies, headers, query-params) is available on
-initial page loads. On SSE re-renders, a minimal synthetic request is passed
-instead, but cursors and app-state are always available.
+Middleware runs inside the render context — cursors work, and the full Ring
+request (cookies, headers, query-params) is available on initial page loads.
+On SSE re-renders, a minimal synthetic request is passed instead, but cursors
+and app-state are always available.
 
 Returning a Ring response map from middleware (e.g. `{:status 302 ...}`)
 short-circuits the render. On initial HTTP requests this produces a normal
@@ -1305,8 +1302,8 @@ navbars and breadcrumbs:
    [:h1 "Home"]])
 ```
 
-You can also read it from `context/*request*` inside actions or anywhere within
-the request context — the value is always consistent with the tab's current
+You can also read it from `(h/route)` inside actions or anywhere within the
+request context — the value is always consistent with the tab's current
 route.
 
 ### Parameter coercion
@@ -1369,9 +1366,8 @@ when client-side navigation hits a dead URL. Override it with `:not-found`, a
     :not-found #'not-found-page))
 ```
 
-Pass a Var to pick up REPL redefinitions without restarting. The default lives
-at `hyper.render.error/not-found`. Pass `:not-found nil` to disable the feature
-and fall back to Reitit's plain-text 404.
+Pass a Var to pick up REPL redefinitions without restarting. Pass `:not-found
+nil` to disable the feature and fall back to Reitit's plain-text 404.
 
 ## Suppress hyper wrapping certain endpoints
 
@@ -1554,12 +1550,10 @@ disconnect leaves watches in place, so a reconnect does not re-run their setup.
 
 By default, `watch!` works with anything that implements `clojure.lang.IRef`
 (atoms, refs, agents, vars). For custom external sources, extend
-`hyper.protocols/Watchable`:
+`h/Watchable`:
 
 ```clojure
-(require '[hyper.protocols :as proto])
-
-(extend-protocol proto/Watchable
+(extend-protocol h/Watchable
   my.db/QueryResult
   (-add-watch [this key callback]
     ;; callback is (fn [old-val new-val])
@@ -1836,7 +1830,7 @@ handlers the linter cannot identify statically.
 
 Most hyper UIs need no client-side code at all — but some islands genuinely
 do: charts, editors, maps, anything built on a JavaScript library that owns
-its own DOM. `hyper.component/defc` lets you author those islands as
+its own DOM. `h/defc` lets you author those islands as
 **web components** written in a ClojureScript dialect
 ([Squint](https://github.com/squint-cljs/squint)), compiled to JavaScript
 **on the JVM at macro-expansion time** — no Node, no build step, no npm.
@@ -2044,10 +2038,6 @@ Hyper ships clj-kondo config (see [clj-kondo](#clj-kondo)) that validates
 `defc` structure at lint time and makes attrs, `emit`, and `ctx` resolve
 inside segments.
 
-`h/defc` is a re-export; the canonical namespace is `hyper.component`,
-which also houses the lower-level API (`register-component!`, `attrs`,
-the bundle registry).
-
 For self-hosted/air-gapped deploys, override the Squint runtime CDN URL
 with the `:squint-core-url` option on `create-handler`.
 
@@ -2083,13 +2073,12 @@ Editors learn this differently:
 
   ```clojure
   {:extra-indents
-   {defc                 [[:block 1] [:inner 1]]
-    hyper.core/defc      [[:block 1] [:inner 1]]
-    hyper.component/defc [[:block 1] [:inner 1]]}}
+   {defc            [[:block 1] [:inner 1]]
+    hyper.core/defc [[:block 1] [:inner 1]]}}
   ```
 
   The unqualified entry covers `defc` called via `:refer`; the qualified
-  entries cover `h/defc` / `component/defc`.
+  entry covers `h/defc`.
 
 ## Batched cursor updates
 

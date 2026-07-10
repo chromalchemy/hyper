@@ -1,4 +1,4 @@
-(ns hyper.datastar
+(ns ^:no-doc hyper.datastar
   "The Datastar-expression boundary type.
 
    `RawExpr` wraps a finished Datastar/JS expression string (e.g. the

@@ -1,4 +1,4 @@
-(ns hyper.render.error
+(ns ^:no-doc hyper.render.error
   "Built-in error renderers for use as the `:render-error` option on
    `hyper.core/create-handler`.
 

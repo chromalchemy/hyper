@@ -1,4 +1,4 @@
-(ns hyper.client-params
+(ns ^:no-doc hyper.client-params
   "Client parameters are special symbols that can appear in the body
   of the hyper.core/action macro, allowing server-side event handlers
   to access data collected from the client event handler.

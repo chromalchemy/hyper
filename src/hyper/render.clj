@@ -1,4 +1,4 @@
-(ns hyper.render
+(ns ^:no-doc hyper.render
   "Rendering pipeline.
 
    Handles rendering hiccup to HTML and formatting Datastar SSE events."

@@ -1,4 +1,4 @@
-(ns hyper.lifecycle
+(ns ^:no-doc hyper.lifecycle
   "View lifecycle vocabulary shared across page handlers (and, later,
    reactive sub-regions and async workers).
 

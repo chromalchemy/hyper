@@ -1,4 +1,4 @@
-(ns hyper.context
+(ns ^:no-doc hyper.context
   "Request context and dynamic vars for hyper applications.
 
    Lives in a low-level namespace so that both render.clj and core.clj

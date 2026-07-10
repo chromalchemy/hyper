@@ -1,4 +1,4 @@
-(ns hyper.server
+(ns ^:no-doc hyper.server
   "HTTP server, routing, and middleware.
 
    Provides Ring handler creation for hyper applications."

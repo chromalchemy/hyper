@@ -1,4 +1,4 @@
-(ns hyper.signal
+(ns ^:no-doc hyper.signal
   "Client-side Datastar signals for hyper.
 
    Signals are reactive client-side variables backed by Datastar's signal

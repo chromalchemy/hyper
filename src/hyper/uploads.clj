@@ -1,4 +1,4 @@
-(ns hyper.uploads
+(ns ^:no-doc hyper.uploads
   "Multipart file uploads for hyper actions.
 
    An upload is just an `h/action` whose body uses a file client param ($form

@@ -1,4 +1,4 @@
-(ns hyper.expr
+(ns ^:no-doc hyper.expr
   "Clojure → Datastar expression transpiler.
 
    Write Datastar (data-*) expressions as s-expressions with hyper's own

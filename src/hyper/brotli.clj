@@ -1,4 +1,4 @@
-(ns hyper.brotli
+(ns ^:no-doc hyper.brotli
   "Brotli compression for HTTP responses and SSE streams.
 
    Provides both one-shot compression (for page responses, via middleware)

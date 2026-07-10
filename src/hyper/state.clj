@@ -1,4 +1,4 @@
-(ns hyper.state
+(ns ^:no-doc hyper.state
   "State management for hyper applications.
 
    Manages session and tab-scoped state using atoms and cursors.

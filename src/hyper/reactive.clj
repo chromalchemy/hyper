@@ -1,4 +1,4 @@
-(ns hyper.reactive
+(ns ^:no-doc hyper.reactive
   "Backwards-compatible shims for the reactive-component API.
 
    Reactive components are now just one kind of *subview* — a render-bearing,

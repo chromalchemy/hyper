@@ -1,4 +1,4 @@
-(ns hyper.actions
+(ns ^:no-doc hyper.actions
   "Action handling for hyper applications.
 
    Actions are server-side functions triggered by client interactions."

@@ -1,4 +1,4 @@
-(ns hyper.subview
+(ns ^:no-doc hyper.subview
   "Unified per-tab sub-region lifecycle registry.
 
    A *subview* is a managed region of a page that owns a slice of lifecycle:

@@ -14,6 +14,7 @@
             [hyper.context :as context :refer [*request* *action-idx*]]
             [hyper.expr]
             [hyper.lifecycle :as lifecycle]
+            [hyper.protocols :as protocols]
             [hyper.reactive :as reactive]
             [hyper.render :as render]
             [hyper.routes :as routes]
@@ -99,9 +100,29 @@
      (compare-and-set! cursor nil default-value)
      cursor)))
 
+(def Watchable
+  "Protocol for external state sources that `watch!` can observe. Extended
+   by default for atoms, refs, vars, and any `IRef`. Extend it yourself for
+   custom sources — databases, message queues, or any stateful resource:
+
+     (extend-protocol Watchable
+       my.db/QueryResult
+       (-add-watch [this key callback]
+         ;; callback is (fn [old-val new-val]); set up your change listener
+         )
+       (-remove-watch [this key]
+         ;; tear down the listener
+         )
+       (-dispose [this]
+         ;; release resources (close connections, stop polling, etc.);
+         ;; called once the last tab watching this source navigates away
+         ;; or disconnects — no-op for sources that hold no resources
+         (.close this)))"
+  protocols/Watchable)
+
 (defn watch!
   "Watch an external source for changes, triggering a re-render of the current
-   tab when it changes. Source must satisfy the hyper.protocols/Watchable protocol
+   tab when it changes. Source must satisfy the `Watchable` protocol
    (extended by default for atoms, refs, vars, and any IRef).
 
    A watch is a mount-scoped subscription, keyed by source identity for dedup.
@@ -205,6 +226,36 @@
   ([key default]
    (get (:hyper/env context/*request*) key default)))
 
+(defn action-name
+  "Return the `:as` name of the currently executing action, or nil when
+   called outside an action context or the action was not given an `:as`
+   name.
+
+   Lets utility functions identify which action is running without the
+   caller having to pass the name explicitly:
+
+     (defn audit! []
+       (log/info \"Action executed\" {:action (action-name)}))
+
+     (action {:as \"delete-user\"}
+       (audit!)          ;; logs {:action \"delete-user\"}
+       (delete-user! id))"
+  []
+  context/*action-name*)
+
+(defn route
+  "Return the current route info map — :name, :path, :path-params, and
+   :query-params — consistent with the tab's current route.
+
+   Works anywhere within the request context (render functions, actions,
+   render middleware); a render function can equivalently read it off the
+   request via (:hyper/route req).
+
+   Example:
+     (route)  ;; => {:name :user :path \"/user/42\" :path-params {:id \"42\"} ...}"
+  []
+  (:hyper/route *request*))
+
 ;; ---------------------------------------------------------------------------
 ;; Batched cursor updates
 ;; ---------------------------------------------------------------------------
@@ -280,8 +331,8 @@
 (defmacro reactive
   "Create a reactive component that re-renders independently when its deps change.
 
-   deps is a vector of Watchable sources (atoms, cursors, or any type extending
-   hyper.protocols/Watchable).  The body is a hiccup expression that will be
+   deps is a vector of Watchable sources (atoms, cursors, or any type
+   extending Watchable).  The body is a hiccup expression that will be
    wrapped in a div with a stable ID.
 
    When any dep changes, only this component re-renders and a targeted Datastar
@@ -594,6 +645,25 @@
 ;; Client param support for actions
 ;; ---------------------------------------------------------------------------
 
+(def client-param
+  "Multimethod mapping a client-param symbol (like `$value`, `$key`) to its
+   definition — a map of :js (JavaScript run client-side to extract the
+   value) and :key (the key used to send it to the server). The built-ins
+   are $value, $checked, $key, $detail, $form-data, $form, and $files.
+
+   Extend it to add custom client-side param symbols, dispatching on the
+   symbol itself:
+
+     (defmethod client-param '$mouse-offset [_]
+       {:js \"{x:evt.offsetX, y:evt.offsetY}\" :key \"mouseOffset\"})
+
+   With this in place, an `action` body can reference `$mouse-offset`,
+   bound on the server to an EDN map with :x and :y keys. Methods must be
+   defined before any action that references the symbol. A definition
+   marked :multipart? true switches the action's transport to a
+   multipart/form-data upload instead of the default JSON @post()."
+  client-params/client-param)
+
 (defn- find-client-params
   "Walk the action body forms and return the subset of the defined client-params
    whose symbols appear in the body.
@@ -756,7 +826,7 @@
               (expr (when (= evt.key \"Enter\") (action (search! @query*))))}]
 
    Locals splice automatically; evt/el/$signals/JS interop pass through
-   to the client.  Canonical documentation: hyper.expr/->expr."
+   to the client."
   [& forms]
   `(hyper.expr/->expr ~@forms))
 
@@ -772,8 +842,7 @@
          [:div {:on {:click ::selected}} label \": \" value]))
 
    Also defines a server-side render function of the same name, so pages
-   call components like ordinary hiccup functions.  Canonical
-   documentation: hyper.component/defc."
+   call components like ordinary hiccup functions."
   {:style/indent        1
    :style.cljfmt/indent [[:block 1] [:inner 1]]}
   [& args]
@@ -894,9 +963,9 @@
    - :not-found         — Function `(fn [req] -> hiccup)` rendered when no route
                           matches, served as a full page with HTTP 404 (and over
                           SSE for client-side navigation).  May be a Var to pick
-                          up redefinitions.  Defaults to
-                          `hyper.render.error/not-found`; pass `nil` to disable
-                          and fall back to reitit's plain-text 404.
+                          up redefinitions.  Defaults to a built-in 404 page;
+                          pass `nil` to disable and fall back to reitit's
+                          plain-text 404.
 
    The request key :hyper/env is reserved for application-provided context.
    Ring middleware that sets :hyper/env on the request will have it automatically

@@ -1,4 +1,4 @@
-(ns hyper.component
+(ns ^:no-doc hyper.component
   "Client-side web components compiled via embedded Squint.
 
    This namespace provides the foundation for defining custom elements in a
