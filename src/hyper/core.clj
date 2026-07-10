@@ -184,10 +184,10 @@
    placeholder, prefer `async`."
   [worker-fn]
   (context/guard-effect! :spawn "h/spawn!")
-  (let [{:keys [session-id tab-id app-state* router]} (context/require-context! "spawn!")
-        idx                                           (if *action-idx* (swap! *action-idx* inc) 0)
-        sid                                           (str "s_" tab-id "_" idx)]
-    (subview/spawn-worker! app-state* tab-id sid session-id router worker-fn)
+  (let [{:keys [session-id tab-id app-state*]} (context/require-context! "spawn!")
+        idx                                    (if *action-idx* (swap! *action-idx* inc) 0)
+        sid                                    (str "s_" tab-id "_" idx)]
+    (subview/spawn-worker! app-state* tab-id sid session-id worker-fn)
     nil))
 
 (defn env
@@ -441,11 +441,10 @@
           [nil (first args) (second args) (nth args 2) (drop 3 args)])]
     `(let [{tab-id#     :tab-id
             app-state*# :app-state*
-            session-id# :session-id
-            router#     :router}    (context/require-context! "async")
-           idx#                     (if context/*action-idx* (swap! context/*action-idx* inc) 0)
-           fallback-id#             (str "async_" tab-id# "_" idx#)]
-       (subview/render-async! app-state*# tab-id# session-id# router# ~(:key opts) fallback-id#
+            session-id# :session-id} (context/require-context! "async")
+           idx#                      (if context/*action-idx* (swap! context/*action-idx* inc) 0)
+           fallback-id#              (str "async_" tab-id# "_" idx#)]
+       (subview/render-async! app-state*# tab-id# session-id# ~(:key opts) fallback-id#
                               ~deps
                               (fn [] ~fetch-expr)
                               (fn [~binding] ~@render-body)))))

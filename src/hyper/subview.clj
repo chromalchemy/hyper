@@ -181,10 +181,7 @@
     (when render-fn
       (let [tab-state  (get-in @app-state* [:tabs tab-id])
             session-id (:session-id tab-state)
-            req        {:hyper/session-id session-id
-                        :hyper/tab-id     tab-id
-                        :hyper/app-state  app-state*
-                        :hyper/router     (:router @app-state*)}]
+            req        (context/context-request app-state* tab-id session-id)]
         (push-thread-bindings (context/partial-render-bindings req))
         (try
           (let [body         (binding [context/*region-path* (:region-path spec [])]
@@ -365,16 +362,11 @@
    Idempotent: a form-1 render body re-invokes `h/spawn!` on every render, so
    only the first occurrence (when `sid` is absent) actually spawns; later
    renders are a no-op."
-  [app-state* tab-id sid session-id router worker-fn]
+  [app-state* tab-id sid session-id worker-fn]
   (when-let [acc context/*registered-subview-ids*]
     (swap! acc conj sid))
   (when-not (get-subview app-state* tab-id sid)
-    (let [env    (get-in @app-state* [:tabs tab-id :env])
-          req    {:hyper/session-id session-id
-                  :hyper/tab-id     tab-id
-                  :hyper/app-state  app-state*
-                  :hyper/router     router
-                  :hyper/env        env}
+    (let [req    (context/context-request app-state* tab-id session-id)
           thread (Thread/startVirtualThread
                    (fn []
                      (binding [context/*request* req]
@@ -415,13 +407,8 @@
    teardown) leaves the cell untouched: the new fetch or teardown owns it.
    Records the thread in the async store so a later refetch/teardown can
    interrupt it."
-  [app-state* tab-id session-id router store-path cell fetch-fn]
-  (let [env    (get-in @app-state* [:tabs tab-id :env])
-        req    {:hyper/session-id session-id
-                :hyper/tab-id     tab-id
-                :hyper/app-state  app-state*
-                :hyper/router     router
-                :hyper/env        env}
+  [app-state* tab-id session-id store-path cell fetch-fn]
+  (let [req    (context/context-request app-state* tab-id session-id)
         thread (Thread/startVirtualThread
                  (fn []
                    (binding [context/*request* req]
@@ -444,14 +431,14 @@
      cell {:status :reloading :result <prior>}, interrupt the in-flight fetch,
      re-snapshot deps, and spawn a fresh fetch.
    - Otherwise: reuse the existing cell (no refetch)."
-  [app-state* tab-id session-id router store-path user-deps fetch-fn]
+  [app-state* tab-id session-id store-path user-deps fetch-fn]
   (let [existing (get-in @app-state* store-path)
         cur-vals (mapv deref user-deps)]
     (cond
       (nil? existing)
       (let [cell (atom {:status :loading})]
         (swap! app-state* assoc-in store-path {:cell cell :dep-vals cur-vals :thread nil})
-        (start-async-fetch! app-state* tab-id session-id router store-path cell fetch-fn)
+        (start-async-fetch! app-state* tab-id session-id store-path cell fetch-fn)
         cell)
 
       (not= cur-vals (:dep-vals existing))
@@ -459,7 +446,7 @@
         (swap! cell (fn [s] {:status :reloading :result (:result s)}))
         (when-let [^Thread old (:thread existing)] (.interrupt old))
         (swap! app-state* assoc-in store-path (assoc existing :dep-vals cur-vals))
-        (start-async-fetch! app-state* tab-id session-id router store-path cell fetch-fn)
+        (start-async-fetch! app-state* tab-id session-id store-path cell fetch-fn)
         cell)
 
       :else
@@ -484,12 +471,12 @@
    coordination store.  The render body must return a single rooted hiccup
    element (as with `reactive`), so the id can be injected.  Returns the
    hiccup."
-  [app-state* tab-id session-id router key fallback-id user-deps fetch-fn render-fn]
+  [app-state* tab-id session-id key fallback-id user-deps fetch-fn render-fn]
   (let [token        (when (some? key) (key->token key))
         component-id (if token (scoped-id "async_" tab-id token) fallback-id)
         path         (cond-> context/*region-path* token (conj token))
         store-path   [:tabs tab-id :async component-id]
-        cell         (coordinate-async! app-state* tab-id session-id router
+        cell         (coordinate-async! app-state* tab-id session-id
                                         store-path user-deps fetch-fn)
         deps         (into [cell] user-deps)
         ;; Snapshot deps before rendering, and render against the snapshot, so
@@ -503,7 +490,7 @@
         ;; The stored render-fn re-coordinates (so a partial re-render from a
         ;; user-dep change still refetches) then renders the current status.
         thunk        (fn []
-                       (let [cell (coordinate-async! app-state* tab-id session-id router
+                       (let [cell (coordinate-async! app-state* tab-id session-id
                                                      store-path user-deps fetch-fn)]
                          (render-fn @cell)))]
     (register-subview! app-state* tab-id component-id

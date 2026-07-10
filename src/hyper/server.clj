@@ -376,16 +376,19 @@
 (defn cleanup-tab!
   "Clean up all resources for a tab: watchers, reactive components, renderer thread, actions, and state."
   [app-state* tab-id]
-  (watch/remove-watchers! app-state* tab-id)
-  ;; teardown-all-components! (-> subview/teardown-all!) tears down every
-  ;; subview for the tab, including framework :tab watches and user/route
-  ;; :mount watches.
-  (reactive/teardown-all-components! app-state* tab-id)
-  (lifecycle/teardown-page-view! app-state* tab-id)
-  (when-let [stop! (get-in @app-state* [:tabs tab-id :renderer :stop!])]
-    (stop!))
-  (actions/cleanup-tab-actions! app-state* tab-id)
-  (state/cleanup-tab! app-state* tab-id)
+  ;; Teardown runs outside any live request; bind a context so :unmount fns
+  ;; resolve cursors, h/env, and h/route.
+  (binding [context/*request* (context/teardown-request app-state* tab-id)]
+    (watch/remove-watchers! app-state* tab-id)
+    ;; teardown-all-components! (-> subview/teardown-all!) tears down every
+    ;; subview for the tab, including framework :tab watches and user/route
+    ;; :mount watches.
+    (reactive/teardown-all-components! app-state* tab-id)
+    (lifecycle/teardown-page-view! app-state* tab-id)
+    (when-let [stop! (get-in @app-state* [:tabs tab-id :renderer :stop!])]
+      (stop!))
+    (actions/cleanup-tab-actions! app-state* tab-id)
+    (state/cleanup-tab! app-state* tab-id))
   nil)
 
 (defn detach-tab!

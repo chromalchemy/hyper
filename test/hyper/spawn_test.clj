@@ -37,7 +37,7 @@
       (binding [context/*render-guard* (doto (context/make-guard :error)
                                          (swap! assoc :mode :active))]
         (subview/spawn-worker!
-          app-state* tab-id "s_guard" session-id nil
+          app-state* tab-id "s_guard" session-id
           (fn []
            ;; tab-cursor resolves via the rebound *request*; the write would
            ;; throw if the guard were active on this thread.

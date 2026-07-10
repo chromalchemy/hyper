@@ -216,6 +216,26 @@
      :app-state* app-state*
      :router     (:hyper/router *request*)}))
 
+(defn context-request
+  "Build the hyper request-context map for `tab-id`: :hyper/session-id,
+   :hyper/tab-id, :hyper/app-state, :hyper/router, :hyper/route, and
+   :hyper/env. Route, env, and (2-arity) session-id come from the tab record;
+   router from app-state."
+  ([app-state* tab-id]
+   (context-request app-state* tab-id (get-in @app-state* [:tabs tab-id :session-id])))
+  ([app-state* tab-id session-id]
+   {:hyper/session-id session-id
+    :hyper/tab-id     tab-id
+    :hyper/app-state  app-state*
+    :hyper/router     (get @app-state* :router)
+    :hyper/route      (get-in @app-state* [:tabs tab-id :route])
+    :hyper/env        (get-in @app-state* [:tabs tab-id :env])}))
+
+(defn teardown-request
+  "Build the request-context map for running a tab's teardown (:unmount) fns."
+  [app-state* tab-id]
+  (context-request app-state* tab-id))
+
 ;; ---------------------------------------------------------------------------
 ;; Render purity guard
 ;; ---------------------------------------------------------------------------

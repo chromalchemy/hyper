@@ -3,6 +3,7 @@
             [clojure.test :refer [deftest is testing]]
             [hyper.core :as h]
             [hyper.lifecycle :as lifecycle]
+            [hyper.server :as server]
             [hyper.state :as state]
             [hyper.subview :as subview]
             [hyper.test :as ht]))
@@ -85,7 +86,25 @@
     (let [r (ht/test-page (fn [_req]
                             (h/view {:render (fn [res _req]
                                                [:div "res=" (pr-str res)])})))]
-      (is (str/includes? (:body-html r) "res=nil")))))
+      (is (str/includes? (:body-html r) "res=nil"))))
+
+  (testing "unmount can read session cursors and h/env during disconnect teardown"
+    (let [seen    (atom ::unset)
+          seen-db (atom ::unset)
+          handler (fn [_req]
+                    (h/view
+                      {:render  (fn [_res _req] [:div "ok"])
+                       :unmount (fn [_res]
+                                  (reset! seen (some-> @(h/session-cursor :user) :name))
+                                  (reset! seen-db (h/env :db)))}))
+          r       (ht/test-page handler {:cursors {:session {:user {:name "alice"}}}})
+          app     (:app-state r)]
+      ;; Mirror the per-tab env the framework stashes on each HTTP request.
+      (swap! app assoc-in [:tabs "test-tab" :env] {:db :prod})
+      (server/cleanup-tab! app "test-tab")
+      (is (= "alice" @seen) "unmount saw the session-cursor value")
+      (is (= :prod @seen-db) "unmount saw :hyper/env via h/env")
+      (is (nil? (get-in @app [:tabs "test-tab" :page-view]))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Render purity guard
