@@ -117,6 +117,30 @@
                             [:div]))]
       (is (= 5 (get-in r [:cursors :tab :n]))))))
 
+(deftest mount-watch-derived-cursor
+  (testing "a form-3 mount that creates a defaulted source cursor and a watch
+            deriving into a second cursor renders without a guard error, and
+            the derived value lands (missionary-style DAG on cursors)"
+    (let [app     (error-app)
+          handler (fn [_req]
+                    (h/view
+                      {:mount   (fn []
+                                  (let [_entry* (h/tab-cursor :entry {:side :buy})
+                                        alloc*  (h/tab-cursor :alloc)]
+                                    (add-watch app ::derive
+                                               (fn [_ _ old new]
+                                                 (let [p [:tabs "test-tab" :data :entry]]
+                                                   (when (not= (get-in old p) (get-in new p))
+                                                     (reset! alloc* :computed)))))
+                                    nil))
+                       :render  (fn [_res _req] [:div "ok"])
+                       :unmount (fn [_res] (remove-watch app ::derive))}))
+          r       (ht/test-page handler {:app-state app})]
+      (is (str/includes? (:body-html r) "ok"))
+      (is (= {:side :buy} (get-in r [:cursors :tab :entry])))
+      (is (= :computed (get-in r [:cursors :tab :alloc]))
+          "derived cursor written by the watch during the mount flush"))))
+
 ;; ---------------------------------------------------------------------------
 ;; watch! as a mount-scoped subview (Phase C)
 ;; ---------------------------------------------------------------------------

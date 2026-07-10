@@ -223,6 +223,20 @@
    Nested batches are transparent — the inner batch executes within the
    existing overlay and the outermost boundary handles the flush.
 
+   The atomicity guarantee covers the writes made in the batch body — not
+   writes made by watches reacting to them.  If one cursor is derived from
+   another via a watch (e.g. recomputing total* whenever items* changes),
+   the watch only runs after the batched values are committed, so the
+   derived cursor updates in a separate atomic update immediately after.
+   The page may re-render between the two, showing the new batched values
+   with the old derived value for one frame before a follow-up render
+   corrects it.  To keep a derived value in the same frame as its source,
+   compute it in the batch body instead:
+
+     (h/batch
+       (reset! items* new-items)
+       (reset! total* (reduce + new-items)))  ;; same atomic update — no lag
+
    A batch inside background work (future, send-off, fiber) spawned from a
    render or outer batch ignores the conveyed overlay and creates its own,
    flushing to the live app-state when its body completes.

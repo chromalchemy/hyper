@@ -55,7 +55,10 @@
 ;; replayed onto the live atom via `flush-overlay!` — replaying operations
 ;; (not absolute values) lets a swap!/update-style write compose with a
 ;; concurrent same-path write instead of clobbering it; reset! still
-;; overwrites by design.  nil during action execution (without batch).
+;; overwrites by design.  The flush iterates to a fixpoint: cursor writes
+;; made by watch callbacks reacting to a phase are buffered and applied as
+;; subsequent atomic phases rather than dropped (see `flush-overlay!`).
+;; nil during action execution (without batch).
 ;;
 ;; Thread ownership: `future`, `send-off`, fibers, etc. convey dynamic
 ;; bindings, so background work spawned from a render/batch would inherit
@@ -95,15 +98,41 @@
           state
           ops))
 
+(declare ^:dynamic *render-guard*)
+
+(def ^:private max-flush-phases
+  "Ceiling on reactive flush phases before flush-overlay! throws — a watch
+   cycle whose values never reach a fixpoint would otherwise loop forever."
+  100)
+
 (defn flush-overlay!
-  "Replay the current overlay's op-log onto the live atom in a single swap!.
-   No-op when nothing was recorded, or the calling thread doesn't own the
-   overlay."
+  "Replay the current overlay's op-log onto the live atom, iterating to a
+   fixpoint.  All ops buffered before the call land in the first swap!, so
+   user write-pairs stay atomic.  Watch callbacks that run during a phase's
+   notifications and write cursors append new ops; each batch of appended
+   ops is applied as the next atomic phase until the log drains.  The render
+   guard is released for the duration — the render body has already been
+   judged, and reaction writes are applied rather than dropped, so they are
+   not render effects.  Throws when the log keeps growing past
+   `max-flush-phases` (a non-converging write cycle).  No-op when nothing
+   was recorded, or the calling thread doesn't own the overlay."
   [app-state*]
   (when-let [{:keys [ops*]} (current-overlay)]
-    (let [ops @ops*]
-      (when (seq ops)
-        (swap! app-state* apply-ops ops)))))
+    (binding [*render-guard* nil]
+      (loop [applied 0
+             phase   1]
+        (let [ops     @ops*
+              pending (subvec ops applied)]
+          (when (seq pending)
+            (when (> phase max-flush-phases)
+              (throw (ex-info (str "flush-overlay! did not converge after "
+                                   max-flush-phases " phases — a cursor watch "
+                                   "keeps writing on every phase (write cycle?)")
+                              {:hyper/flush-phases (dec phase)
+                               :hyper/pending-ops  (mapv #(select-keys % [:kind :path])
+                                                         pending)})))
+            (swap! app-state* apply-ops pending)
+            (recur (count ops) (inc phase))))))))
 
 ;; The :as name of the currently executing action, or nil when outside
 ;; an action context or when the action was not given an :as name.

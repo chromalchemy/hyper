@@ -663,6 +663,31 @@
         (is (= 3 (get-in @app-state* [:tabs "t1" :data :c]))))
       (remove-watch app-state* :counter))))
 
+(deftest batch-reaction-transparency-test
+  (testing "a watch reacting to the batch flush with a batch-wrapped cursor
+            write does not re-enter the flush — ops apply exactly once and
+            the reaction write lands as a follow-up update"
+    (let [app-state* (atom (state/init-state))
+          _          (state/get-or-create-tab! app-state* "s1" "t1")]
+      (binding [context/*request* {:hyper/session-id "s1"
+                                   :hyper/tab-id     "t1"
+                                   :hyper/app-state  app-state*}]
+        (let [n*     (hy/tab-cursor :n 0)
+              other* (hy/tab-cursor :other)]
+          (add-watch app-state* :batched-reaction
+                     (fn [_ _ old new]
+                       (let [p [:tabs "t1" :data :n]]
+                         (when (not= (get-in old p) (get-in new p))
+                           (hy/batch
+                             (reset! other* :from-batch))))))
+          (hy/batch
+            (swap! n* inc))
+          (is (= 1 (get-in @app-state* [:tabs "t1" :data :n]))
+              "op applied exactly once — no re-entrant flush")
+          (is (= :from-batch (get-in @app-state* [:tabs "t1" :data :other]))
+              "batched reaction write landed")))
+      (remove-watch app-state* :batched-reaction))))
+
 (deftest batch-return-value-test
   (testing "batch returns the value of the last expression"
     (let [app-state* (atom (state/init-state))
