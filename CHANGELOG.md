@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1 — 2026-07-10
+
+### Bug Fixes
+
+- Fix missing request context bindings in teardown and partial renders
+
 ## 0.2.0 — 2026-07-10
 
 ### Bug Fixes
