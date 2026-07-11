@@ -1,6 +1,7 @@
 (ns hyper.context-test
   (:require [clojure.test :refer [deftest is testing]]
-            [hyper.context :as context]))
+            [hyper.context :as context]
+            [hyper.state :as state]))
 
 (deftest require-context-test
   (testing "throws when called outside request context"
@@ -94,3 +95,165 @@
                               [{:kind :reset :path [:x] :value 1}
                                {:kind :update :path [:x] :f inc}
                                {:kind :update :path [:x] :f inc}])))))
+
+;; ---------------------------------------------------------------------------
+;; Overlay flush — buffering, atomicity, and reactive phases
+;; ---------------------------------------------------------------------------
+
+(def ^:private tab "t1")
+
+(defn- fresh-app []
+  (atom (assoc-in (state/init-state) [:tabs tab :data] {})))
+
+(defn- live [app path]
+  (get-in @app (into [:tabs tab :data] (if (vector? path) path [path]))))
+
+(defn- overlay-for [app]
+  {:state* (atom @app)
+   :ops*   (atom [])
+   :owner  (Thread/currentThread)})
+
+(defmacro ^:private with-overlay
+  "Run body under a batch-style overlay owned by this thread (no guard)."
+  [app & body]
+  `(binding [context/*state-overlay* (overlay-for ~app)]
+     ~@body))
+
+(defmacro ^:private with-render-context
+  "Run body under a full render context — overlay plus an ACTIVE render
+   guard, exactly like render-tab after guard-discard!.  Combined with
+   {:render-guard :error} on the app, any effect judged as in-render throws."
+  [app & body]
+  `(with-bindings (context/render-bindings {:hyper/app-state ~app} ~app)
+     (context/guard-discard!)
+     ~@body))
+
+(deftest overlay-buffers-writes-until-flush
+  (testing "cursor writes under an overlay are invisible in live state until flush"
+    (let [app (fresh-app)]
+      (with-overlay app
+        (let [x* (state/tab-cursor app tab :x)]
+          (reset! x* 1)
+          (is (nil? (live app :x)) "write is buffered, not live")
+          (context/flush-overlay! app)
+          (is (= 1 (live app :x)) "write lands at flush"))))))
+
+(deftest overlay-read-your-writes
+  (testing "reads under the overlay see buffered defaults and writes"
+    (let [app (fresh-app)]
+      (with-overlay app
+        (let [x* (state/tab-cursor app tab :x 42)]
+          (is (= 42 @x*) "default visible via shadow")
+          (swap! x* inc)
+          (is (= 43 @x*) "write visible via shadow")
+          (is (nil? (live app :x)) "still not live"))))))
+
+(deftest default-init-yields-to-concurrent-live-write
+  (testing "a default-value init is a CAS that yields to a real write landing
+            before flush, rather than clobbering it"
+    (let [app (fresh-app)]
+      (with-overlay app
+        (state/tab-cursor app tab :x 42)
+        ;; concurrent writer commits a real value before the flush
+        (swap! app assoc-in [:tabs tab :data :x] 99)
+        (context/flush-overlay! app)
+        (is (= 99 (live app :x)))))))
+
+(deftest pre-flush-writes-land-in-one-transition
+  (testing "all user writes buffered before the flush commit in a single
+            atomic swap — a watcher never observes one without the other"
+    (let [app         (fresh-app)
+          transitions (atom [])]
+      (add-watch app ::obs
+                 (fn [_ _ old new]
+                   (swap! transitions conj
+                          {:a [(get-in old [:tabs tab :data :a])
+                               (get-in new [:tabs tab :data :a])]
+                           :b [(get-in old [:tabs tab :data :b])
+                               (get-in new [:tabs tab :data :b])]})))
+      (with-overlay app
+        (reset! (state/tab-cursor app tab :a) 1)
+        (reset! (state/tab-cursor app tab :b) 2)
+        (context/flush-overlay! app))
+      (remove-watch app ::obs)
+      (is (= 1 (count @transitions)) "exactly one live transition")
+      (is (= {:a [nil 1] :b [nil 2]} (first @transitions))
+          "both writes visible in the same transition"))))
+
+(deftest reaction-write-during-flush-lands
+  (testing "a cursor written by a watch callback during the flush is applied
+            (next phase), not dropped — and raises no render-guard error even
+            at :render-guard :error (the missionary m/watch-into-cursor case)"
+    (let [app (doto (fresh-app) (swap! assoc :render-guard :error))]
+      (with-render-context app
+        (let [_entry* (state/tab-cursor app tab :entry {:side :buy})
+              alloc*  (state/tab-cursor app tab :alloc)]
+          (add-watch app ::derive
+                     (fn [_ _ old new]
+                       (let [p [:tabs tab :data :entry]]
+                         (when (not= (get-in old p) (get-in new p))
+                           (reset! alloc* :computed)))))
+          (context/flush-overlay! app)))
+      (remove-watch app ::derive)
+      (is (= {:side :buy} (live app :entry)) "source default landed")
+      (is (= :computed (live app :alloc)) "derived write landed, not dropped"))))
+
+(deftest reaction-cascade-converges
+  (testing "chained reactions (a -> b -> c) converge across flush phases"
+    (let [app (fresh-app)]
+      (with-overlay app
+        (let [a* (state/tab-cursor app tab :a)
+              b* (state/tab-cursor app tab :b)
+              c* (state/tab-cursor app tab :c)]
+          (add-watch app ::a->b
+                     (fn [_ _ old new]
+                       (let [p [:tabs tab :data :a]]
+                         (when (not= (get-in old p) (get-in new p))
+                           (reset! b* (inc (get-in new p)))))))
+          (add-watch app ::b->c
+                     (fn [_ _ old new]
+                       (let [p [:tabs tab :data :b]]
+                         (when (not= (get-in old p) (get-in new p))
+                           (reset! c* (inc (get-in new p)))))))
+          (reset! a* 1)
+          (context/flush-overlay! app)))
+      (remove-watch app ::a->b)
+      (remove-watch app ::b->c)
+      (is (= 1 (live app :a)))
+      (is (= 2 (live app :b)))
+      (is (= 3 (live app :c))))))
+
+(deftest ops-apply-exactly-once-across-phases
+  (testing "a buffered swap! op is applied exactly once even when reactions
+            force additional flush phases"
+    (let [app (fresh-app)]
+      (with-overlay app
+        (let [n*     (state/tab-cursor app tab :n 0)
+              other* (state/tab-cursor app tab :other)]
+          (add-watch app ::second-phase
+                     (fn [_ _ old new]
+                       (let [p [:tabs tab :data :n]]
+                         (when (and (not= (get-in old p) (get-in new p))
+                                    (nil? (get-in new [:tabs tab :data :other])))
+                           (reset! other* :done)))))
+          (swap! n* inc)
+          (context/flush-overlay! app)))
+      (remove-watch app ::second-phase)
+      (is (= 1 (live app :n)) "inc applied exactly once, not re-applied per phase")
+      (is (= :done (live app :other)) "second phase ran"))))
+
+(deftest non-converging-cycle-throws
+  (testing "a watch that keeps writing on every phase (value never reaches a
+            fixpoint) fails loudly instead of looping or silently dropping"
+    (let [app (fresh-app)]
+      (with-overlay app
+        (let [x* (state/tab-cursor app tab :x 0)]
+          (add-watch app ::cycle
+                     (fn [_ _ old new]
+                       (let [p [:tabs tab :data :x]]
+                         (when (not= (get-in old p) (get-in new p))
+                           (swap! x* inc)))))
+          (swap! x* inc)
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"did not converge"
+                                (context/flush-overlay! app)))))
+      (remove-watch app ::cycle))))

@@ -1,4 +1,4 @@
-(ns hyper.component.bundle
+(ns ^:no-doc hyper.component.bundle
   "Assembly and serving support for the client-components JS bundle.
 
    Components registered in hyper.component/registry* are assembled into a

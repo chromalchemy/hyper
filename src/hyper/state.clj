@@ -1,4 +1,4 @@
-(ns hyper.state
+(ns ^:no-doc hyper.state
   "State management for hyper applications.
 
    Manages session and tab-scoped state using atoms and cursors.
@@ -140,13 +140,22 @@
   (let [full-path (into (vec path-prefix) (normalize-path path))]
     (->Cursor parent-atom full-path (atom {}) nil (atom {}))))
 
+(defn stamp-scope!
+  "Stamp a cursor with :hyper/scope and :hyper/path metadata.  Returns the
+   cursor."
+  [cursor scope path]
+  (reset-meta! cursor {:hyper/scope scope
+                       :hyper/path  (normalize-path path)})
+  cursor)
+
 (defn session-cursor
   "Create a cursor to session state at the given path.
    If default-value is provided and the path is nil, initializes with default-value."
   ([app-state* session-id path]
-   (create-cursor app-state* [:sessions session-id :data] path))
+   (stamp-scope! (create-cursor app-state* [:sessions session-id :data] path)
+                 :session path))
   ([app-state* session-id path default-value]
-   (let [cursor (create-cursor app-state* [:sessions session-id :data] path)]
+   (let [cursor (session-cursor app-state* session-id path)]
      ;; cas (not read-then-reset) so a default init yields to a concurrent
      ;; write at flush rather than clobbering it.
      (compare-and-set! cursor nil default-value)
@@ -156,9 +165,10 @@
   "Create a cursor to tab state at the given path.
    If default-value is provided and the path is nil, initializes with default-value."
   ([app-state* tab-id path]
-   (create-cursor app-state* [:tabs tab-id :data] path))
+   (stamp-scope! (create-cursor app-state* [:tabs tab-id :data] path)
+                 :tab path))
   ([app-state* tab-id path default-value]
-   (let [cursor (create-cursor app-state* [:tabs tab-id :data] path)]
+   (let [cursor (tab-cursor app-state* tab-id path)]
      (compare-and-set! cursor nil default-value)
      cursor)))
 
@@ -167,9 +177,10 @@
    Global state is shared across all sessions and tabs.
    If default-value is provided and the path is nil, initializes with default-value."
   ([app-state* path]
-   (create-cursor app-state* [:global] path))
+   (stamp-scope! (create-cursor app-state* [:global] path)
+                 :global path))
   ([app-state* path default-value]
-   (let [cursor (create-cursor app-state* [:global] path)]
+   (let [cursor (global-cursor app-state* path)]
      (compare-and-set! cursor nil default-value)
      cursor)))
 

@@ -1,4 +1,4 @@
-(ns hyper.lifecycle
+(ns ^:no-doc hyper.lifecycle
   "View lifecycle vocabulary shared across page handlers (and, later,
    reactive sub-regions and async workers).
 
@@ -134,7 +134,10 @@
    chain so middleware runs on every render (form-1 body, form-2 inner,
    form-3 :render) just as it does today."
   [app-state* tab-id handler req render-error-fn wrap-mw]
-  (let [raw (safe (wrap-mw handler) render-error-fn req)]
+  (let [;; Stamped onto the stored page-view; the mount boundary compares it
+        ;; (see render-page).
+        path-params (get-in @app-state* [:tabs tab-id :route :path-params])
+        raw         (safe (wrap-mw handler) render-error-fn req)]
     (cond
       ;; form-3 — handler returned a View. The detection call merely
       ;; constructed it (pure); discard any buffered effects, run :mount
@@ -143,11 +146,12 @@
       (let [resource (run-mount raw)
             render'  (fn [r] ((:render raw) resource r))]
         (store-page-view! app-state* tab-id
-                          {:form      :form-3
-                           :source-fn handler
-                           :render-fn render'
-                           :resource  resource
-                           :unmount   (:unmount raw)})
+                          {:form        :form-3
+                           :source-fn   handler
+                           :path-params path-params
+                           :render-fn   render'
+                           :resource    resource
+                           :unmount     (:unmount raw)})
         (context/guard-discard!)
         (safe (wrap-mw render') render-error-fn req))
 
@@ -157,9 +161,10 @@
       (fn? raw)
       (do
         (store-page-view! app-state* tab-id
-                          {:form      :form-2
-                           :source-fn handler
-                           :render-fn raw})
+                          {:form        :form-2
+                           :source-fn   handler
+                           :path-params path-params
+                           :render-fn   raw})
         (context/guard-discard!)
         (safe (wrap-mw raw) render-error-fn req))
 
@@ -168,7 +173,7 @@
       :else
       (do
         (store-page-view! app-state* tab-id
-                          {:form :form-1 :source-fn handler})
+                          {:form :form-1 :source-fn handler :path-params path-params})
         (context/guard-flush-and-activate!)
         raw))))
 
@@ -190,25 +195,32 @@
    - wrap-mw         — `(fn [render-fn] -> render-fn)` applying the
                        render-middleware chain (use `identity` for none)
 
-   form-2/3 mount only when the page first renders or the handler identity
-   changes (route navigation, Var redefinition); a superseded form-2/3 is
-   unmounted first.  form-1 re-runs its body every render (as before)."
+   The mount boundary is keyed on `[handler path-params]`: a page (re)mounts
+   on first render, on handler-identity change (navigation, Var redefinition),
+   and on a route **path-param** change (the same handler serving a different
+   path-param value).  A superseded mount is unmounted first — its form-3 resource and
+   mount-scoped subviews (`h/watch!`, `h/spawn!`, async) are torn down, and the
+   new mount re-acquires whatever is scoped to the new path-params.  Query-param
+   changes (filters, pagination — cursor-backed view state) re-render in place.
+   form-1 re-runs its body every render."
   [app-state* tab-id handler req render-error-fn wrap-mw]
-  (let [wrap-mw (or wrap-mw identity)
-        stored  (get-in @app-state* [:tabs tab-id :page-view])]
-    (if (and stored
-             (identical? handler (:source-fn stored))
-             (not= :form-1 (:form stored)))
+  (let [wrap-mw     (or wrap-mw identity)
+        stored      (get-in @app-state* [:tabs tab-id :page-view])
+        path-params (get-in @app-state* [:tabs tab-id :route :path-params])
+        same-mount? (and stored
+                         (identical? handler (:source-fn stored))
+                         (= path-params (:path-params stored)))]
+    (if (and same-mount? (not= :form-1 (:form stored)))
       ;; Fast path — form-2/3 already mounted: render via the cached pure fn.
       (do
         (context/guard-discard!)
         (safe (wrap-mw (:render-fn stored)) render-error-fn req))
-      ;; (Re)resolve — first render, form-1, or handler changed.
+      ;; (Re)resolve — first render, form-1, or remount (handler/path-params
+      ;; changed).
       (do
-        (when (and stored (not (identical? handler (:source-fn stored))))
-          ;; Page-view remount (navigation / handler redefinition): tear down
-          ;; the old mount's form-3 resource AND its mount-scoped subviews
-          ;; (h/watch!, async).  The new mount re-registers what it needs.
+        (when (and stored (not same-mount?))
+          ;; Remount: tear down the old mount's form-3 resource and mount-scoped
+          ;; subviews (h/watch!, h/spawn!, async); the new mount re-registers.
           (run-unmount! stored)
           (subview/teardown-mount-scoped! app-state* tab-id))
         (resolve-and-render! app-state* tab-id handler req render-error-fn wrap-mw)))))

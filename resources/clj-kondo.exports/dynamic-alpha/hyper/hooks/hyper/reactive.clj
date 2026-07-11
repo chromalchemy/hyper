@@ -20,9 +20,12 @@
           :type type)))
 
 (defn reactive
-  "Validate + rewrite (reactive [deps] & body)."
+  "Validate + rewrite (reactive {opts}? [deps] & body)."
   [{:keys [node]}]
-  (let [[_ deps & body] (:children node)]
+  (let [[_ & args]      (:children node)
+        opts            (when (and (first args) (api/map-node? (first args)))
+                          (first args))
+        [deps & body]   (if opts (rest args) args)]
     (when-not (and deps (api/vector-node? deps))
       (finding! (or deps node) :error
                 "h/reactive requires a deps vector as its first argument (e.g. [clock*])"
@@ -36,6 +39,7 @@
                     (list*
                      (api/token-node 'let)
                      (api/vector-node
-                      [(api/token-node '_deps) (or deps (api/vector-node []))])
+                      (cond-> [(api/token-node '_deps) (or deps (api/vector-node []))]
+                        opts (conj (api/token-node '_opts) opts)))
                      body))]
       {:node new-node})))

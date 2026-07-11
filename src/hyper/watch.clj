@@ -1,4 +1,4 @@
-(ns hyper.watch
+(ns ^:no-doc hyper.watch
   "Internal-state reactivity for hyper tabs.
 
    Two responsibilities live here:

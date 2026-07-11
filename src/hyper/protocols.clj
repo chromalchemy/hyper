@@ -1,4 +1,4 @@
-(ns hyper.protocols
+(ns ^:no-doc hyper.protocols
   "Protocols for extending hyper's capabilities.
 
    Consumers implementing external state sources (databases, message queues, etc.)

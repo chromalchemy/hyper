@@ -12,8 +12,10 @@
 //   strings otherwise; parsed values cached per raw string.
 // - Tiny hiccup->DOM interpreter for render output (squint compiles hiccup
 //   literals to plain JS arrays with string tags).
-// - Style inheritance: document stylesheets are cloned into each shadow
-//   root so global CSS (e.g. Tailwind) styles component internals.
+// - Style inheritance: a base stylesheet (sane :host / render-root layout
+//   defaults) plus clones of the document stylesheets are added to each
+//   shadow root, so global CSS (e.g. Tailwind) styles component internals
+//   and can override the base.
 // - ctx.emit: bubbling, composed CustomEvents across the boundary.
 
 // The spec registry is page-global (not module-scoped): a hot-swapped bundle
@@ -144,7 +146,18 @@ function $appendHiccup(parent, h, ns) {
   }
 }
 
+// Base layout defaults added to every component shadow root: a block host
+// and a render root that fills it as a real (measurable) box. Overridable
+// by global CSS and a component's own styles.
+const $BASE_CSS =
+  ':host{display:block}\n' +
+  '[data-hyper-root]{display:block;height:100%}';
+
 function $adoptStyles(shadowRoot) {
+  // Base defaults first, so cloned document styles below override them.
+  const base = document.createElement('style');
+  base.textContent = $BASE_CSS;
+  shadowRoot.appendChild(base);
   // Clone document stylesheets into the shadow root so global CSS reaches
   // component internals. Link clones hit the browser cache (no refetch).
   for (const node of document.querySelectorAll(

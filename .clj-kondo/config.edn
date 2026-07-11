@@ -1,1 +1,5 @@
-{:lint-as {hyper.core/defpage clojure.core/defn}}
+{:lint-as {hyper.core/defpage clojure.core/defn}
+ ;; Lint this project with its own shipped clj-kondo config (the single source
+ ;; of truth) rather than a committed duplicate under .clj-kondo/. Consumers are
+ ;; unaffected — they import from the jar's resources/clj-kondo.exports.
+ :config-paths ["../resources/clj-kondo.exports/dynamic-alpha/hyper"]}

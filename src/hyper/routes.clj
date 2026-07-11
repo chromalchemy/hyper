@@ -1,4 +1,4 @@
-(ns hyper.routes
+(ns ^:no-doc hyper.routes
   "Route-querying helpers shared between server and render.
 
    Pure functions for looking up route metadata by name, resolving

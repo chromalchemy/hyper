@@ -1,4 +1,4 @@
-(ns hyper.actions
+(ns ^:no-doc hyper.actions
   "Action handling for hyper applications.
 
    Actions are server-side functions triggered by client interactions."
@@ -24,6 +24,16 @@
     (string? g) (when-not (str/blank? g) g)
     :else       (throw (ex-info "action :when guard must evaluate to a string Datastar expression"
                                 {:guard g}))))
+
+(defn warn-deprecated-when!
+  "Emit a deprecation warning for the `action :when` guard, steering callers to
+   the `h/expr` composition.  Called at macro-expansion time."
+  []
+  (t/log! {:level :warn
+           :id    :hyper.warn/action-when-deprecated
+           :msg   (str "action :when is deprecated — gate the action with h/expr instead: "
+                       "(h/expr (when <cond> (h/action ...))). "
+                       "Client-param symbols like $key/$value work inside h/expr.")}))
 
 (defn build-action-expr
   "Build the Datastar/JS expression string for an action.

@@ -1,4 +1,4 @@
-(ns hyper.reactive
+(ns ^:no-doc hyper.reactive
   "Backwards-compatible shims for the reactive-component API.
 
    Reactive components are now just one kind of *subview* — a render-bearing,
@@ -18,9 +18,14 @@
 
 (defn render-component
   "Render a reactive component during a full page render.  Delegates to
-   `subview/render-reactive!` (a render-bearing, partial-on-change subview)."
-  [app-state* tab-id component-id deps render-fn]
-  (subview/render-reactive! app-state* tab-id component-id deps render-fn))
+   `subview/render-reactive!` (a render-bearing, partial-on-change subview).
+   The 5-arity treats `component-id` as the fallback id (root `:id` still
+   wins); the 6-arity passes a `key` (path-scoped identity) that takes
+   precedence."
+  ([app-state* tab-id component-id deps render-fn]
+   (subview/render-reactive! app-state* tab-id nil component-id deps render-fn))
+  ([app-state* tab-id key fallback-id deps render-fn]
+   (subview/render-reactive! app-state* tab-id key fallback-id deps render-fn)))
 
 (defn partial-render
   "Re-render a single reactive component and return the targeted-fragment HTML."

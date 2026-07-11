@@ -1,0 +1,142 @@
+name: Release
+
+on:
+  # Manual trigger — used for ad-hoc snapshot deploys.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (e.g. 0.1.0-SNAPSHOT)'
+        required: false
+        default: '0.1.0-SNAPSHOT'
+
+  # Release deploys — triggered by pushing a vX.Y.Z tag.
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+# Releases are sequential; don't cancel an in-flight deploy.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to Clojars
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      # `contents: write` is needed by softprops/action-gh-release to create
+      # the GitHub Release on a tag push.
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history + tags so git-cliff can diff against the previous tag.
+          fetch-depth: 0
+          fetch-tags: true
+
+      # Nix scaffolding mirrors .github/workflows/ci.yaml — hyper uses a
+      # shell.nix (not a flake), so we drive everything through `nix-shell`.
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra_nix_config: |
+            substituters = https://cache.nixos.org https://nix-community.cachix.org
+            trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= nix-community.cachix.org-1:mB9FSh9qf2dCimDSUo8Zy7bkq5CX+/rkCWyvRCYg3Fs=
+
+      - name: Enable Nix cache
+        uses: Camsbury/magic-nix-cache-action@main
+        with:
+          use-github-fork: true
+          github-fork-repo: Camsbury/magic-nix-cache
+          github-fork-ref: latest
+          github-fork-asset: magic-nix-cache
+          use-flakehub: false
+
+      - name: Cache clojure dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gitlibs
+            ~/.deps.clj
+          key: cljdeps-${{ hashFiles('deps.edn') }}
+          restore-keys: cljdeps-
+
+      - name: Build (nix-shell)
+        run: nix-shell --run "echo \"finished building.\""
+
+      - name: Resolve version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            # Tagged release — version comes from the tag (strip the leading "v").
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            # Manual run — use the dispatch input.
+            VERSION="${{ inputs.version }}"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Publishing version: $VERSION"
+
+      # Fail fast on tag pushes if the changelog hasn't been stamped. Catches
+      # the common mistake of tagging before running:
+      #   git cliff --tag vX.Y.Z --unreleased --prepend CHANGELOG.md
+      - name: Verify CHANGELOG.md has section for this release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          # Escape dots so the version is matched literally as a regex.
+          PATTERN="^## ${VERSION//./[.]}([[:space:]]|$)"
+          if ! grep -qE "$PATTERN" CHANGELOG.md; then
+            echo "::error file=CHANGELOG.md::Missing '## ${VERSION}' section in CHANGELOG.md"
+            echo ""
+            echo "CHANGELOG.md does not contain a section for ${VERSION}."
+            echo ""
+            echo "Run before tagging:"
+            echo "  git cliff --tag v${VERSION} --unreleased --prepend CHANGELOG.md"
+            echo "  git add CHANGELOG.md"
+            echo "  git commit -m 'docs: changelog for v${VERSION}'"
+            echo "  git tag -f v${VERSION} && git push origin main v${VERSION} --force-with-lease"
+            exit 1
+          fi
+          echo "✓ Found CHANGELOG.md entry for ${VERSION}"
+
+      - name: Run tests
+        run: nix-shell --run "clojure -M:main:test"
+
+      - name: Deploy to Clojars
+        env:
+          CLOJARS_USERNAME: ${{ secrets.CLOJARS_USERNAME }}
+          CLOJARS_PASSWORD: ${{ secrets.CLOJARS_PASSWORD }}
+        run: nix-shell --run "clojure -T:build deploy"
+
+      # Below: tag-push only. Snapshot dispatches stop after Clojars deploy.
+
+      # Use the hand-curated CHANGELOG.md as the single source of truth for
+      # release notes: extract everything between this version's "## <version>"
+      # heading and the next "## " heading. (The verify step above guarantees
+      # the section exists.)
+      - name: Extract release notes from CHANGELOG
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          awk -v ver="${VERSION//./[.]}" '
+            $0 ~ "^## " ver "([[:space:]]|$)" { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          # Strip leading and trailing blank lines (tac reverses so the same
+          # leading-trim also handles the trailing side).
+          awk 'NF {p=1} p' release-notes.md | tac | awk 'NF {p=1} p' | tac > release-notes.trimmed
+          mv release-notes.trimmed release-notes.md
+          echo "----- release notes -----"
+          cat release-notes.md
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body_path: release-notes.md

@@ -20,13 +20,14 @@
     (swap! disposed* inc)))
 
 (defn- wire-watch!
-  "Register + immediately wire a mount-scoped watch through the subview engine,
-   as h/watch! does when a renderer is present.  Returns the subview id."
+  "Register a mount-scoped watch with a renderer present, so it wires
+   immediately through the subview engine (as h/watch! does when a renderer
+   exists).  Returns the subview id."
   ([app-state* tab-id source] (wire-watch! app-state* tab-id source (fn [])))
   ([app-state* tab-id source trigger-render!]
-   (let [sid (subview/register-watch! app-state* tab-id source)]
-     (subview/wire-subview! app-state* tab-id sid trigger-render! nil)
-     sid)))
+   (swap! app-state* update-in [:tabs tab-id :renderer]
+          #(merge {:trigger-render! trigger-render! :trigger-partial! (fn [_])} %))
+   (subview/register-watch! app-state* tab-id source)))
 
 (deftest test-watchers
   (testing "Watchers trigger callback on state change"
@@ -261,10 +262,10 @@
 
       (state/get-or-create-tab! app-state* "test-session-nav" tab-id)
 
-      ;; A user watch is mount-scoped; a framework watch is tab-scoped.
+      ;; A user watch is mount-scoped; a framework watch is tab-scoped.  Both
+      ;; wire immediately because wire-watch! installed a renderer.
       (wire-watch! app-state* tab-id user-src)
-      (let [sid (subview/register-watch! app-state* tab-id framework-src :tab)]
-        (subview/wire-subview! app-state* tab-id sid (fn []) nil))
+      (subview/register-watch! app-state* tab-id framework-src :tab)
 
       (is (= 2 (count (get-in @app-state* [:tabs tab-id :subviews])))
           "both watches registered")

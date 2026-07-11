@@ -1,4 +1,4 @@
-(ns hyper.render.queue
+(ns ^:no-doc hyper.render.queue
   "Render queue — single coordination primitive for the per-tab renderer.
 
    Replaces the previous atoms (pending-partials*, full-render-needed*,

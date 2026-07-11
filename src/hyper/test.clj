@@ -33,10 +33,50 @@
             [hyper.render :as render]
             [hyper.render.error :as render.error]
             [hyper.state :as state]
-            [hyper.subview :as subview]))
+            [hyper.subview :as subview]
+            [reitit.core :as reitit]))
 
 (def ^:private default-session-id "test-session")
 (def ^:private default-tab-id "test-tab")
+
+(defn- flatten-routes
+  "Flatten a (possibly nested) reitit routes vector by compiling it and
+   reading the routes back, mirroring how the server stores :routes in
+   app-state for live route-metadata lookups."
+  [routes]
+  (when (seq routes)
+    (-> routes reitit/router reitit/routes)))
+
+(defn- resolve-router
+  "Resolve `{:router r :routes flat-routes}` for navigation support in a test
+   render, from the test-page opts.  Returns nil when no router/routes are
+   supplied (so existing tests are unaffected).
+
+   opts keys (both optional):
+   - :router — a pre-built reitit router, used as-is for name matching.
+   - :routes — a reitit routes vector (or a Var holding one) from which a
+               router is compiled.  Each route's :name is what h/navigate and
+               effects/navigate! match against.
+
+   When both are supplied, :router is used for matching and :routes for the
+   flattened route index (titles, render fns)."
+  [{:keys [router routes]}]
+  (let [routes (cond-> routes (var? routes) deref)]
+    (cond
+      router
+      {:router router
+       :routes (flatten-routes (or routes (reitit/routes router)))}
+
+      (reitit/router? routes)
+      {:router routes
+       :routes (flatten-routes (reitit/routes routes))}
+
+      (seq routes)
+      (let [flat (flatten-routes routes)]
+        {:router (reitit/router flat)
+         :routes flat})
+
+      :else nil)))
 
 (defn- build-actions-map
   "Build the actions map for the test result. Actions with an :as name are
@@ -83,6 +123,18 @@
    - :tab-id      — Tab ID string. Default: \"test-tab\".
    - :route       — Route info map {:name :path :path-params :query-params}.
                      Default: {:name :test-page :path \"/\" :path-params {} :query-params {}}.
+   - :routes      — A reitit routes vector (or a Var holding one) used to build
+                     a bound router so that `h/navigate` (during render) and
+                     `effects/navigate!` (during actions, via `test-action`)
+                     resolve named routes reliably — no need to spin up a full
+                     `create-handler`. The router and flattened routes are stored
+                     in app-state and threaded into the request as :hyper/router,
+                     and they persist across re-renders that share :app-state.
+                     Example: {:routes [[\"/\" {:name :home :get home-fn}]
+                                        [\"/about\" {:name :about :get about-fn}]]}.
+   - :router      — A pre-built reitit router, used as-is for name matching.
+                     Escape hatch for advanced cases; prefer :routes. When both
+                     are given, :router matches and :routes provides metadata.
    - :req         — Extra keys to merge into the request map passed to handler.
    - :render-middleware — Vector of middleware fns to wrap the handler.
                      Each is (fn [handler] (fn [req] ...)), identical to Ring
@@ -120,11 +172,19 @@
                                        :path-params  {}
                                        :query-params {}})
          cursors    (:cursors opts)
-         extra-req  (:req opts)]
+         extra-req  (:req opts)
+         resolved   (resolve-router opts)]
 
      ;; Ensure session and tab exist in state
      (state/get-or-create-tab! app-state* session-id tab-id)
      (state/set-tab-route! app-state* tab-id route)
+
+     ;; Store a bound router + flattened routes so h/navigate (render) and
+     ;; effects/navigate! (action) can resolve named routes in tests.
+     (when resolved
+       (swap! app-state* assoc
+              :router (:router resolved)
+              :routes (:routes resolved)))
 
      ;; Seed cursor state when provided
      (when-let [global-data (:global cursors)]
@@ -135,11 +195,13 @@
        (swap! app-state* update-in [:tabs tab-id :data] merge tab-data))
 
      ;; Build the request context
-     (let [req (cond-> {:hyper/session-id session-id
-                        :hyper/tab-id     tab-id
-                        :hyper/app-state  app-state*
-                        :hyper/route      route}
-                 extra-req (merge extra-req))]
+     (let [effective-router (or (:router resolved) (get @app-state* :router))
+           req              (cond-> {:hyper/session-id session-id
+                                     :hyper/tab-id     tab-id
+                                     :hyper/app-state  app-state*
+                                     :hyper/route      route}
+                              effective-router (assoc :hyper/router effective-router)
+                              extra-req        (merge extra-req))]
 
        ;; Bind context vars and render
        (push-thread-bindings (context/render-bindings req app-state*))

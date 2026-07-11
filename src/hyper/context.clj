@@ -1,4 +1,4 @@
-(ns hyper.context
+(ns ^:no-doc hyper.context
   "Request context and dynamic vars for hyper applications.
 
    Lives in a low-level namespace so that both render.clj and core.clj
@@ -10,8 +10,15 @@
 
 ;; Per-render action counter. Bound to (atom 0) before each render so that
 ;; deterministic render functions produce the same action IDs every time,
-;; enabling effective gzip streaming compression.
+;; enabling effective brotli streaming compression.
 (def ^:dynamic *action-idx* nil)
+
+;; Ambient key-path of the enclosing keyed regions. A keyed `reactive`/`async`
+;; pushes its key token while rendering its body, so a nested region's `:key`
+;; only has to be unique among its siblings (its id is the full path). Bound to
+;; [] at the root of a full render; restored from the region's stored path on a
+;; partial re-render.
+(def ^:dynamic *region-path* [])
 
 ;; Datastar signal values parsed from the @post() request body during
 ;; action execution.  Bound to a keyword-keyed map by the action handler
@@ -48,7 +55,10 @@
 ;; replayed onto the live atom via `flush-overlay!` — replaying operations
 ;; (not absolute values) lets a swap!/update-style write compose with a
 ;; concurrent same-path write instead of clobbering it; reset! still
-;; overwrites by design.  nil during action execution (without batch).
+;; overwrites by design.  The flush iterates to a fixpoint: cursor writes
+;; made by watch callbacks reacting to a phase are buffered and applied as
+;; subsequent atomic phases rather than dropped (see `flush-overlay!`).
+;; nil during action execution (without batch).
 ;;
 ;; Thread ownership: `future`, `send-off`, fibers, etc. convey dynamic
 ;; bindings, so background work spawned from a render/batch would inherit
@@ -88,15 +98,41 @@
           state
           ops))
 
+(declare ^:dynamic *render-guard*)
+
+(def ^:private max-flush-phases
+  "Ceiling on reactive flush phases before flush-overlay! throws — a watch
+   cycle whose values never reach a fixpoint would otherwise loop forever."
+  100)
+
 (defn flush-overlay!
-  "Replay the current overlay's op-log onto the live atom in a single swap!.
-   No-op when nothing was recorded, or the calling thread doesn't own the
-   overlay."
+  "Replay the current overlay's op-log onto the live atom, iterating to a
+   fixpoint.  All ops buffered before the call land in the first swap!, so
+   user write-pairs stay atomic.  Watch callbacks that run during a phase's
+   notifications and write cursors append new ops; each batch of appended
+   ops is applied as the next atomic phase until the log drains.  The render
+   guard is released for the duration — the render body has already been
+   judged, and reaction writes are applied rather than dropped, so they are
+   not render effects.  Throws when the log keeps growing past
+   `max-flush-phases` (a non-converging write cycle).  No-op when nothing
+   was recorded, or the calling thread doesn't own the overlay."
   [app-state*]
   (when-let [{:keys [ops*]} (current-overlay)]
-    (let [ops @ops*]
-      (when (seq ops)
-        (swap! app-state* apply-ops ops)))))
+    (binding [*render-guard* nil]
+      (loop [applied 0
+             phase   1]
+        (let [ops     @ops*
+              pending (subvec ops applied)]
+          (when (seq pending)
+            (when (> phase max-flush-phases)
+              (throw (ex-info (str "flush-overlay! did not converge after "
+                                   max-flush-phases " phases — a cursor watch "
+                                   "keeps writing on every phase (write cycle?)")
+                              {:hyper/flush-phases (dec phase)
+                               :hyper/pending-ops  (mapv #(select-keys % [:kind :path])
+                                                         pending)})))
+            (swap! app-state* apply-ops pending)
+            (recur (count ops) (inc phase))))))))
 
 ;; The :as name of the currently executing action, or nil when outside
 ;; an action context or when the action was not given an :as name.
@@ -135,6 +171,7 @@
   [req app-state*]
   {#'*request*                req
    #'*action-idx*             (atom 0)
+   #'*region-path*            []
    #'*declared-signals*       (atom [])
    #'*registered-action-ids*  (atom #{})
    #'*registered-subview-ids* (atom #{})
@@ -149,6 +186,7 @@
   [req]
   {#'*request*                req
    #'*action-idx*             (atom 0)
+   #'*region-path*            []
    #'*declared-signals*       (atom [])
    #'*registered-action-ids*  (atom #{})
    #'*registered-subview-ids* (atom #{})
@@ -177,6 +215,26 @@
      :tab-id     tab-id
      :app-state* app-state*
      :router     (:hyper/router *request*)}))
+
+(defn context-request
+  "Build the hyper request-context map for `tab-id`: :hyper/session-id,
+   :hyper/tab-id, :hyper/app-state, :hyper/router, :hyper/route, and
+   :hyper/env. Route, env, and (2-arity) session-id come from the tab record;
+   router from app-state."
+  ([app-state* tab-id]
+   (context-request app-state* tab-id (get-in @app-state* [:tabs tab-id :session-id])))
+  ([app-state* tab-id session-id]
+   {:hyper/session-id session-id
+    :hyper/tab-id     tab-id
+    :hyper/app-state  app-state*
+    :hyper/router     (get @app-state* :router)
+    :hyper/route      (get-in @app-state* [:tabs tab-id :route])
+    :hyper/env        (get-in @app-state* [:tabs tab-id :env])}))
+
+(defn teardown-request
+  "Build the request-context map for running a tab's teardown (:unmount) fns."
+  [app-state* tab-id]
+  (context-request app-state* tab-id))
 
 ;; ---------------------------------------------------------------------------
 ;; Render purity guard

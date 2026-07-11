@@ -1,4 +1,4 @@
-(ns hyper.subview
+(ns ^:no-doc hyper.subview
   "Unified per-tab sub-region lifecycle registry.
 
    A *subview* is a managed region of a page that owns a slice of lifecycle:
@@ -37,26 +37,74 @@
   [app-state* tab-id sid]
   (get-in @app-state* [:tabs tab-id :subviews sid]))
 
-(defn- inject-id
-  "Inject a subview ID onto hiccup.  If the element already has an :id, uses
-   it as the html-id and leaves the hiccup unchanged.  Otherwise, adds the
-   subview-id as the :id.  Returns [html-id hiccup]."
-  [hiccup sid]
-  (let [[tag & rest] hiccup
-        has-attrs?   (map? (first rest))
-        attrs        (if has-attrs? (first rest) {})
-        children     (if has-attrs? (next rest) rest)]
-    (if-let [existing-id (:id attrs)]
-      [(str existing-id) hiccup]
-      [sid (into [tag (assoc attrs :id sid)] children)])))
+(defn key->token
+  "Derive a stable, id-safe token from a region `:key` value.  Simple values
+   pass through; anything else collapses to a hash."
+  [k]
+  (let [s (cond
+            (string? k)                 k
+            (keyword? k)                (subs (str k) 1)
+            (symbol? k)                 (str k)
+            (or (integer? k) (uuid? k)) (str k))]
+    ;; Tokens must be CSS-identifier-safe — they land in element ids that
+    ;; Datastar resolves as `#id`. Anything else collapses to a hex hash.
+    (if (and s (re-matches #"[A-Za-z0-9_-]+" s))
+      s
+      (format "%08x" (bit-and (hash k) 0xffffffff)))))
+
+(defn scoped-id
+  "Compose a CSS-safe region id from `prefix`, `tab-id`, the ambient
+   `*region-path*`, and `token`.  A nested region encodes its parent path as a
+   hex hash segment rather than a path-joined string, so the id stays a valid
+   `#id` selector for Datastar morphing."
+  [prefix tab-id token]
+  (let [parent context/*region-path*]
+    (if (empty? parent)
+      (str prefix tab-id "_" token)
+      (str prefix tab-id "_" (format "%08x" (bit-and (hash parent) 0xffffffff)) "_" token))))
+
+(defn- resolve-region-id
+  "Resolve a region's id and ensure the hiccup root carries it as `:id` (the
+   morph anchor).  Precedence: `explicit-id` > the root element's `:id` >
+   `fallback-id`.  A nil body renders nothing but the region still needs a
+   stable anchor for later partial fragments, so an empty element carrying the
+   id is returned.  Returns `[id hiccup]`."
+  [explicit-id fallback-id hiccup]
+  (if (nil? hiccup)
+    (let [id (or explicit-id fallback-id)]
+      [id [:div {:id id}]])
+    (let [[tag & more] hiccup
+          has-attrs?   (map? (first more))
+          attrs        (if has-attrs? (first more) {})
+          children     (if has-attrs? (next more) more)
+          root-id      (some-> (:id attrs) str)
+          id           (or explicit-id root-id fallback-id)]
+      (if (= id root-id)
+        [id hiccup]
+        [id (into [tag (assoc attrs :id id)] children)]))))
+
+(defn- check-region-unique!
+  "Throw when `id` was already registered by an earlier region in this render.
+   Positional ids are unique by construction, so a clash always means two
+   regions resolved to the same `:key`/`:id`."
+  [tab-id id]
+  (when-let [acc context/*registered-subview-ids*]
+    (when (contains? @acc id)
+      (throw (ex-info (str "Duplicate region id " (pr-str id)
+                           " in one render — :key/:id values must be unique.")
+                      {:hyper/region-id id :hyper/tab-id tab-id})))))
 
 ;; ---------------------------------------------------------------------------
 ;; Registration
 ;; ---------------------------------------------------------------------------
 
+(declare wire-subview!)
+
 (defn register-subview!
   "Record/refresh a subview during a render, marking it live for this render
-   cycle so it survives the post-render sweep.  Idempotent.
+   cycle so it survives the post-render sweep, and wire its dep watches when a
+   renderer is present (see `wire-subview!`).  Wiring can enqueue a partial
+   render if a dep already changed.  Idempotent.
 
    `spec` keys (all optional unless noted):
    - :deps        vector of Watchable sources to subscribe (ref-counted)
@@ -84,6 +132,7 @@
                  (update :on-change #(or % :partial))
                  (update :scope #(or % :render)))]
     (swap! app-state* assoc-in [:tabs tab-id :subviews sid] spec)
+    (wire-subview! app-state* tab-id sid)
     spec))
 
 ;; ---------------------------------------------------------------------------
@@ -101,8 +150,8 @@
    apply the same transform — otherwise a consumer hiccup dialect that relies
    on it (e.g. lambdaisland/ornament `defstyled` tags, or function components)
    serializes raw on a transform-less re-render: the component leaks its name
-   as text and loses its element/attributes.  Applied after `inject-id` so the
-   injected id flows through the transform onto the root element."
+   as text and loses its element/attributes.  Applied after `resolve-region-id`
+   so the resolved id flows through the transform onto the root element."
   [app-state* hiccup]
   (let [transform (get @app-state* :hiccup-transform)]
     (c/html (if transform (transform hiccup) hiccup))))
@@ -116,18 +165,27 @@
    existing :id), caches the serialized HTML for later partial re-renders, and
    registers the subview as live.  Returns the hiccup.
 
+   Identity resolves as `key` (path-scoped) > the root element's `:id` >
+   `fallback-id` (the positional id), and keys the registry and morph anchor
+   alike.  A `key` also scopes the region path for nested regions.
    `:on-change` defaults to `:partial` — a dep change re-renders only this
    region."
-  [app-state* tab-id sid deps render-fn]
-  (let [body             (render-fn)
-        [html-id hiccup] (inject-id body sid)
-        html             (render-html app-state* hiccup)]
-    (register-subview! app-state* tab-id sid
+  [app-state* tab-id key fallback-id deps render-fn]
+  (let [token       (when (some? key) (key->token key))
+        explicit-id (when token (scoped-id "r_" tab-id token))
+        path        (cond-> context/*region-path* token (conj token))
+        dep-vals    (mapv deref deps)
+        body        (binding [context/*region-path* path] (render-fn))
+        [id hiccup] (resolve-region-id explicit-id fallback-id body)
+        html        (render-html app-state* hiccup)]
+    (check-region-unique! tab-id id)
+    (register-subview! app-state* tab-id id
                        {:render-fn   render-fn
                         :deps        deps
-                        :dep-vals    (mapv deref deps)
+                        :dep-vals    dep-vals
                         :cached-html html
-                        :html-id     html-id
+                        :html-id     id
+                        :region-path path
                         :on-change   :partial})
     hiccup))
 
@@ -144,20 +202,18 @@
     (when render-fn
       (let [tab-state  (get-in @app-state* [:tabs tab-id])
             session-id (:session-id tab-state)
-            req        {:hyper/session-id session-id
-                        :hyper/tab-id     tab-id
-                        :hyper/app-state  app-state*
-                        :hyper/router     (:router @app-state*)}]
+            req        (context/context-request app-state* tab-id session-id)]
         (push-thread-bindings (context/partial-render-bindings req))
         (try
-          (let [body             (render-fn)
-                [html-id hiccup] (inject-id body sid)
-                html             (render-html app-state* hiccup)]
+          (let [body         (binding [context/*region-path* (:region-path spec [])]
+                               (render-fn))
+                [_id hiccup] (resolve-region-id sid sid body)
+                html         (render-html app-state* hiccup)]
             (swap! app-state* assoc-in [:tabs tab-id :subviews sid]
                    (assoc spec
                           :dep-vals    (mapv deref deps)
                           :cached-html html
-                          :html-id     html-id))
+                          :html-id     sid))
             html)
           (finally
             (pop-thread-bindings)))))))
@@ -280,16 +336,26 @@
      sid)))
 
 (defn wire-subview!
-  "Wire a single subview's dep watches immediately, if it has deps and is not
-   already wired (dedup against :subview-watches).  Used by h/watch! to attach
-   the watch the moment it is registered when a renderer is already present;
-   otherwise `setup-new-watches!` wires it on the next full render."
-  [app-state* tab-id sid trigger-render! enqueue-partial!]
-  (when-let [{:keys [deps on-change]} (get-subview app-state* tab-id sid)]
-    (when (and (seq deps)
-               (not (contains? (get-in @app-state* [:tabs tab-id :subview-watches]) sid)))
-      (setup-subview-watches! app-state* tab-id sid deps (or on-change :partial)
-                              trigger-render! enqueue-partial!))))
+  "Wire a subview's dep watches when an SSE renderer is present and the subview
+   has deps not already wired.  A no-op before a renderer exists — the first
+   full render's `setup-new-watches!` wires it then.
+
+   If a dep changed between the render and this wiring (e.g. an async fetch that
+   landed before the watch was attached), fires the change once so the update is
+   not missed."
+  [app-state* tab-id sid]
+  (when-let [{:keys [trigger-render! trigger-partial!]} (get-in @app-state* [:tabs tab-id :renderer])]
+    (when-let [{:keys [deps on-change dep-vals]} (get-subview app-state* tab-id sid)]
+      (when (and (seq deps)
+                 (not (contains? (get-in @app-state* [:tabs tab-id :subview-watches]) sid)))
+        (setup-subview-watches! app-state* tab-id sid deps (or on-change :partial)
+                                trigger-render! trigger-partial!)
+        ;; A fetch landing here can trip both the just-attached watch and this
+        ;; check, firing two partials — that is deliberate: a redundant partial
+        ;; is idempotent, whereas dropping the check would reopen a lost-update
+        ;; race for a fetch that landed before the watch was attached.
+        (when (and dep-vals (not= dep-vals (mapv deref deps)))
+          (if (= on-change :full) (trigger-render!) (trigger-partial! sid)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Worker subviews (h/spawn!)
@@ -317,16 +383,11 @@
    Idempotent: a form-1 render body re-invokes `h/spawn!` on every render, so
    only the first occurrence (when `sid` is absent) actually spawns; later
    renders are a no-op."
-  [app-state* tab-id sid session-id router worker-fn]
+  [app-state* tab-id sid session-id worker-fn]
   (when-let [acc context/*registered-subview-ids*]
     (swap! acc conj sid))
   (when-not (get-subview app-state* tab-id sid)
-    (let [env    (get-in @app-state* [:tabs tab-id :env])
-          req    {:hyper/session-id session-id
-                  :hyper/tab-id     tab-id
-                  :hyper/app-state  app-state*
-                  :hyper/router     router
-                  :hyper/env        env}
+    (let [req    (context/context-request app-state* tab-id session-id)
           thread (Thread/startVirtualThread
                    (fn []
                      (binding [context/*request* req]
@@ -367,13 +428,8 @@
    teardown) leaves the cell untouched: the new fetch or teardown owns it.
    Records the thread in the async store so a later refetch/teardown can
    interrupt it."
-  [app-state* tab-id session-id router store-path cell fetch-fn]
-  (let [env    (get-in @app-state* [:tabs tab-id :env])
-        req    {:hyper/session-id session-id
-                :hyper/tab-id     tab-id
-                :hyper/app-state  app-state*
-                :hyper/router     router
-                :hyper/env        env}
+  [app-state* tab-id session-id store-path cell fetch-fn]
+  (let [req    (context/context-request app-state* tab-id session-id)
         thread (Thread/startVirtualThread
                  (fn []
                    (binding [context/*request* req]
@@ -396,14 +452,14 @@
      cell {:status :reloading :result <prior>}, interrupt the in-flight fetch,
      re-snapshot deps, and spawn a fresh fetch.
    - Otherwise: reuse the existing cell (no refetch)."
-  [app-state* tab-id session-id router store-path user-deps fetch-fn]
+  [app-state* tab-id session-id store-path user-deps fetch-fn]
   (let [existing (get-in @app-state* store-path)
         cur-vals (mapv deref user-deps)]
     (cond
       (nil? existing)
       (let [cell (atom {:status :loading})]
         (swap! app-state* assoc-in store-path {:cell cell :dep-vals cur-vals :thread nil})
-        (start-async-fetch! app-state* tab-id session-id router store-path cell fetch-fn)
+        (start-async-fetch! app-state* tab-id session-id store-path cell fetch-fn)
         cell)
 
       (not= cur-vals (:dep-vals existing))
@@ -411,7 +467,7 @@
         (swap! cell (fn [s] {:status :reloading :result (:result s)}))
         (when-let [^Thread old (:thread existing)] (.interrupt old))
         (swap! app-state* assoc-in store-path (assoc existing :dep-vals cur-vals))
-        (start-async-fetch! app-state* tab-id session-id router store-path cell fetch-fn)
+        (start-async-fetch! app-state* tab-id session-id store-path cell fetch-fn)
         cell)
 
       :else
@@ -436,26 +492,35 @@
    coordination store.  The render body must return a single rooted hiccup
    element (as with `reactive`), so the id can be injected.  Returns the
    hiccup."
-  [app-state* tab-id session-id router component-id user-deps fetch-fn render-fn]
-  (let [store-path       [:tabs tab-id :async component-id]
-        cell             (coordinate-async! app-state* tab-id session-id router
-                                            store-path user-deps fetch-fn)
-        deps             (into [cell] user-deps)
-        body             (render-fn @cell)
-        [html-id hiccup] (inject-id body component-id)
-        html             (render-html app-state* hiccup)
+  [app-state* tab-id session-id key fallback-id user-deps fetch-fn render-fn]
+  (let [token        (when (some? key) (key->token key))
+        component-id (if token (scoped-id "async_" tab-id token) fallback-id)
+        path         (cond-> context/*region-path* token (conj token))
+        store-path   [:tabs tab-id :async component-id]
+        cell         (coordinate-async! app-state* tab-id session-id
+                                        store-path user-deps fetch-fn)
+        deps         (into [cell] user-deps)
+        ;; Snapshot deps before rendering, and render against the snapshot, so
+        ;; the cached :dep-vals matches what the body shows.  A fetch that lands
+        ;; after this is then a genuine change the watch (or wiring) reacts to.
+        dep-vals     (mapv deref deps)
+        body         (binding [context/*region-path* path] (render-fn (first dep-vals)))
+        [id hiccup]  (resolve-region-id component-id component-id body)
+        html         (render-html app-state* hiccup)
+        _            (check-region-unique! tab-id id)
         ;; The stored render-fn re-coordinates (so a partial re-render from a
         ;; user-dep change still refetches) then renders the current status.
-        thunk            (fn []
-                           (let [cell (coordinate-async! app-state* tab-id session-id router
-                                                         store-path user-deps fetch-fn)]
-                             (render-fn @cell)))]
+        thunk        (fn []
+                       (let [cell (coordinate-async! app-state* tab-id session-id
+                                                     store-path user-deps fetch-fn)]
+                         (render-fn @cell)))]
     (register-subview! app-state* tab-id component-id
                        {:render-fn   thunk
                         :deps        deps
-                        :dep-vals    (mapv deref deps)
+                        :dep-vals    dep-vals
                         :cached-html html
-                        :html-id     html-id
+                        :html-id     id
+                        :region-path path
                         :on-change   :partial
                         :scope       :render
                         :unmount     (fn [_]

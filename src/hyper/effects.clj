@@ -53,7 +53,7 @@
 ;; Pending effects accumulator
 ;; ---------------------------------------------------------------------------
 
-(def ^:dynamic *pending*
+(def ^:no-doc ^:dynamic *pending*
   "Accumulator for effects emitted during action execution.
 
    Bound to (atom {:cookies {} :scripts [] :session-ops []}) by the
@@ -269,13 +269,13 @@
 ;; Internal — used by action-handler in server.clj
 ;; ---------------------------------------------------------------------------
 
-(defn init-pending
+(defn ^:no-doc init-pending
   "Create a fresh pending effects atom.  Called by action-handler before
    binding *pending*."
   []
   (atom {:cookies {} :scripts [] :session-ops []}))
 
-(defn collect-pending!
+(defn ^:no-doc collect-pending!
   "Drain and return the accumulated effects.  Returns a map with
    :cookies, :scripts, and :session-ops.  Called by action-handler
    after action execution."
@@ -283,7 +283,7 @@
   (when *pending*
     @*pending*))
 
-(defn apply-cookies-to-response
+(defn ^:no-doc apply-cookies-to-response
   "Merge pending cookies into an HTTP response map.
    Returns the response with :cookies added/merged."
   [response pending-effects]
@@ -317,7 +317,7 @@
              (reduce apply-session-op (or base-session {}) ops))
       response)))
 
-(defn format-execute-script-event
+(defn ^:no-doc format-execute-script-event
   "Format a JavaScript string as a Datastar patch-elements SSE event
    that appends a self-removing <script> tag to the body.
 
@@ -331,7 +331,7 @@
        "data: selector body\n"
        "data: elements <script data-effect=\"el.remove()\">" js "</script>\n\n"))
 
-(defn format-pending-scripts
+(defn ^:no-doc format-pending-scripts
   "Format all pending scripts as SSE events.  Returns a single string
    of concatenated SSE events, or nil if there are no scripts."
   [pending-effects]

@@ -3,6 +3,7 @@
             [clojure.test :refer [deftest is testing]]
             [hyper.context :as context]
             [hyper.core :as hy]
+            [hyper.datastar :as datastar]
             [hyper.render :as render]
             [hyper.render.error :as render.error]
             [hyper.signal :as signal]
@@ -87,7 +88,7 @@
     (is (thrown? Exception
                  (hy/action (println "test")))))
 
-  (testing "action registers and returns Datastar expression string"
+  (testing "action registers and returns a Datastar expression"
     (let [app-state* (atom (state/init-state))
           session-id "test-session-3"
           tab-id     "test_tab_2"
@@ -95,14 +96,15 @@
       (binding [context/*request* {:hyper/session-id session-id
                                    :hyper/tab-id     tab-id
                                    :hyper/app-state  app-state*}]
-        (let [action-expr (hy/action (reset! executed true))]
-          (is (string? action-expr))
-          (is (.contains action-expr "@post"))
-          (is (.contains action-expr "/hyper/actions"))
-          (is (.contains action-expr "action-id="))
+        (let [action-expr (hy/action (reset! executed true))
+              action-js   (str action-expr)]
+          (is (datastar/datastar-expr? action-expr))
+          (is (.contains action-js "@post"))
+          (is (.contains action-js "/hyper/actions"))
+          (is (.contains action-js "action-id="))
 
           ;; Extract action ID and execute it
-          (let [action-id (second (re-find #"action-id=([^']+)" action-expr))]
+          (let [action-id (second (re-find #"action-id=([^']+)" action-js))]
             (is (some? action-id))
             ((get-in @app-state* [:actions action-id :fn]) nil)
             (is @executed)))))))
@@ -332,6 +334,19 @@
         (let [cursor (hy/path-cursor :q "")]
           (is (= "clojure" @cursor))))))
 
+  (testing "path-cursor stamps :hyper/scope and :hyper/path metadata"
+    (let [app-state* (atom (state/init-state))
+          session-id "test-session-path-meta"
+          tab-id     "test_tab_path_meta"]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (state/set-tab-route! app-state* tab-id
+                            {:name :home :path "/" :path-params {} :query-params {}})
+      (binding [context/*request* {:hyper/session-id session-id
+                                   :hyper/tab-id     tab-id
+                                   :hyper/app-state  app-state*}]
+        (is (= {:hyper/scope :path :hyper/path [:page]}
+               (meta (hy/path-cursor :page 1)))))))
+
   (testing "path-cursor swap! works"
     (let [app-state* (atom (state/init-state))
           session-id "test-session-path-3"
@@ -357,7 +372,7 @@
       (binding [context/*request* {:hyper/session-id session-id
                                    :hyper/tab-id     tab-id
                                    :hyper/app-state  app-state*}]
-        (let [action-expr (hy/action (reset! (hy/tab-cursor :query) $value))]
+        (let [action-expr (str (hy/action (reset! (hy/tab-cursor :query) $value)))]
           (is (string? action-expr))
           (is (.contains action-expr "@post("))
           (is (.contains action-expr "hyper.encodeClientParams"))
@@ -375,7 +390,7 @@
       (binding [context/*request* {:hyper/session-id session-id
                                    :hyper/tab-id     tab-id
                                    :hyper/app-state  app-state*}]
-        (let [action-expr (hy/action (reset! (hy/tab-cursor :dark?) $checked))]
+        (let [action-expr (str (hy/action (reset! (hy/tab-cursor :dark?) $checked)))]
           (is (.contains action-expr "checked:evt.target.checked"))
           (let [action-id (second (re-find #"action-id=([^'&\"]+)" action-expr))]
             (is (some? action-id))
@@ -390,7 +405,7 @@
       (binding [context/*request* {:hyper/session-id session-id
                                    :hyper/tab-id     tab-id
                                    :hyper/app-state  app-state*}]
-        (let [action-expr (hy/action (reset! (hy/tab-cursor :last-key) $key))]
+        (let [action-expr (str (hy/action (reset! (hy/tab-cursor :last-key) $key)))]
           (is (.contains action-expr "key:evt.key"))
           (let [action-id (second (re-find #"action-id=([^'&\"]+)" action-expr))]
             (is (some? action-id))
@@ -405,7 +420,7 @@
       (binding [context/*request* {:hyper/session-id session-id
                                    :hyper/tab-id     tab-id
                                    :hyper/app-state  app-state*}]
-        (let [action-expr (hy/action (reset! (hy/tab-cursor :form) $form-data))]
+        (let [action-expr (str (hy/action (reset! (hy/tab-cursor :form) $form-data)))]
           (is (.contains action-expr "formData:Object.fromEntries"))
           (let [action-id (second (re-find #"action-id=([^'&\"]+)" action-expr))]
             (is (some? action-id))
@@ -421,7 +436,7 @@
       (binding [context/*request* {:hyper/session-id session-id
                                    :hyper/tab-id     tab-id
                                    :hyper/app-state  app-state*}]
-        (let [action-expr (hy/action (swap! (hy/tab-cursor :count 0) inc))]
+        (let [action-expr (str (hy/action (swap! (hy/tab-cursor :count 0) inc)))]
           (is (.contains action-expr "@post("))
           (is (not (.contains action-expr "hyper.encodeClientParams")))))))
 
@@ -433,8 +448,8 @@
       (binding [context/*request* {:hyper/session-id session-id
                                    :hyper/tab-id     tab-id
                                    :hyper/app-state  app-state*}]
-        (let [action-expr (hy/action (do (reset! (hy/tab-cursor :val) $value)
-                                         (reset! (hy/tab-cursor :k) $key)))]
+        (let [action-expr (str (hy/action (do (reset! (hy/tab-cursor :val) $value)
+                                              (reset! (hy/tab-cursor :k) $key))))]
           (is (.contains action-expr "@post("))
           (is (.contains action-expr "hyper.encodeClientParams"))
           (is (.contains action-expr "value:evt.target.value"))
@@ -448,8 +463,8 @@
       (binding [context/*request* {:hyper/session-id session-id
                                    :hyper/tab-id     tab-id
                                    :hyper/app-state  app-state*}]
-        (let [action-expr (hy/action {:when "evt.key === 'Enter'"}
-                                     (reset! (hy/tab-cursor :val) $value))]
+        (let [action-expr (str (hy/action {:when "evt.key === 'Enter'"}
+                                          (reset! (hy/tab-cursor :val) $value)))]
           (is (string? action-expr))
           (is (.contains action-expr "evt.key === 'Enter'"))
           (is (.contains action-expr "@post("))
@@ -470,7 +485,7 @@
       (binding [context/*request* {:hyper/session-id session-id
                                    :hyper/tab-id     tab-id
                                    :hyper/app-state  app-state*}]
-        (let [action-expr (hy/action {:when ""} (reset! (hy/tab-cursor :val) $value))]
+        (let [action-expr (str (hy/action {:when ""} (reset! (hy/tab-cursor :val) $value)))]
           (is (.contains action-expr "@post("))
           (is (.contains action-expr "hyper.encodeClientParams"))
           (is (.contains action-expr "value:evt.target.value"))
@@ -484,8 +499,8 @@
       (binding [context/*request* {:hyper/session-id session-id
                                    :hyper/tab-id     tab-id
                                    :hyper/app-state  app-state*}]
-        (let [action-expr (hy/action {:when (hy/expr (= evt.key "Enter"))}
-                                     (reset! (hy/tab-cursor :val) $value))]
+        (let [action-expr (str (hy/action {:when (hy/expr (= evt.key "Enter"))}
+                                          (reset! (hy/tab-cursor :val) $value)))]
           (is (.startsWith action-expr "(evt.key) === (\"Enter\") && "))
           (is (.contains action-expr "@post("))))))
 
@@ -510,7 +525,7 @@
       (binding [context/*request* {:hyper/session-id session-id
                                    :hyper/tab-id     tab-id
                                    :hyper/app-state  app-state*}]
-        (let [action-expr (hy/action (swap! (hy/tab-cursor :n 0) inc))]
+        (let [action-expr (str (hy/action (swap! (hy/tab-cursor :n 0) inc)))]
           (is (string/includes? action-expr "@post('/hyper/actions?"))))))
 
   (testing "action macro prefixes /hyper/actions with :base-path"
@@ -521,7 +536,7 @@
       (binding [context/*request* {:hyper/session-id session-id
                                    :hyper/tab-id     tab-id
                                    :hyper/app-state  app-state*}]
-        (let [action-expr (hy/action (swap! (hy/tab-cursor :n 0) inc))]
+        (let [action-expr (str (hy/action (swap! (hy/tab-cursor :n 0) inc)))]
           (is (string/includes? action-expr "@post('/my-app/hyper/actions?"))
           (is (not (string/includes? action-expr "@post('/hyper/actions?")))))))
 
@@ -533,7 +548,7 @@
       (binding [context/*request* {:hyper/session-id session-id
                                    :hyper/tab-id     tab-id
                                    :hyper/app-state  app-state*}]
-        (let [action-expr (hy/action (reset! (hy/tab-cursor :v) $value))]
+        (let [action-expr (str (hy/action (reset! (hy/tab-cursor :v) $value)))]
           (is (string/includes? action-expr "@post('/sub/hyper/actions?"))
           (is (string/includes? action-expr "hyper.encodeClientParams"))))))
 
@@ -545,8 +560,8 @@
       (binding [context/*request* {:hyper/session-id session-id
                                    :hyper/tab-id     tab-id
                                    :hyper/app-state  app-state*}]
-        (let [action-expr (hy/action {:when "evt.key === 'Enter'"}
-                                     (swap! (hy/tab-cursor :n 0) inc))]
+        (let [action-expr (str (hy/action {:when "evt.key === 'Enter'"}
+                                          (swap! (hy/tab-cursor :n 0) inc)))]
           (is (string/includes? action-expr "@post('/app/hyper/actions?"))
           (is (string/starts-with? action-expr "evt.key === 'Enter' && ")))))))
 
@@ -647,6 +662,31 @@
         (is (= 2 (get-in @app-state* [:tabs "t1" :data :b])))
         (is (= 3 (get-in @app-state* [:tabs "t1" :data :c]))))
       (remove-watch app-state* :counter))))
+
+(deftest batch-reaction-transparency-test
+  (testing "a watch reacting to the batch flush with a batch-wrapped cursor
+            write does not re-enter the flush — ops apply exactly once and
+            the reaction write lands as a follow-up update"
+    (let [app-state* (atom (state/init-state))
+          _          (state/get-or-create-tab! app-state* "s1" "t1")]
+      (binding [context/*request* {:hyper/session-id "s1"
+                                   :hyper/tab-id     "t1"
+                                   :hyper/app-state  app-state*}]
+        (let [n*     (hy/tab-cursor :n 0)
+              other* (hy/tab-cursor :other)]
+          (add-watch app-state* :batched-reaction
+                     (fn [_ _ old new]
+                       (let [p [:tabs "t1" :data :n]]
+                         (when (not= (get-in old p) (get-in new p))
+                           (hy/batch
+                             (reset! other* :from-batch))))))
+          (hy/batch
+            (swap! n* inc))
+          (is (= 1 (get-in @app-state* [:tabs "t1" :data :n]))
+              "op applied exactly once — no re-entrant flush")
+          (is (= :from-batch (get-in @app-state* [:tabs "t1" :data :other]))
+              "batched reaction write landed")))
+      (remove-watch app-state* :batched-reaction))))
 
 (deftest batch-return-value-test
   (testing "batch returns the value of the last expression"

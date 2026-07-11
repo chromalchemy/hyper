@@ -23,6 +23,27 @@
       (is (= {} (:tabs state)))
       (is (= {} (:actions state))))))
 
+(deftest cursor-scope-metadata-test
+  (let [app-state* (atom (state/init-state))]
+    (testing "scoped constructors stamp :hyper/scope and :hyper/path"
+      (is (= {:hyper/scope :global :hyper/path [:theme]}
+             (meta (state/global-cursor app-state* :theme))))
+      (is (= {:hyper/scope :session :hyper/path [:user :name]}
+             (meta (state/session-cursor app-state* "s1" [:user :name]))))
+      (is (= {:hyper/scope :tab :hyper/path [:count]}
+             (meta (state/tab-cursor app-state* "t1" :count)))))
+
+    (testing "default-value arities stamp the same metadata"
+      (is (= {:hyper/scope :global :hyper/path [:n]}
+             (meta (state/global-cursor app-state* :n 0))))
+      (is (= {:hyper/scope :session :hyper/path [:cols 0 :width]}
+             (meta (state/session-cursor app-state* "s1" [:cols 0 :width] 240))))
+      (is (= {:hyper/scope :tab :hyper/path [:draft]}
+             (meta (state/tab-cursor app-state* "t1" :draft "")))))
+
+    (testing "raw create-cursor carries no scope metadata"
+      (is (= {} (meta (state/create-cursor app-state* [:custom] :x)))))))
+
 (deftest session-management-test
   (testing "creates new session"
     (let [app-state* (atom (state/init-state))

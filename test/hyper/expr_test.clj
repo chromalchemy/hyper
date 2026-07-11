@@ -2,14 +2,32 @@
   "Unit tests for hyper.expr — the Clojure → Datastar expression transpiler."
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
-            [hyper.expr :refer [->expr]]
-            [hyper.signal :as signal]))
+            [hyper.context :as context]
+            [hyper.core :as h]
+            [hyper.datastar :as datastar]
+            [hyper.expr :as expr :refer [->expr]]
+            [hyper.signal :as signal]
+            [hyper.state :as state]))
 
 (defn- local-sig [nm default]
   (signal/->LocalSignal (str "_" nm) (str "_" nm) default))
 
 (defn- sig [js-name]
   (signal/->Signal js-name js-name [(keyword js-name)] (atom {}) "t1" nil))
+
+(defmacro ^:private rendering
+  "Evaluate body inside a minimal render context so `h/action` can register
+   and produce its expression."
+  [app-state* & body]
+  `(binding [context/*request*    {:hyper/session-id "s"         :hyper/tab-id "t"
+                                   :hyper/app-state  ~app-state* :hyper/router nil}
+             context/*action-idx* (atom 0)]
+     ~@body))
+
+(defn- new-tab []
+  (let [app-state* (atom (state/init-state))]
+    (state/get-or-create-tab! app-state* "s" "t")
+    app-state*))
 
 ;; ---------------------------------------------------------------------------
 ;; Raw Datastar style (no locals)
@@ -162,3 +180,80 @@
   (testing "deref of a non-signal var is left to the client (no splice)"
     (is (str/includes? (->expr (not @some-undefined-thing))
                        "squint_core.deref"))))
+
+;; ---------------------------------------------------------------------------
+;; DatastarExpr splicing — signals and actions ride one dispatch
+;; ---------------------------------------------------------------------------
+
+(deftest test-splice-datastar-expr
+  (testing "signals splice to their $ref via the protocol"
+    (is (= "$userName" (expr/splice (sig "userName") :value)))
+    (is (= "$_open" (expr/splice (local-sig "open" false) :value))))
+
+  (testing "a RawExpr splices as raw JS, not a quoted literal"
+    (is (= "@post('/x')" (expr/splice (datastar/raw-expr "@post('/x')") :value))))
+
+  (testing "ordinary values fall back to JS literals"
+    (is (= "'hi'" (expr/splice "hi" :value)))
+    (is (= "[1, 2, 3]" (expr/splice [1 2 3] :value))))
+
+  (testing ":signal mode stays strict — a RawExpr is not an assignment target"
+    (is (thrown-with-msg? Exception #"must be a signal"
+                          (expr/splice (datastar/raw-expr "@post('/x')") :signal)))))
+
+;; ---------------------------------------------------------------------------
+;; Actions embedded inside expr
+;; ---------------------------------------------------------------------------
+
+(deftest test-action-in-expr
+  (testing "a bare action splices its raw @post(...) into the expression"
+    (let [app-state* (new-tab)]
+      (rendering app-state*
+                 (is (= "@post('/hyper/actions?action-id=a_t_1')"
+                        (h/expr (h/action (reset! (h/tab-cursor :q) 1))))))))
+
+  (testing "an action guarded by a client-side condition compiles to a ternary"
+    (let [app-state* (new-tab)]
+      (rendering app-state*
+                 (let [out (h/expr (when (= evt.key "Enter")
+                                     (h/action (reset! (h/tab-cursor :q) 2))))]
+                   (is (str/includes? out "(evt.key) === (\"Enter\")"))
+                   (is (str/includes? out "@post('/hyper/actions?action-id=a_t_1')"))
+                   (is (str/includes? out "?"))
+                   (is (not (str/includes? out "action(")))))))
+
+  (testing "the embedded action is registered in tab state at render time"
+    (let [app-state* (new-tab)]
+      (rendering app-state*
+                 (h/expr (h/action (reset! (h/tab-cursor :q) 3))))
+      (is (contains? (:actions @app-state*) "a_t_1")))))
+
+;; ---------------------------------------------------------------------------
+;; Client-param vocabulary in expr ($value, $key, …)
+;; ---------------------------------------------------------------------------
+
+(deftest test-client-params-in-expr
+  (testing "client-param symbols expand to their client-side JS"
+    (is (= "(evt.key) === (\"Enter\")" (->expr (= $key "Enter"))))
+    (is (= "evt.target.checked" (->expr $checked)))
+    (is (= "evt.detail" (->expr $detail)))
+    (is (= "Object.fromEntries(new FormData(evt.target.closest('form')))"
+           (->expr $form-data))))
+
+  (testing "$value assigns a signal the same as evt.target.value"
+    (let [q* (sig "q")]
+      (is (= (->expr (reset! q* evt.target.value))
+             (->expr (reset! q* $value))))))
+
+  (testing "non-param $signals still pass through untouched"
+    (is (= "$count = 0" (->expr (set! $count 0))))
+    (let [name* (sig "userName")]
+      (is (= "$userName" (->expr @name*)))))
+
+  (testing "a client-param guard composes with an embedded action's own params"
+    (let [app-state* (new-tab)]
+      (rendering app-state*
+                 (let [out (h/expr (when (= $key "Enter")
+                                     (h/action (reset! (h/tab-cursor :q) $value))))]
+                   (is (str/includes? out "(evt.key) === (\"Enter\")"))
+                   (is (str/includes? out "hyper.encodeClientParams({value:evt.target.value})")))))))

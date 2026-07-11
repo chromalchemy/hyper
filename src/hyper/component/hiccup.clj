@@ -1,4 +1,4 @@
-(ns hyper.component.hiccup
+(ns ^:no-doc hyper.component.hiccup
   "Macro-time hiccup compilation for client components.
 
    Literal hiccup in defc render segments is compiled into ($h ...)

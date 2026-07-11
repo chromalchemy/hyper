@@ -14,6 +14,7 @@
             [hyper.context :as context :refer [*request* *action-idx*]]
             [hyper.expr]
             [hyper.lifecycle :as lifecycle]
+            [hyper.protocols :as protocols]
             [hyper.reactive :as reactive]
             [hyper.render :as render]
             [hyper.routes :as routes]
@@ -21,6 +22,7 @@
             [hyper.signal :as signal]
             [hyper.state :as state]
             [hyper.subview :as subview]
+            [hyper.uploads :as uploads]
             [hyper.utils :as utils]
             [reitit.core :as reitit]))
 
@@ -89,46 +91,64 @@
      (path-cursor :search \"\")   ;; URL: /?search=hello"
   ([path]
    (let [{:keys [tab-id app-state*]} (context/require-context! "path-cursor")]
-     (state/create-cursor app-state* [:tabs tab-id :route :query-params] path)))
+     (state/stamp-scope!
+       (state/create-cursor app-state* [:tabs tab-id :route :query-params] path)
+       :path path)))
   ([path default-value]
-   (let [{:keys [tab-id app-state*]} (context/require-context! "path-cursor")
-         cursor                      (state/create-cursor
-                                       app-state*
-                                       [:tabs tab-id :route :query-params]
-                                       path)]
+   (let [cursor (path-cursor path)]
      ;; cas so the default init yields to a concurrent write (see state/Cursor).
      (compare-and-set! cursor nil default-value)
      cursor)))
 
+(def Watchable
+  "Protocol for external state sources that `watch!` can observe. Extended
+   by default for atoms, refs, vars, and any `IRef`. Extend it yourself for
+   custom sources — databases, message queues, or any stateful resource:
+
+     (extend-protocol Watchable
+       my.db/QueryResult
+       (-add-watch [this key callback]
+         ;; callback is (fn [old-val new-val]); set up your change listener
+         )
+       (-remove-watch [this key]
+         ;; tear down the listener
+         )
+       (-dispose [this]
+         ;; release resources (close connections, stop polling, etc.);
+         ;; called once the last tab watching this source navigates away
+         ;; or disconnects — no-op for sources that hold no resources
+         (.close this)))"
+  protocols/Watchable)
+
 (defn watch!
   "Watch an external source for changes, triggering a re-render of the current
-   tab when it changes. Source must satisfy the hyper.protocols/Watchable protocol
+   tab when it changes. Source must satisfy the `Watchable` protocol
    (extended by default for atoms, refs, vars, and any IRef).
 
-   Idempotent — safe to call on every render with the same source.
-   Watches are automatically cleaned up when the tab disconnects.
+   A watch is a mount-scoped subscription, keyed by source identity for dedup.
+   Prefer a **form-2 setup closure** (runs once per mount):
 
-   Example:
-     ;; Watch a database query result atom
      (defn my-page [req]
-       (watch! db-results)
-       [:div [:p \"Count: \" (count @db-results)]])
+       (let [results (db/query-atom (get-in req [:hyper/route :path-params :id]))]
+         (watch! results)                     ;; setup — runs once per mount
+         (fn [req] [:p \"Count: \" (count @results)])))
 
-     ;; Watch any Watchable source
-     (watch! my-event-stream)"
+   It is idempotent, so a form-1 render body also works (re-subscribing each
+   render); that path triggers the render-purity warning nudging you to form-2.
+
+   The mount boundary is keyed on `[handler path-params]`, so a source derived
+   from a path-param re-subscribes when that path-param changes: the page
+   remounts, tearing down the old watch and running setup for the new one.
+   Watches are cleaned up on remount and tab disconnect."
   [source]
   (context/guard-effect! :watch "h/watch!")
-  (let [{:keys [tab-id app-state*]} (context/require-context! "watch!")
-        ;; A user watch is a mount-scoped, full-render subview: registered once
-        ;; per mount (form-2 setup) or idempotently each render (form-1 body),
-        ;; keyed by source identity for dedup.  Torn down on navigation
-        ;; (page-view remount) and tab disconnect — never by the per-render sweep.
-        sid                         (subview/register-watch! app-state* tab-id source)
-        trigger-render!             (get-in @app-state* [:tabs tab-id :renderer :trigger-render!])]
-    ;; Wire immediately when an SSE renderer already exists; otherwise the
-    ;; first full render's setup-new-watches! wires it (initial HTTP render).
-    (when trigger-render!
-      (subview/wire-subview! app-state* tab-id sid trigger-render! nil))
+  (let [{:keys [tab-id app-state*]} (context/require-context! "watch!")]
+    ;; A user watch is a mount-scoped, full-render subview: registered once
+    ;; per mount (form-2 setup) or idempotently each render (form-1 body),
+    ;; keyed by source identity for dedup.  Torn down on navigation
+    ;; (page-view remount) and tab disconnect — never by the per-render sweep.
+    ;; register-watch! wires it immediately when a renderer is present.
+    (subview/register-watch! app-state* tab-id source)
     nil))
 
 (defn spawn!
@@ -164,10 +184,10 @@
    placeholder, prefer `async`."
   [worker-fn]
   (context/guard-effect! :spawn "h/spawn!")
-  (let [{:keys [session-id tab-id app-state* router]} (context/require-context! "spawn!")
-        idx                                           (if *action-idx* (swap! *action-idx* inc) 0)
-        sid                                           (str "s_" tab-id "_" idx)]
-    (subview/spawn-worker! app-state* tab-id sid session-id router worker-fn)
+  (let [{:keys [session-id tab-id app-state*]} (context/require-context! "spawn!")
+        idx                                    (if *action-idx* (swap! *action-idx* inc) 0)
+        sid                                    (str "s_" tab-id "_" idx)]
+    (subview/spawn-worker! app-state* tab-id sid session-id worker-fn)
     nil))
 
 (defn env
@@ -206,6 +226,36 @@
   ([key default]
    (get (:hyper/env context/*request*) key default)))
 
+(defn action-name
+  "Return the `:as` name of the currently executing action, or nil when
+   called outside an action context or the action was not given an `:as`
+   name.
+
+   Lets utility functions identify which action is running without the
+   caller having to pass the name explicitly:
+
+     (defn audit! []
+       (log/info \"Action executed\" {:action (action-name)}))
+
+     (action {:as \"delete-user\"}
+       (audit!)          ;; logs {:action \"delete-user\"}
+       (delete-user! id))"
+  []
+  context/*action-name*)
+
+(defn route
+  "Return the current route info map — :name, :path, :path-params, and
+   :query-params — consistent with the tab's current route.
+
+   Works anywhere within the request context (render functions, actions,
+   render middleware); a render function can equivalently read it off the
+   request via (:hyper/route req).
+
+   Example:
+     (route)  ;; => {:name :user :path \"/user/42\" :path-params {:id \"42\"} ...}"
+  []
+  (:hyper/route *request*))
+
 ;; ---------------------------------------------------------------------------
 ;; Batched cursor updates
 ;; ---------------------------------------------------------------------------
@@ -223,6 +273,20 @@
 
    Nested batches are transparent — the inner batch executes within the
    existing overlay and the outermost boundary handles the flush.
+
+   The atomicity guarantee covers the writes made in the batch body — not
+   writes made by watches reacting to them.  If one cursor is derived from
+   another via a watch (e.g. recomputing total* whenever items* changes),
+   the watch only runs after the batched values are committed, so the
+   derived cursor updates in a separate atomic update immediately after.
+   The page may re-render between the two, showing the new batched values
+   with the old derived value for one frame before a follow-up render
+   corrects it.  To keep a derived value in the same frame as its source,
+   compute it in the batch body instead:
+
+     (h/batch
+       (reset! items* new-items)
+       (reset! total* (reduce + new-items)))  ;; same atomic update — no lag
 
    A batch inside background work (future, send-off, fiber) spawned from a
    render or outer batch ignores the conveyed overlay and creates its own,
@@ -267,8 +331,8 @@
 (defmacro reactive
   "Create a reactive component that re-renders independently when its deps change.
 
-   deps is a vector of Watchable sources (atoms, cursors, or any type extending
-   hyper.protocols/Watchable).  The body is a hiccup expression that will be
+   deps is a vector of Watchable sources (atoms, cursors, or any type
+   extending Watchable).  The body is a hiccup expression that will be
    wrapped in a div with a stable ID.
 
    When any dep changes, only this component re-renders and a targeted Datastar
@@ -279,6 +343,12 @@
    Supports nesting — inner reactive blocks re-execute independently during
    partial renders triggered by their own deps.
 
+   An optional leading opts map accepts `:key` — a stable identity for the
+   region.  Give a `:key` (or a stable `:id` on the body's root element) to
+   any reactive in a dynamic/keyed list so its identity follows the item
+   across reorders and sibling shape changes; without one the region id is
+   positional.
+
    Usage:
      (let [clock* (h/global-cursor :clock)]
        (reactive [clock*]
@@ -288,14 +358,21 @@
      (let [x* (h/tab-cursor :x 0)
            y* (h/tab-cursor :y 0)]
        (reactive [x* y*]
-         [:p \"Position: \" @x* \", \" @y*]))"
-  [deps & body]
-  `(let [{tab-id# :tab-id app-state*# :app-state*} (context/require-context! "reactive")
-         idx#                                      (if context/*action-idx* (swap! context/*action-idx* inc) 0)
-         component-id#                             (str "r_" tab-id# "_" idx#)
-         deps#                                     ~deps
-         render-fn#                                (fn [] ~@body)]
-     (reactive/render-component app-state*# tab-id# component-id# deps# render-fn#)))
+         [:p \"Position: \" @x* \", \" @y*]))
+
+     ;; Keyed region in a list — identity follows the node
+     (reactive {:key (:id node)} [grid*]
+       [:div.grid (render-grid @grid*)])"
+  [& args]
+  (let [[opts deps body] (if (map? (first args))
+                           [(first args) (second args) (nnext args)]
+                           [nil (first args) (next args)])]
+    `(let [{tab-id# :tab-id app-state*# :app-state*} (context/require-context! "reactive")
+           idx#                                      (if context/*action-idx* (swap! context/*action-idx* inc) 0)
+           fallback-id#                              (str "r_" tab-id# "_" idx#)
+           deps#                                     ~deps
+           render-fn#                                (fn [] ~@body)]
+       (reactive/render-component app-state*# tab-id# ~(:key opts) fallback-id# deps# render-fn#))))
 
 (defmacro async
   "Render-time data loading with a placeholder.  Spawns the `fetch` on a
@@ -345,18 +422,32 @@
 
    Prefer `async` for leaf / region-local data that wants its own loading state
    co-located with its render.  For page-level data you want before first paint
-   or shared across regions, load it in a form-2 setup closure into a cursor."
-  [deps fetch-expr binding & render-body]
-  `(let [{tab-id#     :tab-id
-          app-state*# :app-state*
-          session-id# :session-id
-          router#     :router}    (context/require-context! "async")
-         idx#                     (if context/*action-idx* (swap! context/*action-idx* inc) 0)
-         component-id#            (str "async_" tab-id# "_" idx#)]
-     (subview/render-async! app-state*# tab-id# session-id# router# component-id#
-                            ~deps
-                            (fn [] ~fetch-expr)
-                            (fn [~binding] ~@render-body))))
+   or shared across regions, load it in a form-2 setup closure into a cursor.
+
+   An optional leading opts map accepts `:key` — a stable identity for the
+   region.  Give a `:key` to any async in a dynamic/keyed list so its in-flight
+   fetch and store follow the item across reorders and sibling shape changes;
+   without one the region id is positional.
+
+   Example with a key:
+     (h/async {:key (:id node)} [user-id*]
+       (db/fetch-rows @user-id*)
+       {:keys [status result]}
+       ...)"
+  [& args]
+  (let [[opts deps fetch-expr binding render-body]
+        (if (map? (first args))
+          [(first args) (second args) (nth args 2) (nth args 3) (drop 4 args)]
+          [nil (first args) (second args) (nth args 2) (drop 3 args)])]
+    `(let [{tab-id#     :tab-id
+            app-state*# :app-state*
+            session-id# :session-id} (context/require-context! "async")
+           idx#                      (if context/*action-idx* (swap! context/*action-idx* inc) 0)
+           fallback-id#              (str "async_" tab-id# "_" idx#)]
+       (subview/render-async! app-state*# tab-id# session-id# ~(:key opts) fallback-id#
+                              ~deps
+                              (fn [] ~fetch-expr)
+                              (fn [~binding] ~@render-body)))))
 
 ;; ---------------------------------------------------------------------------
 ;; View lifecycle (form-3)
@@ -458,6 +549,46 @@
   ([path default-value]
    (signal/create-local-signal path default-value)))
 
+(defn optimistic
+  "Pair a scoped cursor with a client-side signal.  The client is
+   authoritative while the user interacts; the cursor is authoritative at
+   rest.  Use for continuous gestures (resize, drag, sliders) whose result
+   should persist and propagate like any cursor.
+
+   The signal name derives from the cursor's scope and path:
+     (optimistic (session-cursor [:cols 0 :width] 240))  ;; → $sessionCols0Width
+
+   During render, `@opt*` returns the Datastar expression string; during an
+   action it returns the live client-reported value.  `reset!`/`swap!` in an
+   action write the cursor — the authoritative value — and the client is
+   patched on the next render.  `commit!` makes the client's value official.
+
+   opts:
+   - :auto-commit? — commit the client-reported value on every action POST
+   - :on-conflict  — :client-wins (default) | :server-wins |
+                     (fn [{:keys [base committed reported]}] → value to commit);
+                     :server-wins and fn policies track the base value the
+                     client's edit was based on via a companion signal."
+  ([cursor]
+   (optimistic cursor {}))
+  ([cursor opts]
+   (let [{:keys [tab-id app-state*]} (context/require-context! "optimistic")]
+     (signal/create-optimistic app-state* tab-id cursor opts))))
+
+(defn commit!
+  "Make the client-reported value of an optimistic official: run its
+   conflict policy and write the result to the backing cursor.  Returns
+   the committed value.  Action-only.
+
+     [:div.handle {:data-on:pointerup (action (commit! w*))}]
+
+   Equivalent to `(reset! opt* @opt*)` plus conflict detection.  To
+   validate or transform on the way in, skip the sugar:
+
+     (action (reset! w* (clamp @w* 80 640)))"
+  [opt*]
+  (signal/commit! opt*))
+
 ;; ---------------------------------------------------------------------------
 ;; Connection status signals (client-only, maintained by Datastar)
 ;; ---------------------------------------------------------------------------
@@ -513,6 +644,25 @@
 ;; Client param support for actions
 ;; ---------------------------------------------------------------------------
 
+(def client-param
+  "Multimethod mapping a client-param symbol (like `$value`, `$key`) to its
+   definition — a map of :js (JavaScript run client-side to extract the
+   value) and :key (the key used to send it to the server). The built-ins
+   are $value, $checked, $key, $detail, $form-data, $form, and $files.
+
+   Extend it to add custom client-side param symbols, dispatching on the
+   symbol itself:
+
+     (defmethod client-param '$mouse-offset [_]
+       {:js \"{x:evt.offsetX, y:evt.offsetY}\" :key \"mouseOffset\"})
+
+   With this in place, an `action` body can reference `$mouse-offset`,
+   bound on the server to an EDN map with :x and :y keys. Methods must be
+   defined before any action that references the symbol. A definition
+   marked :multipart? true switches the action's transport to a
+   multipart/form-data upload instead of the default JSON @post()."
+  client-params/client-param)
+
 (defn- find-client-params
   "Walk the action body forms and return the subset of the defined client-params
    whose symbols appear in the body.
@@ -526,14 +676,14 @@
                    (assoc m sym (client-params/client-param sym)))
                  {}))))
 
-(defmacro action
+(defmacro ^{:hyper/datastar-expr true} action
   "Create a server action expression for use in Datastar event attributes.
    Returns a Datastar expression string that can be bound to any event.
 
    The action is registered with the current session/tab context
    and can access state via cursors. Action IDs are deterministic
    (derived from a per-render counter + tab-id) so that re-renders
-   produce identical HTML, enabling effective gzip streaming compression.
+   produce identical HTML, enabling effective brotli streaming compression.
 
    Supports client-side special forms that transmit DOM values to the server:
    - $value     — the value of the input/select/textarea that fired the event
@@ -556,11 +706,22 @@
      [:input {:data-on:keydown (action {:when \"evt.key === 'Enter'\"}
                                  (search!))}]
 
+     ;; :when is sugar — an action returns a Datastar expression that composes
+     ;; inside `expr`, so the guard above is equivalent to:
+     [:input {:data-on:keydown (expr (when (= evt.key \"Enter\")
+                                       (action (search!))))}]
+
      ;; Named action for testing — :as gives the action a human-readable name
      ;; that hyper.test/test-page uses as the key in its :actions map
      [:button {:data-on:click (action {:as \"increment\"}
                                 (swap! (tab-cursor :count) inc))}
       \"Increment\"]
+
+     ;; :key gives the action a stable id (independent of render order) — the
+     ;; same identity story as reactive/async, for actions in keyed lists
+     [:button {:data-on:click (action {:key (:id node)}
+                                (delete! (:id node)))}
+      \"Delete\"]
 
      ;; Checkbox
      [:input {:type \"checkbox\"
@@ -576,25 +737,42 @@
   [& args]
   (let [[maybe-opts & body] args
         opts-map?           (and (map? maybe-opts)
-                                 (some #{:when :as} (keys maybe-opts)))
-        [js as-name body]   (if opts-map?
-                              (let [guard (:when maybe-opts)
-                                    ;; String literals are validated here; any
-                                    ;; other form (e.g. (expr ...)) is deferred
-                                    ;; to runtime evaluation — sanitize-guard
-                                    ;; validates the result.
-                                    js    (cond
-                                            (string? guard) (when-not (str/blank? guard) guard)
-                                            (some? guard)   guard)]
-                                [js (:as maybe-opts) body])
-                              [nil nil args])
+                                 (some #{:when :as :upload :key} (keys maybe-opts)))
+        [js as-name upload-ref-form key-form body]
+        (if opts-map?
+          (let [guard (:when maybe-opts)
+                ;; String literals are validated here; any other form
+                ;; (e.g. (expr ...)) is deferred to runtime evaluation —
+                ;; sanitize-guard validates the result.
+                js    (cond
+                        (string? guard) (when-not (str/blank? guard) guard)
+                        (some? guard)   guard)]
+            [js (:as maybe-opts) (:upload maybe-opts) (:key maybe-opts) body])
+          [nil nil nil nil args])
+        _                   (when (and opts-map? (contains? maybe-opts :when))
+                              (actions/warn-deprecated-when!))
         used-params         (find-client-params body)
         param-syms          (keys used-params)
+        ;; Multipart params ($form/$files) switch the action to a file-upload
+        ;; transport (see hyper.uploads).  Validate the combination at macro
+        ;; time so misuse fails loudly with a clear message.
+        multipart-syms      (filter client-params/multipart-param? param-syms)
+        other-syms          (remove (set multipart-syms) param-syms)
+        _                   (when (> (count multipart-syms) 1)
+                              (throw (ex-info "An upload action may use at most one multipart param ($form or $files)."
+                                              {:params (vec multipart-syms)})))
+        _                   (when (and (seq multipart-syms) (seq other-syms))
+                              (throw (ex-info "Multipart upload params ($form/$files) cannot be combined with other client params."
+                                              {:multipart (vec multipart-syms) :others (vec other-syms)})))
+        _                   (when (and upload-ref-form (empty? multipart-syms))
+                              (throw (ex-info "action :upload requires a $form or $files param in the body."
+                                              {:upload upload-ref-form})))
         cp-sym              (gensym "client-params")]
     `(let [{session-id# :session-id
             tab-id#     :tab-id
             app-state*# :app-state*
             router#     :router}    (context/require-context! "action")
+           upload-ref#              ~upload-ref-form
            action-fn#               (fn [~cp-sym]
                                       (let [~@(mapcat (fn [sym]
                                                         (let [k (keyword (:key (client-params/client-param sym)))]
@@ -607,11 +785,18 @@
                                                                      :hyper/env        (get-in @app-state*# [:tabs tab-id# :env])}]
                                           ~@body)))
            idx#                     (if context/*action-idx* (swap! context/*action-idx* inc) (hash action-fn#))
-           action-id#               (str "a_" tab-id# "_" idx#)
+           key#                     ~key-form
+           action-id#               (if (some? key#)
+                                      (subview/scoped-id "a_" tab-id# (subview/key->token key#))
+                                      (str "a_" tab-id# "_" idx#))
            _#                       (actions/register-action! app-state*# session-id# tab-id# action-fn# action-id#
                                                               ~(when as-name {:as as-name}))
+           ;; Stash the upload status ref so the /hyper/upload handler can
+           ;; transition its phase/result; nil for non-upload actions.
+           _#                       (when upload-ref#
+                                      (swap! app-state*# assoc-in [:actions action-id# :upload-ref] upload-ref#))
            base-path#               (get @app-state*# :base-path "")]
-       (actions/build-action-expr action-id# '~used-params (actions/sanitize-guard ~js) base-path#))))
+       (uploads/build-expr action-id# '~used-params (actions/sanitize-guard ~js) base-path# upload-ref#))))
 
 ;; ---------------------------------------------------------------------------
 ;; Client-side expressions and components (re-exports)
@@ -632,8 +817,15 @@
      [:input {:data-on:keydown
               (expr (when (= evt.key \"Enter\") (@post \"/search\")))}]
 
+   A server `action` composes as a client-side value — it registers at render
+   time and contributes its raw @post(...), so it can be gated by client-side
+   control flow (subsuming the action `:when` guard):
+
+     [:input {:data-on:keydown
+              (expr (when (= evt.key \"Enter\") (action (search! @query*))))}]
+
    Locals splice automatically; evt/el/$signals/JS interop pass through
-   to the client.  Canonical documentation: hyper.expr/->expr."
+   to the client."
   [& forms]
   `(hyper.expr/->expr ~@forms))
 
@@ -649,8 +841,7 @@
          [:div {:on {:click ::selected}} label \": \" value]))
 
    Also defines a server-side render function of the same name, so pages
-   call components like ordinary hiccup functions.  Canonical
-   documentation: hyper.component/defc."
+   call components like ordinary hiccup functions."
   {:style/indent        1
    :style.cljfmt/indent [[:block 1] [:inner 1]]}
   [& args]
@@ -734,6 +925,12 @@
                           components bundle (default: version-matched jsDelivr CDN).
                           Point at a self-hosted copy for offline/air-gapped deploys.
    - :head              — Hiccup nodes appended to the HTML <head>, or (fn [req] ...) -> hiccup
+   - :webkit-sse-shim?  — Inject a small client shim (into <head>, only for WebKit/Safari
+                          user agents) that routes the GET render stream through a native
+                          EventSource instead of fetch+ReadableStream, working around a
+                          WebKit bug where a large isolated SSE patch is held back until
+                          the next write.  Other browsers never receive it.  Default true;
+                          pass false to disable.
    - :base-path         — URL path prefix for reverse-proxy deployments where the app is served
                           under a subfolder (e.g. \"/my-app\"). When set, all internal hyper
                           endpoints (/hyper/events, /hyper/actions, /hyper/navigate) are mounted
@@ -769,9 +966,9 @@
    - :not-found         — Function `(fn [req] -> hiccup)` rendered when no route
                           matches, served as a full page with HTTP 404 (and over
                           SSE for client-side navigation).  May be a Var to pick
-                          up redefinitions.  Defaults to
-                          `hyper.render.error/not-found`; pass `nil` to disable
-                          and fall back to reitit's plain-text 404.
+                          up redefinitions.  Defaults to a built-in 404 page;
+                          pass `nil` to disable and fall back to reitit's
+                          plain-text 404.
 
    The request key :hyper/env is reserved for application-provided context.
    Ring middleware that sets :hyper/env on the request will have it automatically
@@ -805,7 +1002,8 @@
      (stop! app)"
   [routes & {:keys [app-state head static-resources static-dir watches
                     datastar-script base-path middleware render-middleware
-                    render-error hiccup-transform squint-core-url render-guard]
+                    render-error hiccup-transform squint-core-url render-guard
+                    max-file-size max-file-count upload-expires-in]
              :or   {app-state       (atom (state/init-state))
                     datastar-script server/default-datastar-script}
              :as   opts}]
@@ -823,6 +1021,13 @@
                            ;; Only forward when supplied so server defaults apply.
                            render-error (assoc :render-error render-error)
                            render-guard (assoc :render-guard render-guard)
+                           ;; File-upload limits for the /hyper/upload route.
+                           max-file-size (assoc :max-file-size max-file-size)
+                           max-file-count (assoc :max-file-count max-file-count)
+                           upload-expires-in (assoc :upload-expires-in upload-expires-in)
+                           ;; `contains?` so an explicit `false` is honored while
+                           ;; absence lets the server default (true) apply.
+                           (contains? opts :webkit-sse-shim?) (assoc :webkit-sse-shim? (:webkit-sse-shim? opts))
                            ;; `contains?` so an explicit `:not-found nil` (disable) is honored.
                            (contains? opts :not-found) (assoc :not-found (:not-found opts)))))
 

@@ -1,15 +1,16 @@
-(ns hyper.server
+(ns ^:no-doc hyper.server
   "HTTP server, routing, and middleware.
 
    Provides Ring handler creation for hyper applications."
   (:require [cheshire.core :as json]
+            [clojure.java.io :as io]
             [clojure.string]
             [compact-uuids.core :as uuid]
             [dev.onionpancakes.chassis.core :as c]
             [hyper.actions :as actions]
+            [hyper.brotli :as br]
             [hyper.component :as component]
             [hyper.component.bundle :as component.bundle]
-            [hyper.compress :as gz]
             [hyper.context :as context]
             [hyper.effects :as effects]
             [hyper.lifecycle :as lifecycle]
@@ -21,18 +22,22 @@
             [hyper.signal :as signal]
             [hyper.state :as state]
             [hyper.subview :as subview]
+            [hyper.uploads :as uploads]
             [hyper.utils :as utils]
             [hyper.watch :as watch]
-            [org.httpkit.server :as http-kit]
             [reitit.coercion :as coercion]
             [reitit.coercion.malli :as malli]
             [reitit.core :as reitit]
             [reitit.ring :as ring]
             [reitit.ring.coercion :as ring-coercion]
+            [ring.adapter.jetty9 :as jetty]
+            [ring.core.protocols :as ring-protocols]
             [ring.middleware.content-type :as content-type]
             [ring.middleware.cookies :as cookies]
             [ring.middleware.file :as file]
             [ring.middleware.keyword-params :as keyword-params]
+            [ring.middleware.multipart-params :as multipart-params]
+            [ring.middleware.multipart-params.temp-file :as temp-file]
             [ring.middleware.not-modified :as not-modified]
             [ring.middleware.params :as params]
             [ring.middleware.resource :as resource]
@@ -98,34 +103,40 @@
       (rq/enqueue-partial! q component-id))))
 
 (defn- send-sse!
-  "Compress (when gz-stream is non-nil) and send an SSE payload over the channel.
-   Returns true when sent, false when the channel is closed."
-  [channel gz-out gz-stream sse-payload]
-  (let [payload (if gz-stream
-                  (gz/compress-stream gz-out gz-stream sse-payload)
-                  sse-payload)]
-    (boolean (http-kit/send! channel payload false))))
+  "Compress (when br-stream is non-nil) and write an SSE payload to the response
+   output stream, flushing so the client sees the event immediately.
+   Returns true when written, false when the connection is closed (the write or
+   flush throws an IOException — e.g. Jetty's EofException on client disconnect)."
+  [^java.io.OutputStream os br-out br-stream sse-payload]
+  (try
+    (let [^bytes payload (if br-stream
+                           (br/compress-stream br-out br-stream sse-payload)
+                           (.getBytes ^String sse-payload "UTF-8"))]
+      (.write os payload)
+      (.flush os)
+      true)
+    (catch java.io.IOException _ false)))
 
 (defn- handle-partial-render
   "Render only the dirty reactive components and send targeted fragments.
-   Returns true/nil on success, false when the channel is closed."
-  [app-state* tab-id dirty-ids channel gz-out gz-stream]
+   Returns true/nil on success, false when the connection is closed."
+  [app-state* tab-id dirty-ids os br-out br-stream]
   (let [fragments (keep (fn [component-id]
                           (reactive/partial-render app-state* tab-id component-id))
                         dirty-ids)]
     (when (seq fragments)
-      (send-sse! channel gz-out gz-stream
+      (send-sse! os br-out br-stream
                  (render/format-datastar-fragments fragments)))))
 
 (defn- handle-ring-redirect
   "Convert a 3xx Ring redirect response into a client-side window.location
    redirect over SSE.  Throws for non-redirect Ring responses."
-  [render-result tab-id channel gz-out gz-stream]
+  [render-result tab-id os br-out br-stream]
   (let [status   (:status render-result)
         location (get-in render-result [:headers "Location"])]
     (if (and (<= 300 status 399) location)
       (let [js (str "window.location.href='" (utils/escape-js-string location) "'")]
-        (send-sse! channel gz-out gz-stream
+        (send-sse! os br-out br-stream
                    (effects/format-execute-script-event js)))
       (throw (ex-info
                (str "Render middleware returned a Ring response over SSE that cannot "
@@ -140,17 +151,15 @@
    body fragment, signal patches).  Sweeps stale actions/reactive components
    and wires up watches for new reactive components.
 
-   `last-sent-signals` is the signal snapshot last delivered to the client
-   (nil on the first render); it lets us send only the signal patches that
-   add information beyond the body fragment's `data-signals:NAME__ifmissing`
-   declarations.
-   Returns true/nil on success, false when the channel is closed."
-  [app-state* session-id tab-id sig-patches last-sent-signals
-   trigger-render! enqueue-partial! channel gz-out gz-stream]
+   `known-signals` is what the client already holds (last sent merged with
+   client-reported; nil on first render) — only patches beyond it are sent.
+   Returns true/nil on success, false when the connection is closed."
+  [app-state* session-id tab-id sig-patches known-signals
+   trigger-render! enqueue-partial! os br-out br-stream]
   (when-let [render-result (render/render-tab app-state* session-id tab-id)]
     (if (:status render-result)
       ;; Ring response passthrough (e.g. redirect from render middleware)
-      (handle-ring-redirect render-result tab-id channel gz-out gz-stream)
+      (handle-ring-redirect render-result tab-id os br-out br-stream)
       ;; Normal render — assemble and send SSE payload
       (let [{:keys [title head-html body-html url
                     declared-signals registered-action-ids
@@ -158,9 +167,11 @@
         ;; Sweep stale actions + render-scoped subviews (reactive regions)
         (actions/sweep-stale-tab-actions! app-state* tab-id registered-action-ids)
         (subview/sweep-stale! app-state* tab-id registered-subview-ids)
-        ;; Wire watches for new subviews — reactive regions (partial) and any
-        ;; not-yet-wired user watches (full), e.g. registered during the
-        ;; initial HTTP render before this SSE renderer existed.
+        ;; Catch-up wiring for subviews registered before this renderer existed
+        ;; (mount-scoped h/watch! in the initial HTTP render's form-2 setup,
+        ;; which does not re-register on SSE renders).  Subviews registered
+        ;; during an SSE render are already wired by register-subview!, so for
+        ;; them this is a no-op.
         (subview/setup-new-watches! app-state* tab-id trigger-render! enqueue-partial!)
         (let [head-event   (render/format-head-update title head-html)
               sig-attrs    (signal/format-signal-attrs declared-signals)
@@ -174,19 +185,19 @@
               ;; client-side state it builds from the DOM (e.g. checkbox-array
               ;; signals, issue #44).
               sig-patches  (signal/drop-ifmissing-covered-patches
-                             sig-patches declared-signals last-sent-signals)
+                             sig-patches declared-signals known-signals)
               sig-event    (when (seq sig-patches)
                              (signal/format-patch-signals-event sig-patches))
               sse-payload  (str head-event body-event sig-event)]
-          (send-sse! channel gz-out gz-stream sse-payload))))))
+          (send-sse! os br-out br-stream sse-payload))))))
 
 (defn- send-pending-scripts!
   "Send drained scripts over SSE.
-   Returns true/nil on success, false when the channel is closed."
-  [scripts tab-id channel gz-out gz-stream]
+   Returns true/nil on success, false when the connection is closed."
+  [scripts tab-id os br-out br-stream]
   (try
     (when (seq scripts)
-      (send-sse! channel gz-out gz-stream
+      (send-sse! os br-out br-stream
                  (apply str (map effects/format-execute-script-event scripts))))
     (catch Throwable e
       (t/error! {:id   :hyper.error/renderer-scripts
@@ -195,45 +206,54 @@
                 e)
       nil)))
 
-(defn- -renderer-loop!
-  "Virtual-thread render loop for a single tab.
+(defn- drain-client-signals!
+  "Atomically remove and return this tab's client-reported signals together
+   with its current signal state.  Returns [client-reported current-signals]."
+  [app-state* tab-id]
+  ;; Consumed, not kept — a stale report must not suppress a later server
+  ;; write back to the same value.
+  (let [[old new] (swap-vals! app-state*
+                              (fn [state]
+                                (if (get-in state [:tabs tab-id :client-signals])
+                                  (update-in state [:tabs tab-id] dissoc :client-signals)
+                                  state)))]
+    [(get-in old [:tabs tab-id :client-signals])
+     (get-in new [:tabs tab-id :signals])]))
 
-   Owns the http-kit AsyncChannel and (optional) streaming gzip state,
+(defn- -renderer-loop!
+  "Render loop for a single tab, run inside the SSE response's
+   `write-body-to-stream` on a (virtual) Jetty thread.
+
+   Owns the response `OutputStream` and (optional) streaming brotli state,
    guaranteeing single-writer semantics by construction.
 
    Blocks on the render queue until events are available, drains them into
-   a consistent batch, then renders and sends.  The queue replaces the
+   a consistent batch, then renders and writes.  The queue replaces the
    previous Semaphore + atoms approach, eliminating all shared mutable state.
-   Exits when a :shutdown event is received."
-  [app-state* session-id tab-id channel compress?
+   Exits when a :shutdown event is received or the connection closes (a write
+   throws, so `send-sse!` returns false).
+
+   The SSE response headers are set by `sse-events-handler` on the response
+   map; here we only write the body (connected event, then render payloads)."
+  [app-state* session-id tab-id ^java.io.OutputStream os compress?
    render-queue]
-  (let [gz-out           (when compress? (gz/byte-array-out-stream))
-        gz-stream        (when gz-out (gz/compress-out-stream gz-out :window-size 18))
-        headers          (cond-> {"Content-Type"      "text/event-stream"
-                                  "Cache-Control"     "no-cache, no-transform"
-                                  "X-Accel-Buffering" "no"}
-                           compress? (assoc "Content-Encoding" "gzip"))
+  (let [br-out           (when compress? (br/byte-array-out-stream))
+        br-stream        (when br-out (br/compress-out-stream br-out :window-size 18))
         throttle-ms      (long (or (get @app-state* :render-throttle-ms)
                                    default-render-throttle-ms))
         ;; Heartbeat keepalive interval (ms).  nil / non-positive disables it,
         ;; restoring the plain blocking drain.
         heartbeat-ms     (let [hb (get @app-state* :heartbeat-ms default-heartbeat-ms)]
                            (when (and hb (pos? (long hb))) (long hb)))
-        ;; Stable triggers (indirect through app-state) so subview watches
-        ;; wired during this connection keep driving the renderer that is
-        ;; attached after a reconnect.
-        enqueue-partial! (tab-trigger-partial! app-state* tab-id)
-        trigger-render!  (tab-trigger-render! app-state* tab-id)]
+        ;; The same stable triggers subview watches were wired with — resolved
+        ;; from the renderer published before this loop runs.
+        renderer         (get-in @app-state* [:tabs tab-id :renderer])
+        enqueue-partial! (:trigger-partial! renderer)
+        trigger-render!  (:trigger-render! renderer)]
     (try
-      ;; Send the connected event as the initial SSE response (headers + body).
+      ;; Write the connected event as the first chunk of the SSE body.
       (let [connected-msg (render/format-connected-event tab-id)
-            sent?         (boolean
-                            (http-kit/send! channel
-                                            {:headers headers
-                                             :body    (if gz-stream
-                                                        (gz/compress-stream gz-out gz-stream connected-msg)
-                                                        connected-msg)}
-                                            false))]
+            sent?         (send-sse! os br-out br-stream connected-msg)]
         (when sent?
           ;; Main render loop — tracks the last-sent signal snapshot so
           ;; we only emit datastar-patch-signals for actual changes.
@@ -247,95 +267,58 @@
 
                 ;; No events within the heartbeat window — send a keepalive.
                 ;; The write keeps idle connections warm through proxies and
-                ;; surfaces a dead/half-open channel (send-sse! returns false),
-                ;; which exits the loop -> on-close -> detach -> grace window.
+                ;; surfaces a dead/half-open connection (send-sse! returns
+                ;; false), which exits the loop -> detach -> grace window.
                 idle?
-                (let [sent? (send-sse! channel gz-out gz-stream (render/format-heartbeat))]
+                (let [sent? (send-sse! os br-out br-stream (render/format-heartbeat))]
                   (when-not (false? sent?)
                     (recur last-sent-signals)))
 
                 :else
-                (let [current-signals (get-in @app-state* [:tabs tab-id :signals])
-                      sig-patches     (when (and current-signals
-                                                 (not= current-signals last-sent-signals))
-                                        (signal/changed-signals last-sent-signals current-signals))
-                      sent?           (try
-                                        (if (and (seq dirty-ids)
-                                                 (not full-render?)
-                                                 (not (seq sig-patches)))
-                                          (handle-partial-render app-state* tab-id dirty-ids
-                                                                 channel gz-out gz-stream)
-                                          (handle-full-render app-state* session-id tab-id sig-patches
-                                                              last-sent-signals
-                                                              trigger-render! enqueue-partial!
-                                                              channel gz-out gz-stream))
-                                        (catch Throwable e
-                                          (t/error! {:id   :hyper.error/renderer
-                                                     :msg  "Error rendering page"
-                                                     :data {:hyper/tab-id tab-id}}
-                                                    e)
-                                          nil))
-                      script-sent?    (send-pending-scripts! scripts tab-id
-                                                             channel gz-out gz-stream)]
-                  ;; sent? is true (ok), nil (no render-fn or error), false (channel closed)
+                (let [[client-reported
+                       current-signals] (drain-client-signals! app-state* tab-id)
+                      ;; Diff against what the client already holds (last sent
+                      ;; + client-reported) so round-trips aren't echoed back.
+                      known-signals     (if client-reported
+                                          (merge last-sent-signals client-reported)
+                                          last-sent-signals)
+                      sig-patches       (when (and current-signals
+                                                   (not= current-signals known-signals))
+                                          (signal/changed-signals known-signals current-signals))
+                      sent?             (try
+                                          (if (and (seq dirty-ids)
+                                                   (not full-render?)
+                                                   (not (seq sig-patches)))
+                                            (handle-partial-render app-state* tab-id dirty-ids
+                                                                   os br-out br-stream)
+                                            (handle-full-render app-state* session-id tab-id sig-patches
+                                                                known-signals
+                                                                trigger-render! enqueue-partial!
+                                                                os br-out br-stream))
+                                          (catch Throwable e
+                                            (t/error! {:id   :hyper.error/renderer
+                                                       :msg  "Error rendering page"
+                                                       :data {:hyper/tab-id tab-id}}
+                                                      e)
+                                            nil))
+                      script-sent?      (send-pending-scripts! scripts tab-id
+                                                               os br-out br-stream)]
+                  ;; sent? is true (ok), nil (no render-fn or error), false (connection closed)
                   ;; script-sent? follows the same convention
                   (when-not (or (false? sent?) (false? script-sent?))
                     (Thread/sleep throttle-ms)
-                    (recur (or current-signals last-sent-signals)))))))))
+                    (recur (or current-signals known-signals)))))))))
       (catch Throwable e
         (t/error! {:id   :hyper.error/renderer
                    :msg  "Error rendering page"
                    :data {:hyper/tab-id tab-id}}
                   e))
       (finally
-        (gz/close-stream gz-stream)
-        (when (instance? org.httpkit.server.AsyncChannel channel)
-          (t/catch->error! :hyper.error/close-sse-channel
-                           (http-kit/close channel)))
+        (br/close-stream br-stream)
         (t/log! {:level :debug
                  :id    :hyper.event/renderer-close
                  :data  {:hyper/tab-id tab-id}
                  :msg   "Tab renderer closed"})))))
-
-(defn- -start-renderer!
-  "Start a per-tab renderer on a virtual thread and store its handle under
-   `[:tabs tab-id :renderer]` BEFORE the loop runs, so the stable render
-   triggers can resolve its queue immediately.
-
-   `conn-id` uniquely identifies this SSE connection; `:on-close` uses it to
-   tell a genuine disconnect apart from a stale half-open connection that a
-   newer one has already replaced.
-
-   The renderer handle is a map with:
-   - :trigger-render!  — stable zero-arg fn; signal a full re-render
-   - :trigger-partial! — stable one-arg fn; component-id for partial re-render
-   - :enqueue-scripts! — one-arg fn; seq of JS strings to execute
-   - :stop!            — zero-arg fn; enqueues a :shutdown event to stop the loop
-   - :render-queue     — the underlying LinkedBlockingQueue
-   - :conn-id          — this connection's identity
-   - :thread           — the renderer virtual thread"
-  [app-state* session-id tab-id channel compress? conn-id]
-  (let [render-queue (rq/make-queue)
-        renderer     {:trigger-render!  (tab-trigger-render! app-state* tab-id)
-                      :trigger-partial! (tab-trigger-partial! app-state* tab-id)
-                      :enqueue-scripts! #(rq/enqueue-scripts! render-queue %)
-                      :stop!            #(rq/enqueue-shutdown! render-queue)
-                      :render-queue     render-queue
-                      :conn-id          conn-id}]
-    ;; Publish the renderer (with its queue) before starting the loop so the
-    ;; stable triggers and the loop's own setup-new-watches! wiring resolve it.
-    (swap! app-state* assoc-in [:tabs tab-id :renderer] renderer)
-    (let [thread   (-> (Thread/ofVirtual)
-                       (.name (str "hyper-renderer-" tab-id))
-                       (.start ^Runnable
-                         #(-renderer-loop! app-state* session-id tab-id
-                                           channel compress?
-                                           render-queue)))
-          renderer (assoc renderer :thread thread)]
-      ;; Enqueue the initial full render to kick things off
-      (rq/enqueue-full-render! render-queue)
-      (swap! app-state* assoc-in [:tabs tab-id :renderer] renderer)
-      renderer)))
 
 (defn wrap-hyper-context
   "Middleware that adds session-id and tab-id to the request."
@@ -370,21 +353,42 @@
   "Returns the default Datastar CDN script tag."
   []
   [:script {:type "module"
-            :src  "https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.1/bundles/datastar.js"}])
+            :src  "https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.2/bundles/datastar.js"}])
+
+(def ^:private webkit-sse-shim-js
+  "Inline JS injected into <head> for WebKit/Safari clients: routes the GET SSE
+   render stream through a native EventSource (which does not strand) instead of
+   fetch + ReadableStream.  See resources/hyper/webkit_sse_shim.js.  nil if the
+   resource is missing (injection is then skipped)."
+  (some-> (io/resource "hyper/webkit_sse_shim.js") slurp))
+
+(defn safari-request?
+  "True when the request's User-Agent is WebKit-on-Apple (desktop Safari or any
+   iOS browser — all of which use WebKit and are affected by the fetch-streaming
+   strand), and not a desktop Blink/Gecko browser that merely carries the legacy
+   `Safari` token (Chrome, Edge, Opera, Android WebView)."
+  [req]
+  (let [ua (get-in req [:headers "user-agent"] "")]
+    (boolean
+      (and (re-find #"Safari/" ua)
+           (not (re-find #"Chrome/|Chromium|Edg/|OPR/|Android|SamsungBrowser" ua))))))
 
 (defn cleanup-tab!
   "Clean up all resources for a tab: watchers, reactive components, renderer thread, actions, and state."
   [app-state* tab-id]
-  (watch/remove-watchers! app-state* tab-id)
-  ;; teardown-all-components! (-> subview/teardown-all!) tears down every
-  ;; subview for the tab, including framework :tab watches and user/route
-  ;; :mount watches.
-  (reactive/teardown-all-components! app-state* tab-id)
-  (lifecycle/teardown-page-view! app-state* tab-id)
-  (when-let [stop! (get-in @app-state* [:tabs tab-id :renderer :stop!])]
-    (stop!))
-  (actions/cleanup-tab-actions! app-state* tab-id)
-  (state/cleanup-tab! app-state* tab-id)
+  ;; Teardown runs outside any live request; bind a context so :unmount fns
+  ;; resolve cursors, h/env, and h/route.
+  (binding [context/*request* (context/teardown-request app-state* tab-id)]
+    (watch/remove-watchers! app-state* tab-id)
+    ;; teardown-all-components! (-> subview/teardown-all!) tears down every
+    ;; subview for the tab, including framework :tab watches and user/route
+    ;; :mount watches.
+    (reactive/teardown-all-components! app-state* tab-id)
+    (lifecycle/teardown-page-view! app-state* tab-id)
+    (when-let [stop! (get-in @app-state* [:tabs tab-id :renderer :stop!])]
+      (stop!))
+    (actions/cleanup-tab-actions! app-state* tab-id)
+    (state/cleanup-tab! app-state* tab-id))
   nil)
 
 (defn detach-tab!
@@ -453,78 +457,109 @@
               (reset! running? false)
               (.interrupt ^Thread thread))}))
 
+(defn- run-sse-loop!
+  "Run a tab's SSE render loop on the response output stream, for the lifetime
+   of the connection.  Invoked from the SSE response's `write-body-to-stream`
+   (a virtual Jetty thread), it folds together what used to be http-kit's
+   `:on-open` setup, the renderer thread, and `:on-close` teardown:
+
+   1. Publishes a renderer handle (with its render queue) under
+      `[:tabs tab-id :renderer]` BEFORE the loop runs, so the stable render
+      triggers can resolve its queue immediately.
+   2. On the first connection for a tab, wires reactivity once (user/route
+      watchers + framework :tab subviews); a reconnect within the grace window
+      re-attaches a renderer without rebuilding reactivity.
+   3. Runs the blocking render loop (cheap on a virtual thread).
+   4. On exit — a genuine disconnect (a write threw) or shutdown — detaches the
+      tab, unless a newer connection already took over its renderer (guarded by
+      `conn-id`).
+
+   `conn-id` uniquely identifies this connection so a stale half-open
+   connection can't detach a tab whose renderer a newer one already replaced."
+  [app-state* session-id tab-id ^java.io.OutputStream os compress? conn-id]
+  (let [;; A tab whose SSE watchers were already set up is a reconnect: its
+        ;; state/subviews/workers survived the disconnect grace window, so we
+        ;; only re-attach a renderer rather than rebuild reactivity.
+        reconnect?      (boolean (get-in @app-state* [:tabs tab-id :connection-initialized?]))
+        render-queue    (rq/make-queue)
+        renderer        {:trigger-render!  (tab-trigger-render! app-state* tab-id)
+                         :trigger-partial! (tab-trigger-partial! app-state* tab-id)
+                         :enqueue-scripts! #(rq/enqueue-scripts! render-queue %)
+                         :stop!            #(rq/enqueue-shutdown! render-queue)
+                         :render-queue     render-queue
+                         :conn-id          conn-id
+                         :thread           (Thread/currentThread)}
+        trigger-render! (:trigger-render! renderer)]
+    (state/get-or-create-tab! app-state* session-id tab-id)
+    ;; Take over from any stale/half-open renderer still attached (a new
+    ;; connection opened before the old one's body write unwound).
+    (when-let [stop! (get-in @app-state* [:tabs tab-id :renderer :stop!])]
+      (stop!))
+    ;; Publish the renderer (with its queue) before wiring watches so the
+    ;; stable triggers and setup-new-watches! resolve it.
+    (swap! app-state* assoc-in [:tabs tab-id :renderer] renderer)
+    ;; Clear any pending disconnect — we're attached again.
+    (swap! app-state* update-in [:tabs tab-id] dissoc :disconnected-at)
+    (if reconnect?
+      (t/log! {:level :info
+               :id    :hyper.event/tab-reconnect
+               :data  {:hyper/tab-id tab-id}
+               :msg   "Tab reconnected within grace window"})
+      ;; First connection for this tab: wire reactivity once.  Stable triggers
+      ;; (resolved from app-state) keep these watches driving whatever renderer
+      ;; is attached later.
+      (do
+        (swap! app-state* assoc-in [:tabs tab-id :connection-initialized?] true)
+        (watch/setup-watchers! app-state* session-id tab-id trigger-render!)
+        ;; Framework watches as :tab-scoped subviews — set up once at connect,
+        ;; survive navigation, torn down on full disconnect:
+        ;; - routes/head Vars: re-defs trigger re-renders for all tabs
+        ;; - component registry: REPL redefinition hot-swaps the client-components
+        ;;   bundle over SSE (the head update carries the new content-hashed URL).
+        (let [{:keys [routes-source head]} @app-state*]
+          (doseq [source (conj (filterv var? [routes-source head])
+                               component/registry*)]
+            (subview/register-watch! app-state* tab-id source :tab)))))
+    ;; Kick the initial full render, then run the loop until shutdown/disconnect.
+    (rq/enqueue-full-render! render-queue)
+    (try
+      (-renderer-loop! app-state* session-id tab-id os compress? render-queue)
+      (finally
+        ;; Only the connection that is currently attached may detach the tab —
+        ;; a stale half-open connection whose renderer was already replaced by a
+        ;; newer one must not tear it down.
+        (when (= conn-id (get-in @app-state* [:tabs tab-id :renderer :conn-id]))
+          (t/log! {:level :info
+                   :id    :hyper.event/tab-disconnect
+                   :data  {:hyper/tab-id tab-id}
+                   :msg   "Tab disconnected — starting grace window"})
+          (detach-tab! app-state* tab-id))))))
+
 (defn sse-events-handler
-  "Handler for SSE event stream.
-   Starts a per-tab renderer thread that owns the channel and optional
-   gzip stream, then wires up watchers to trigger re-renders."
+  "Handler for the SSE event stream.
+
+   Returns a Ring response whose body is a `StreamableResponseBody`; Jetty
+   invokes `write-body-to-stream` on a (virtual) thread, where `run-sse-loop!`
+   owns the output stream for the connection's lifetime — sending the connected
+   event, wiring reactivity, and streaming re-renders.  The SSE headers are set
+   on the response map here so they are committed before the body streams."
   [app-state*]
   (fn [req]
     (let [session-id (:hyper/session-id req)
           tab-id     (:hyper/tab-id req)
-          compress?  (gz/accepts-gzip? req)
-          ;; Identity for THIS SSE connection — shared by :on-open and
-          ;; :on-close so a stale half-open connection can't detach a tab
-          ;; whose renderer a newer connection already took over.
-          conn-id    (str (random-uuid))]
-
-      (http-kit/as-channel req
-                           {:on-open  (fn [channel]
-                                        (let [;; A tab whose SSE watchers were already set up is a
-                                              ;; reconnect: its state/subviews/workers survived the
-                                              ;; disconnect grace window, so we only re-attach a
-                                              ;; renderer rather than rebuild reactivity.
-                                              reconnect? (boolean
-                                                           (get-in @app-state* [:tabs tab-id :connection-initialized?]))]
-                                          (state/get-or-create-tab! app-state* session-id tab-id)
-                                          ;; Take over from any stale/half-open renderer still
-                                          ;; attached (a new connection opened before the old one's
-                                          ;; :on-close fired).
-                                          (when-let [stop! (get-in @app-state* [:tabs tab-id :renderer :stop!])]
-                                            (stop!))
-
-                                          ;; Start the renderer — it publishes itself under
-                                          ;; [:tabs tab-id :renderer], sends the connected event,
-                                          ;; and then blocks until triggered.
-                                          (let [{:keys [trigger-render!]}
-                                                (-start-renderer! app-state* session-id tab-id
-                                                                  channel compress? conn-id)]
-                                            ;; Clear any pending disconnect — we're attached again.
-                                            (swap! app-state* update-in [:tabs tab-id] dissoc :disconnected-at)
-
-                                            (if reconnect?
-                                              (t/log! {:level :info
-                                                       :id    :hyper.event/tab-reconnect
-                                                       :data  {:hyper/tab-id tab-id}
-                                                       :msg   "Tab reconnected within grace window"})
-                                              ;; First connection for this tab: wire reactivity once.
-                                              ;; Stable triggers (resolved from app-state) keep these
-                                              ;; watches driving whatever renderer is attached later.
-                                              (do
-                                                (swap! app-state* assoc-in [:tabs tab-id :connection-initialized?] true)
-                                                (watch/setup-watchers! app-state* session-id tab-id trigger-render!)
-                                                ;; Framework watches as :tab-scoped subviews — set up
-                                                ;; once at connect, survive navigation, torn down on
-                                                ;; full disconnect:
-                                                ;; - routes/head Vars: re-defs trigger re-renders for all tabs
-                                                ;; - component registry: REPL redefinition hot-swaps the
-                                                ;;   client-components bundle over SSE (the head update carries
-                                                ;;   the new content-hashed script URL).
-                                                (let [{:keys [routes-source head]} @app-state*]
-                                                  (doseq [source (conj (filterv var? [routes-source head])
-                                                                       component/registry*)]
-                                                    (let [sid (subview/register-watch! app-state* tab-id source :tab)]
-                                                      (subview/wire-subview! app-state* tab-id sid trigger-render! nil)))))))))
-
-                            :on-close (fn [_channel _status]
-                                        ;; Only the connection that is currently attached may detach
-                                        ;; the tab — a stale half-open connection whose renderer was
-                                        ;; already replaced by a newer one must not tear it down.
-                                        (when (= conn-id (get-in @app-state* [:tabs tab-id :renderer :conn-id]))
-                                          (t/log! {:level :info
-                                                   :id    :hyper.event/tab-disconnect
-                                                   :data  {:hyper/tab-id tab-id}
-                                                   :msg   "Tab disconnected — starting grace window"})
-                                          (detach-tab! app-state* tab-id)))}))))
+          compress?  (br/accepts-br? req)
+          ;; Identity for THIS SSE connection, so a stale half-open connection
+          ;; can't detach a tab whose renderer a newer connection took over.
+          conn-id    (str (random-uuid))
+          headers    (cond-> {"Content-Type"      "text/event-stream"
+                              "Cache-Control"     "no-cache, no-transform"
+                              "X-Accel-Buffering" "no"}
+                       compress? (assoc "Content-Encoding" "br"))]
+      {:status  200
+       :headers headers
+       :body    (reify ring-protocols/StreamableResponseBody
+                  (write-body-to-stream [_ _response os]
+                    (run-sse-loop! app-state* session-id tab-id os compress? conn-id)))})))
 
 (defn- parse-client-query-params
   "Extract client params from URL query parameters, JSON-decoding each
@@ -589,13 +624,20 @@
               ;; Sync client signal values into server state so the
               ;; render loop can detect changes (e.g. when a user types
               ;; into a data-bind input, the server needs to know the
-              ;; latest value for changed-signals diffing).
+              ;; latest value for changed-signals diffing).  Recording
+              ;; them under :client-signals too keeps the render loop
+              ;; from echoing them back as patches.
               action-data    (get-in @app-state* [:actions action-id])
               tab-id         (:tab-id action-data)]
           (when (and signals tab-id)
-            (swap! app-state* update-in [:tabs tab-id :signals]
-                   (fn [server-sigs]
-                     (merge server-sigs signals))))
+            (swap! app-state* update-in [:tabs tab-id]
+                   (fn [tab]
+                     (-> tab
+                         (update :signals merge signals)
+                         (update :client-signals merge signals))))
+            ;; Persist auto-commit optimistics before the action body runs,
+            ;; so cursor reads in the action see the committed value.
+            (signal/auto-commit! app-state* tab-id signals))
           (when-let [env (:hyper/env req)]
             (when tab-id
               (swap! app-state* assoc-in [:tabs tab-id :env] env)))
@@ -621,6 +663,89 @@
             (catch Exception e
               (t/error! {:id   :hyper.error/action-handler
                          :msg  "Error executing action handler"
+                         :data {:hyper/action-id action-id}}
+                        e)
+              {:status  500
+               :headers {"Content-Type" "application/json"}
+               :body    (json/generate-string {:error (.getMessage e)})})
+            (finally
+              (pop-thread-bindings))))))))
+
+(defn- trigger-tab-render!
+  "Enqueue a full render for `tab-id` on its currently attached renderer (if
+   any).  Used after an upload status transition so a plain-atom `:upload` ref
+   — which the app-state watcher does not observe — is still reflected; signal
+   and cursor refs already trigger via the watcher, so this is a harmless
+   coalesced extra render for them."
+  [app-state* tab-id]
+  (when-let [trigger! (get-in @app-state* [:tabs tab-id :renderer :trigger-render!])]
+    (trigger!)))
+
+(defn upload-handler
+  "Handler for multipart file-upload POST requests (`/hyper/upload`).
+
+   Uploads are `h/action`s whose body uses a file param ($form/$files); the
+   client posts a real multipart/form-data request here (rather than Datastar's
+   JSON @post()).  Wrapped with Ring's multipart middleware, which streams each
+   part to a temp file on disk, this:
+
+   - Looks up the registered action + its `:upload-ref` by action-id.
+   - Parses the multipart body into the `{:form :files}` client-params and
+     folds non-file fields into `context/*signals*` (so `@signal*` reads resolve
+     to submitted field values by matching input name).
+   - Transitions the status ref :processing -> :done (handler return as
+     `:result`) / :error, pushing each change to the client over SSE.
+   - Returns 204 (with any cookies from effects), like the action handler."
+  [app-state*]
+  (fn [req]
+    (let [action-id   (get-in req [:query-params "action-id"])
+          action-data (when action-id (get-in @app-state* [:actions action-id]))]
+      (cond
+        (not action-id)
+        {:status  400
+         :headers {"Content-Type" "application/json"}
+         :body    "{\"error\": \"Missing action-id\"}"}
+
+        (not (:fn action-data))
+        {:status  404
+         :headers {"Content-Type" "application/json"}
+         :body    "{\"error\": \"Upload action not found\"}"}
+
+        :else
+        (let [{:keys [tab-id upload-ref as]} action-data
+              multipart-params               (:multipart-params req)
+              client-params                  (uploads/parse-multipart multipart-params)
+              signals                        (uploads/form-fields->signals multipart-params)
+              req-with-state                 (assoc req
+                                                    :hyper/app-state app-state*
+                                                    :hyper/router (get @app-state* :router))]
+          (when-let [env (:hyper/env req)]
+            (when tab-id
+              (swap! app-state* assoc-in [:tabs tab-id :env] env)))
+          (push-thread-bindings {#'context/*request*     req-with-state
+                                 #'context/*signals*     signals
+                                 #'context/*action-name* as
+                                 #'effects/*pending*     (effects/init-pending)})
+          (try
+            ;; Body fully received: transfer is complete, processing begins.
+            (uploads/set-status! upload-ref {:phase :processing :percent 100 :error nil})
+            (trigger-tab-render! app-state* tab-id)
+            (let [result (try
+                           ((:fn action-data) client-params)
+                           (catch Throwable e
+                             (uploads/set-status! upload-ref {:phase :error :error (.getMessage e)})
+                             (trigger-tab-render! app-state* tab-id)
+                             (throw e)))]
+              (uploads/set-status! upload-ref {:phase :done :percent 100 :result result :error nil})
+              (trigger-tab-render! app-state* tab-id)
+              (let [pending (effects/collect-pending!)]
+                (when-let [scripts (seq (:scripts pending))]
+                  (when-let [renderer (get-in @app-state* [:tabs tab-id :renderer])]
+                    ((:enqueue-scripts! renderer) scripts)))
+                (effects/apply-cookies-to-response {:status 204} pending)))
+            (catch Throwable e
+              (t/error! {:id   :hyper.error/upload-handler
+                         :msg  "Error executing upload handler"
                          :data {:hyper/action-id action-id}}
                         e)
               {:status  500
@@ -679,6 +804,34 @@
     }
     return p.join('&');
   };
+  // Multipart upload via XMLHttpRequest so we get real upload progress
+  // (fetch does not expose request-body progress). fd is a FormData; opts has
+  // {url, start?, progress?(0-100), error?}. The signal callbacks are supplied
+  // by hyper.uploads/build-upload-expr so progress/phase land in a Datastar
+  // signal without a server round-trip; the server pushes processing/done over
+  // SSE. Same-origin, so the session cookie rides along automatically.
+  window.hyper.upload = function(fd, opts) {
+    opts = opts || {};
+    try { if (opts.start) opts.start(); } catch (e) {}
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', opts.url, true);
+    if (xhr.upload && opts.progress) {
+      xhr.upload.onprogress = function(e) {
+        if (e.lengthComputable) {
+          opts.progress(Math.round((e.loaded / e.total) * 100));
+        }
+      };
+    }
+    xhr.onreadystatechange = function() {
+      if (xhr.readyState === 4) {
+        if (xhr.status >= 400) { if (opts.error) opts.error(xhr.status); }
+        else if (opts.progress) { opts.progress(100); }
+      }
+    };
+    xhr.onerror = function() { if (opts.error) opts.error(0); };
+    xhr.send(fd);
+    return undefined;
+  };
   var appEl = document.getElementById('hyper-app');
   if (appEl) {
     // Seed the initial history entry with the current title so back-navigation restores it
@@ -729,14 +882,23 @@
    Shared by page-handler and not-found-handler so both emit identical document
    scaffolding, differing only in `status` and `fallback-title` (the <title>
    used when the result has no :title)."
-  [result {:keys [datastar-script open-when-hidden? base-path] :or {open-when-hidden? true
-                                                                    base-path         ""}}
-   tab-id status fallback-title]
+  [result {:keys [datastar-script open-when-hidden? base-path webkit-sse-shim?]
+           :or   {open-when-hidden? true
+                  base-path         ""
+                  webkit-sse-shim?  true}}
+   req tab-id status fallback-title]
   (let [{:keys [title head-html body-html declared-signals]} result
         title                                                (or title fallback-title)
         sig-attrs                                            (signal/format-signal-attrs declared-signals)
         div-attrs                                            (cond-> {:id "hyper-app"}
                                                                sig-attrs (merge sig-attrs))
+        ;; WebKit/Safari fetch-streaming strand workaround: inject the
+        ;; EventSource shim only for affected user agents, before the datastar
+        ;; script so window.fetch is patched before datastar opens the stream.
+        webkit-shim                                          (when (and webkit-sse-shim?
+                                                                        webkit-sse-shim-js
+                                                                        (safari-request? req))
+                                                               [:script (c/raw webkit-sse-shim-js)])
         html                                                 (c/html
                                                                [c/doctype-html5
                                                                 [:html
@@ -744,6 +906,7 @@
                                                                   [:meta {:charset "UTF-8"}]
                                                                   [:meta {:name "viewport" :content "width=device-width, initial-scale=1"}]
                                                                   [:title title]
+                                                                  webkit-shim
                                                                   datastar-script
                                                                   (when head-html (c/raw head-html))]
                                                                  [:body
@@ -784,7 +947,7 @@
           ;; Ring response passthrough (e.g. a 302 redirect)
           (if (:status result)
             result
-            (page-response result opts tab-id 200 "Hyper App")))))))
+            (page-response result opts req tab-id 200 "Hyper App")))))))
 
 (defn- not-found-handler
   "Reitit default-handler for unmatched routes: renders the configured
@@ -810,7 +973,7 @@
         ;; Ring response passthrough (e.g. a redirect from render middleware)
         (if (:status result)
           result
-          (page-response result opts tab-id 404 "Not Found"))))))
+          (page-response result opts req tab-id 404 "Not Found"))))))
 
 (defn- components-js-handler
   "Serve the assembled client-components ES module bundle.
@@ -984,6 +1147,13 @@
    - :open-when-hidden? Keep the SSE connection open when the browser tab is hidden
                         (default true). When false, Datastar closes the connection
                         on tab hide and reopens it when the tab becomes visible.
+   - :webkit-sse-shim?  Inject a small client shim (into <head>, only for
+                        WebKit/Safari user agents) that routes the GET render
+                        stream through a native EventSource instead of
+                        fetch+ReadableStream, working around a WebKit bug where a
+                        large isolated SSE patch is held back until the next
+                        write.  Other browsers are unaffected and never receive
+                        it.  Default true; pass false to disable.
    - :base-path         URL path prefix for reverse-proxy deployments where the app
                         is served under a subfolder (e.g. \"/my-app\"). When set,
                         all internal hyper endpoints (/hyper/events, /hyper/actions,
@@ -1033,18 +1203,27 @@
                         the next write (so the disconnect grace window can
                         start).  Defaults to 25000 (25s); pass nil or 0 to
                         disable.
+   - :max-file-size     Max bytes allowed per uploaded file on the /hyper/upload
+                        route; a larger file gets a 413.  Default: no limit.
+   - :max-file-count    Max number of files allowed per upload request.
+                        Default: no limit.
+   - :upload-expires-in TTL (seconds) for upload temp files before they are
+                        reaped.  Default 3600 (1 hour).  Move/stream :tempfile
+                        to permanent storage in your handler.
 
    Routes should use :get handlers that return hiccup (Chassis vectors).
    Hyper will wrap them to provide full HTML responses and SSE connections."
   ([routes app-state*]
    (create-handler routes app-state* {:datastar-script (default-datastar-script)}))
   ([routes app-state* {:keys [watches head base-path middleware render-middleware render-error not-found render-guard
-                              disconnect-grace-ms heartbeat-ms]
+                              disconnect-grace-ms heartbeat-ms
+                              max-file-size max-file-count upload-expires-in]
                        :or   {render-error        render.error/minimal
                               not-found           render.error/not-found
                               render-guard        :warn
                               disconnect-grace-ms default-disconnect-grace-ms
-                              heartbeat-ms        default-heartbeat-ms}
+                              heartbeat-ms        default-heartbeat-ms
+                              upload-expires-in   3600}
                        :as   opts}]
    (let [base-path       (or base-path "")
          opts            (assoc opts :base-path base-path)
@@ -1056,8 +1235,19 @@
                            (ring/create-default-handler
                              {:not-found (not-found-handler app-state* opts)})
                            (ring/create-default-handler))
+         ;; Multipart middleware is scoped to the upload route only — action
+         ;; POSTs and SSE must not be run through multipart parsing.  The
+         ;; temp-file store streams each part to disk (Jetty streams the body),
+         ;; so large uploads never buffer in heap.
+         upload-mw       {:store          (temp-file/temp-file-store {:expires-in upload-expires-in})
+                          :max-file-size  max-file-size
+                          :max-file-count max-file-count}
+         upload-route    (multipart-params/wrap-multipart-params
+                           (upload-handler app-state*)
+                           (into {} (remove (comp nil? val)) upload-mw))
          system-routes   [[(str base-path "/hyper/events") {:get (sse-events-handler app-state*)}]
                           [(str base-path "/hyper/actions") {:post (action-handler app-state*)}]
+                          [(str base-path "/hyper/upload") {:post upload-route}]
                           [(str base-path "/hyper/navigate") {:post (navigate-handler app-state*)}]
                           [(str base-path "/hyper/components.js") {:get (components-js-handler app-state*)}]]
          ;; Store the routes source (Var or value) so title resolution can
@@ -1109,7 +1299,7 @@
            ;; are parsed, before routing.  Earlier entries wrap outermost (execute first).
            (reduce (fn [h mw] (mw h)) h (reverse (vec middleware)))
            ((wrap-hyper-context app-state*) h)
-           (gz/wrap-gzip h)
+           (br/wrap-brotli h)
            (keyword-params/wrap-keyword-params h)
            (params/wrap-params h)
            (cookies/wrap-cookies h))]
@@ -1120,10 +1310,14 @@
 
 (defn- -do-stop
   "Stop the HTTP server and clean up all tab resources.
-   Tears down the reaper, all watchers, renderer threads, SSE channels, and actions."
+   Tears down the reaper, all watchers, renderer threads, SSE channels, and actions.
+
+   Order matters: each tab's render loop runs *inside* a Jetty request's
+   write-body-to-stream, so we must stop those loops (cleanup-tab! enqueues
+   :shutdown, letting the loop return and its SSE request complete) BEFORE
+   stopping Jetty.  Otherwise Jetty's graceful stop blocks on the still-open
+   SSE requests and throws a TimeoutException."
   [server app-state*]
-  (when server
-    (server :timeout 100))
   (when app-state*
     (when-let [reaper (:reaper @app-state*)]
       ((:stop! reaper))
@@ -1134,19 +1328,54 @@
       (t/log! {:level :info
                :id    :hyper.event/server-stop
                :data  {:hyper/tab-count (count tab-ids)}
-               :msg   "Hyper server stopped"}))))
+               :msg   "Hyper server stopped"})))
+  (when server
+    ;; Open SSE connections can make graceful stop hit its StopTimeout and throw;
+    ;; the server is stopped regardless, so swallow it (:catch-val) instead of
+    ;; letting a benign stop timeout propagate out of stop!.
+    (t/catch->error! {:id :hyper.error/server-stop :catch-val nil}
+                     (jetty/stop-server server))))
 
 (defn start!
   "Start the HTTP server with the given handler.
 
    handler: Ring handler (created with create-handler)
-   port: Port to run on (default: 3000)
+   options:
+   - :port            - Port to run on (default: 3000)
+   - :stop-timeout-ms - Jetty graceful-stop timeout (default 1000).
+
+   A tab's SSE render loop blocks its thread in write-body-to-stream for the
+   connection's whole lifetime, so the threading setup matters:
+
+   - Sync mode (not :async?): Jetty dispatches each request off the selector
+     onto a worker thread.  In async mode the streaming body-write is driven on
+     a selector thread, and Jetty has only ~cores/2 of them, so a handful of
+     open SSE tabs pins every selector and new connections can't be read (page
+     loads hang).  We flush the OutputStream ourselves in send-sse!, so sync
+     mode still streams incrementally.
+   - QueuedThreadPool + a virtual-threads executor: Jetty's I/O
+     (acceptors/selectors) stays on platform threads, while request handling
+     (and thus the blocking render loop) is dispatched onto a virtual thread —
+     so each connected tab costs one virtual thread, not a platform one.
 
    Returns a stop function. Call (stop-fn) or pass to stop! to shut down
    the server and clean up all tab resources (renderer threads, watchers, actions)."
-  [handler {:keys [port] :or {port 3000}}]
-  (let [server     (http-kit/run-server handler {:port port})
-        app-state* (::app-state (meta handler))]
+  [handler {:keys [port stop-timeout-ms]
+            :or   {port 3000 stop-timeout-ms 1000}}]
+  (let [app-state* (::app-state (meta handler))
+        pool       (doto (org.eclipse.jetty.util.thread.QueuedThreadPool.)
+                     (.setName "hyper-jetty")
+                     (.setVirtualThreadsExecutor
+                       (java.util.concurrent.Executors/newVirtualThreadPerTaskExecutor)))
+        server     (jetty/run-jetty handler
+                                    {:port         port
+                                     :async?       false
+                                     :join?        false
+                                     :thread-pool  pool
+                                     ;; Shorten Jetty's 30s default StopTimeout so stop!
+                                     ;; returns promptly (matters for REPL restarts).
+                                     :configurator (fn [^org.eclipse.jetty.server.Server s]
+                                                     (.setStopTimeout s (long stop-timeout-ms)))})]
     ;; Start the disconnect-grace reaper so tabs detached past their grace
     ;; window are fully torn down.
     (when app-state*

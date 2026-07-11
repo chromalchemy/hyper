@@ -275,6 +275,20 @@
                         (reset! (h/tab-cursor :effect-status) "combo-done"))}
       "Cookie + Script"]]))
 
+(defn optimistic-get [_]
+  (let [w* (h/optimistic (h/session-cursor :col-w 100))
+        n* (h/tab-cursor :n 0)]
+    [:div
+     [:h1 "Test Optimistic"]
+     ;; Signal-driven style — the morph-survival subject.
+     [:div#opt-box {:data-attr:style (h/expr (str "--col-w:" @w* "px"))} "box"]
+     [:span#server-n (str @n*)]
+     ;; Client-only write (simulated drag frame), no server traffic.
+     [:button#drag-btn {:data-on:click (h/expr (reset! w* 555))} "drag"]
+     ;; Unrelated server round trip → full re-render → morph.
+     [:button#bump-btn {:data-on:click (h/action (swap! n* inc))} "bump"]
+     [:button#commit-btn {:data-on:click (h/action (h/commit! w*))} "commit"]]))
+
 (defn default-routes []
   [["/" {:name  :home
          :title "Home"
@@ -314,7 +328,11 @@
    ["/effects"
     {:name  :effects
      :title "Effects"
-     :get   #'effects-get}]])
+     :get   #'effects-get}]
+   ["/optimistic"
+    {:name  :optimistic
+     :title "Optimistic"
+     :get   #'optimistic-get}]])
 
 (def ^:dynamic *test-routes* (default-routes))
 
@@ -1403,6 +1421,41 @@
           (testing "execute-script! runs JS that modifies the DOM"
             (w/click "#script-btn")
             (wait-for-text "#script-result" "executed")))
+
+        (finally
+          (close-browser! browser-info))))))
+
+(deftest ^:e2e optimistic-morph-survival-test
+  (testing "a client-side optimistic write survives a server re-render morph,
+            and commit! persists it"
+    (let [browser-info (launch-browser)
+          ctx          (new-context browser-info)
+          page         (new-page ctx)
+          box-style    #(str (eval-js "document.getElementById('opt-box').getAttribute('style')"))]
+      (try
+        (w/with-page page
+          (w/navigate (str base-url "/optimistic"))
+          (wait-for-sse)
+
+          (testing "a client-side write applies without server traffic"
+            (w/click "#drag-btn")
+            (is (wait-for-pred #(str/includes? (box-style) "555px"))
+                (str "client-side signal write should style the box, saw " (box-style))))
+
+          (testing "an unrelated server re-render (morph) does not clobber it"
+            (w/click "#bump-btn")
+            (wait-for-text "#server-n" "1")
+            ;; The morph has landed (n=1 rendered); the signal-driven style
+            ;; must still hold the client value, not the committed 100.
+            (is (wait-for-pred #(str/includes? (box-style) "555px"))
+                (str "the mid-gesture value must survive the morph, saw " (box-style))))
+
+          (testing "commit! persists the client value to the session cursor"
+            (w/click "#commit-btn")
+            (is (wait-for-pred
+                  #(some (fn [s] (= 555 (get-in s [:data :col-w])))
+                         (vals (:sessions @@test-state*))))
+                "the committed value lands in the backing session cursor")))
 
         (finally
           (close-browser! browser-info))))))

@@ -1,8 +1,10 @@
-/.plans/
 /.cpcache/
-/.clj-kondo/.cache/
+/.clj-kondo/.cache
+.DS_Store
 /.nrepl-port
 .envrc
 /.lsp/
 /.portal
-/.direnv/
+.direnv/
+/target/
+/classes/

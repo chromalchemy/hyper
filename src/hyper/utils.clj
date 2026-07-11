@@ -1,4 +1,4 @@
-(ns hyper.utils
+(ns ^:no-doc hyper.utils
   "General-purpose utility functions."
   (:require [clojure.string]
             [taoensso.telemere :as t])

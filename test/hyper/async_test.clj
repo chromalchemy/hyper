@@ -31,6 +31,26 @@
              context/*action-idx* (atom 0)]
      ~@body))
 
+(deftest test-partial-render-has-route-and-env
+  (testing "a reactive region's partial re-render sees :hyper/route and
+            :hyper/env, matching the full render (regression: partial-render
+            used to omit them, so h/route/h/env returned nil on re-render)"
+    (let [app-state* (atom (state/init-state))
+          dep        (atom 0)]
+      (state/get-or-create-tab! app-state* "s1" "t1")
+      (state/set-tab-route! app-state* "t1"
+                            {:name :dash :path "/dash" :path-params {} :query-params {}})
+      (swap! app-state* assoc-in [:tabs "t1" :env] {:db :prod})
+      (swap! app-state* assoc :router :some-router)
+      (swap! app-state* assoc-in [:tabs "t1" :subviews "r_t1_x"]
+             {:render-fn   (fn [] [:div (str "route=" (:name (h/route))
+                                             " env=" (pr-str (h/env)))])
+              :deps        [dep]                                         :dep-vals  [0]      :html-id "r_t1_x"
+              :region-path []                                            :on-change :partial})
+      (let [html (subview/partial-render app-state* "t1" "r_t1_x")]
+        (is (re-find #"route=:dash" html) "h/route resolves during partial render")
+        (is (re-find #"env=\{:db :prod\}" html) "h/env resolves during partial render")))))
+
 (deftest test-async-loading-then-ready
   (testing "first render is :loading; the worker landing flips the cell to
             :ready and a partial re-render shows the result"

@@ -425,6 +425,32 @@
       (is (= [:plain-badge {:label "OK" :color "green"}]
              (plain-badge {:label "OK" :color "green"}))))))
 
+(deftest test-defc-children
+  (with-fresh-registry
+    #_{:clj-kondo/ignore [:inline-def]}
+    (hc/defc slot-card
+      [{:keys [title]}]
+      (render
+        [:div [:h2 title] [:slot]]))
+
+    (testing "no children behaves exactly as before (host element only)"
+      (is (= [:slot-card {:title "Hi"}]
+             (slot-card {:title "Hi"}))))
+
+    (testing "trailing children are appended to the host element's light DOM"
+      (is (= [:slot-card {:title "Hi"} [:span "a"] [:span "b"]]
+             (slot-card {:title "Hi"} [:span "a"] [:span "b"]))))
+
+    (testing "serialized attrs and children coexist"
+      (let [result (slot-card {:title "Hi"} [:p "body"])]
+        (is (= :slot-card (first result)))
+        (is (= "Hi" (get (second result) :title)))
+        (is (= [:p "body"] (nth result 2)))))
+
+    (testing "a single seq of children splices through (hiccup flattens it)"
+      (is (= [:slot-card {:title "Hi"} '([:li 1] [:li 2])]
+             (slot-card {:title "Hi"} (for [i [1 2]] [:li i])))))))
+
 (deftest test-head-script-tag
   (with-fresh-registry
     (hc/register-component! "a-widget" {:attrs [] :render "(fn [_ _] [:i])"})

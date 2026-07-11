@@ -1,6 +1,8 @@
 # Hyper
 
 [![CI](https://github.com/dynamic-alpha/hyper/actions/workflows/ci.yaml/badge.svg)](https://github.com/dynamic-alpha/hyper/actions/workflows/ci.yaml)
+[![Clojars Project](https://img.shields.io/clojars/v/ai.dyal/hyper.svg)](https://clojars.org/ai.dyal/hyper)
+[![cljdoc](https://cljdoc.org/badge/ai.dyal/hyper)](https://cljdoc.org/d/ai.dyal/hyper)
 
 A reactive server-rendered web framework for Clojure built on
 [Datastar](https://data-star.dev/) and
@@ -68,18 +70,30 @@ Hyper is in active alpha development and used in internal projects at Dynamic
 Alpha. The API is evolving rapidly — expect bugs and breakage until a 1.0
 release.
 
+**Versioning:** until `1.0.0`, hyper does not follow semantic versioning.
+We are still exploring the best API, so any `0.x` release may introduce
+breaking changes as it stabilizes. We'll call out breaking changes in the
+[CHANGELOG](CHANGELOG.md), but pin an exact version and read the changelog
+before upgrading. Once the API settles we'll ship `1.0.0` and adopt semver.
+
 We're building in the open to share with the Clojure community. Feedback and
 contributions are welcome.
 
 ## Installation
 
-We eventually intend to publish to Clojars, however while we are rapidly
-evolving the project we recommend to install via a :git/url instead. Make sure
-to grab the latest SHA.
+Hyper is published to [Clojars](https://clojars.org/ai.dyal/hyper). Add it to
+your `deps.edn`:
 
 ```clojure
-{dynamic-alpha/hyper {:git/url "https://github.com/dynamic-alpha/hyper"
-                      :git/sha "..."}}
+ai.dyal/hyper {:mvn/version "0.1.0"}
+```
+
+The project is evolving rapidly — if you want to track unreleased changes, you
+can depend on a `:git/sha` instead (grab the latest SHA):
+
+```clojure
+{ai.dyal/hyper {:git/url "https://github.com/dynamic-alpha/hyper"
+                :git/sha "..."}}
 ```
 
 ## Requirements
@@ -185,16 +199,14 @@ resulting state changes trigger re-renders for the appropriate tabs.
 
 ### Action identity
 
-During action execution, `context/*action-name*` is bound to the `:as` value of
-the currently running action (or `nil` if the action was not given an `:as`
-name). This lets utility functions identify which action is running without the
-caller having to pass the name explicitly:
+During action execution, `(h/action-name)` returns the `:as` value of the
+currently running action (or `nil` if the action was not given an `:as`
+name). This lets utility functions identify which action is running without
+the caller having to pass the name explicitly:
 
 ```clojure
-(require '[hyper.context :as context])
-
 (defn audit! []
-  (log/info "Action executed" {:action context/*action-name*
+  (log/info "Action executed" {:action (h/action-name)
                                 :user   @(h/session-cursor :user)}))
 
 (h/action {:as "delete-user"}
@@ -241,13 +253,13 @@ Example usage:
 
 When `$` symbols appear in the action body, the macro automatically generates a `fetch()` call instead of `@post()`, sending the extracted values as a JSON body. On the server, the action function receives these values bound to the corresponding `$` symbols.
 
-Additional symbols can be defined by extending the `hyper.client-params/client-param` multimethod.
+Additional symbols can be defined by extending the `h/client-param` multimethod.
 
 For example, if you were handling mouse events, you might want to create support for tracking
 the x and y offset.
 
 ```clojure
-(defmethod hyper.client-params/client-param '$mouse-offset
+(defmethod h/client-param '$mouse-offset
   [_]
   {:js "{x:evt.offsetX, y:evt.offsetY}"
    :key "mouseOffset"})
@@ -262,18 +274,21 @@ an EDN map with keys :x and :y.
 
 ### Client-side guards
 
-Pass a `:when` option to `action` to inject a client-side Datastar expression.
-The guard runs before the action fires, letting you filter events at the browser level without a server round-trip.
+Gate an action with a client-side condition by embedding it in
+[`expr`](#expressions): the action only fires when the condition holds, with
+no network traffic otherwise.
 
 ```clojure
 ;; Only POST when Enter is pressed — no network traffic on other keystrokes
 [:input {:type "text"
-         :data-on:keydown (h/action {:when (h/expr (= evt.key "Enter"))}
-                           (reset! (h/tab-cursor :value) $value))}]
+         :data-on:keydown (h/expr (when (= $key "Enter")
+                                    (h/action (reset! (h/tab-cursor :value) $value))))}]
 ```
 
-The guard is any Datastar expression — build it with [`expr`](#expressions)
-as above, or pass a raw string (`{:when "evt.key === 'Enter'"}`).
+`expr` understands the same client-param vocabulary as `action` (`$key`,
+`$value`, …), so the guard reads naturally. The embedded action registers at
+render time and contributes its `@post(…)` — see
+[Actions inside expressions](#actions-inside-expressions).
 
 ## Signals
 
@@ -419,6 +434,131 @@ All actions use Datastar's `@post()` under the hood, so signal values are
 always available — even in actions that also use client params like `$value`,
 `$key`, etc.
 
+## Optimistic values
+
+`h/optimistic` pairs a cursor with a client-side signal: the **client is
+authoritative while the user is interacting, the cursor is authoritative at
+rest**. Use it for continuous gestures — column resize, drag positions,
+sliders — where the UI must update every frame with no server round trip,
+but the result should persist (and propagate to other tabs) like any cursor.
+
+```clojure
+(defn column [i]
+  (let [w* (h/optimistic (h/session-cursor [:cols i :width] 240))]
+    [:div.col {:data-attr:style (h/expr (str "--col-w:" @w* "px"))}
+     [:div.handle
+      {:data-on:pointermove__throttle.16ms
+       (h/expr (when $_dragging (reset! w* evt.clientX)))
+       :data-on:pointerup
+       (h/action (h/commit! w*))}]]))
+```
+
+The drag updates the signal every frame — instant paint, zero server
+traffic — and `h/commit!` persists the final value to the cursor. Because
+the DOM is driven by a signal-bound attribute, a server re-render landing
+mid-gesture cannot clobber the in-flight value.
+
+### Naming
+
+The signal name derives from the cursor — scope plus path, flattened:
+`(h/session-cursor [:cols 0 :width])` → `$sessionCols0Width`. Scope makes
+derived names collision-free (a tab and a session cursor at `:theme` yield
+`$tabTheme` and `$sessionTheme`), and self-documenting in devtools. Wrapping
+the same cursor twice yields the same signal; wrapping it with different
+options throws.
+
+### Reading and writing
+
+One rule everywhere: **deref reads what the client sees; writes decree what
+the server says.**
+
+| Context | `@opt*` | `(reset!/swap! opt* v)` |
+|---|---|---|
+| render | Datastar expression string (`"$sessionColW"`) | not allowed (render is pure) |
+| action | live client-reported value | writes the **cursor** (authoritative) |
+
+Server writes never touch the signal directly — the next render notices the
+cursor changed and patches the client. Validation is therefore a one-liner,
+commit and clamp in one motion:
+
+```clojure
+(h/action (reset! w* (clamp @w* 80 640)))
+```
+
+If the clamped value differs from what the client had, the correction flows
+down and the UI converges on the server's answer.
+
+### Committing
+
+`(h/commit! opt*)` makes the client's value official — it is
+`(reset! opt* @opt*)` plus conflict detection (below). Plain `reset!`/`swap!`
+skip detection: they are server decrees, and a decree has no base to
+conflict with. `commit!` throws if the signal did not accompany the request
+(e.g. in a file-upload action, which carries form fields instead).
+
+Pass `:auto-commit? true` to commit the reported value on **every** action
+POST from the tab. For a continuous gesture, a throttled no-op action is
+enough — the signal rides the POST:
+
+```clojure
+(let [w* (h/optimistic (h/session-cursor :sidebar-width 300)
+                       {:auto-commit? true})]
+  ...
+  {:data-on:pointermove__throttle.100ms (h/action nil)})
+```
+
+Auto-commit is trusted, raw persistence. If you need to validate or
+transform, use an explicit commit action instead.
+
+### Conflicts
+
+Commits are last-write-wins by default. Pass `:on-conflict` to handle a
+commit based on a stale value — another tab (or the server) changed the
+cursor after this client last synced:
+
+```clojure
+(h/optimistic (h/session-cursor :title "")
+              {:on-conflict :server-wins})
+```
+
+| policy | on conflict |
+|---|---|
+| `:client-wins` | reported value wins — the default, spelled out |
+| `:server-wins` | committed value wins; the client is corrected automatically |
+| `(fn [{:keys [base committed reported]}] …)` | return the value to commit |
+
+where
+
+- `:base` — the committed value the client's edit was based on
+- `:committed` — the cursor's current value
+- `:reported` — the value the client wants
+
+A conflict is `base ≠ committed`; a nil base counts as a conflict (an
+unknown base cannot prove freshness). Whenever the resolved value differs
+from what the client reported — a rejection or an adjustment — the client
+is patched back to it automatically.
+
+Detection works by value echo: hyper generates a companion signal
+(`$…Base`) holding the last committed value synced to that client; it rides
+every request like any signal, and advances automatically after each clean
+commit so the next commit stays clean. `:server-wins` and fn policies pay
+this (small) cost; `:client-wins` and the default do not.
+
+### How it works
+
+- The signal is declared with `__ifmissing` set to the cursor's **current**
+  value, so a fresh page paints committed state with no patch.
+- Every render compares the cursor against the last value synced to that
+  tab; when the server changed it (another tab's commit, a clamp, a
+  background job), a signal patch flows. Tabs sharing a session or global
+  cursor converge automatically — optimistics are multiplayer by default.
+- Values a client itself reported are never echoed back, so round-trips
+  can't snap a fast-moving gesture backwards.
+
+A tab-scoped optimistic works but adds little over a plain signal — reach
+for `h/optimistic` when the value should outlive the tab or be visible
+beyond it.
+
 ## Expressions
 
 `expr` compiles Clojure s-expressions into
@@ -456,6 +596,8 @@ decides where code runs, not the syntax.
 | `@sig` | Signal reference (`$name`) |
 | `(:kw m)` keyword calls | Evaluated as Clojure, spliced as literals |
 | `~form` | Explicit splice (escape hatch for arbitrary Clojure) |
+| `(h/action …)` | Registers at render time; contributes its raw `@post(…)` |
+| Client params (`$value`, `$key`, `$checked`, `$detail`, `$form-data`) | Expand to their client-side JS accessor — e.g. `$key` → `evt.key` |
 | `$signals`, `evt`, `el`, `(@post "/x")`, JS interop | Pass through to the client |
 
 Compilation happens at macro-expansion time (via the same embedded
@@ -464,17 +606,51 @@ Compilation happens at macro-expansion time (via the same embedded
 string interpolation of spliced values only. Output is dependency-free
 JavaScript suitable for Datastar's sandboxed evaluator.
 
-`expr` also works in `action`'s `:when` guard:
+### Actions inside expressions
+
+A server `action` composes as a client-side value: embedded in `expr`, it
+registers at render time and contributes its `@post(…)`, so you can gate it
+with ordinary client-side control flow — no server round-trip until the
+condition holds:
 
 ```clojure
-[:input {:data-on:keydown (h/action {:when (h/expr (= evt.key "Enter"))}
-                            (search! $value))}]
+[:input {:data-on:keydown (h/expr (when (= $key "Enter")
+                                    (h/action (search! $value))))}]
 ```
+
+This is the idiomatic way to guard an action — see
+[Client-side guards](#client-side-guards).
+
+### Client params in expressions
+
+`expr` understands the same **client-param** vocabulary as `action` — the
+`$`-symbols that read from the DOM event: `$value`, `$checked`, `$key`,
+`$detail`, `$form-data`, plus any you register via `h/client-param`.
+Inside `expr` they expand to their
+client-side JS accessor (there is no server round-trip, so only the accessor
+is emitted):
+
+```clojure
+(h/expr (= $key "Enter"))        ;; → (evt.key) === ("Enter")
+(h/expr (reset! query* $value))  ;; → $query = evt.target.value
+```
+
+Each layer keeps its own semantics when they nest — the guard's `$key` is
+client-side, while the embedded action's `$value` still rides the server
+round-trip:
+
+```clojure
+[:input {:data-on:keydown (h/expr (when (= $key "Enter")
+                                    (h/action (reset! (h/tab-cursor :q) $value))))}]
+```
+
+> **Precedence:** these registry names win over the raw `$signal`
+> passthrough, so a signal literally named `value` must be referenced via its
+> signal object (`@value*`), not the raw `$value` symbol.
 
 It covers the simple, obvious expressions a human would write; it is
 possible to construct forms that compile to broken JavaScript. Raw strings
-remain supported everywhere expressions are accepted. The canonical
-namespace is `hyper.expr` (`->expr`); `h/expr` is a re-export.
+remain supported everywhere expressions are accepted.
 
 ## Effects
 
@@ -633,6 +809,140 @@ All effect functions throw if called outside an action context. This is
 intentional — effects are tied to the HTTP request/response cycle and have no
 meaning outside of it.
 
+## File uploads
+
+A file upload is just an `action` whose body uses a **file client param** —
+`$form` or `$files`. Binary content can't ride Datastar's JSON `@post()`, so
+when one of these appears the macro switches the action to a real
+`multipart/form-data` upload (a small `XMLHttpRequest` to `/hyper/upload`),
+while everything else — the trigger you bind it to, cursors, effects — works
+exactly as in a normal action.
+
+```clojure
+(defn profile-page [_]
+  (let [status* (h/signal :avatar-upload {:phase :idle :percent 0})]
+    [:form {:data-on:submit__prevent
+            (h/action {:upload status*}
+              (let [f (:avatar $form)]
+                (store-avatar! (:tempfile f))
+                {:saved (:filename f)}))}
+     [:input {:name "name"}]
+     [:input {:type "file" :name "avatar"}]
+     [:button "Upload"]]))
+```
+
+### File params: `$form` vs `$files`
+
+| Param | Captures | Bound on the server to |
+|---|---|---|
+| `$form` | the whole enclosing `<form>` (named fields **and** files) | a keyword-keyed map, files inline: `{:name "Alice" :avatar {file…}}` |
+| `$files` | the file(s) on the event target (`evt.target.files`) | a vector of file maps |
+
+Each file is a map `{:filename :content-type :tempfile :size}`, where
+`:tempfile` is a `java.io.File`.
+
+**Pick the param to match the event.** `$form` reads the closest form, so use it
+for `data-on:submit`. `$files` reads `evt.target.files`, which is only populated
+on a file input itself — use it on an `<input type="file">`'s `data-on:change`
+to upload the moment a file is chosen:
+
+```clojure
+[:input {:type "file"
+         :data-on:change (h/action {:upload status*} (ingest! $files))}]
+```
+
+You may use at most one file param per action, and not mixed with other client
+params (`$value`, etc.). File extraction is extensible like any client param —
+define a `:multipart? true` method on `h/client-param` whose `:js` returns a
+`FormData` (e.g. a drop zone reading `evt.dataTransfer.files`).
+
+### Status and progress — the `:upload` ref
+
+Pass any `IRef` as `:upload`; the framework writes the upload's status into it:
+
+```clojure
+{:phase   :idle | :uploading | :processing | :done | :error
+ :percent 0-100        ;; live transfer % (signal refs only)
+ :result  …            ;; the action's return value, on :done
+ :error   "…"}         ;; the exception message, on :error
+```
+
+The ref type you choose selects the ergonomics:
+
+| `:upload` ref | live transfer `%` | how you read it in render |
+|---|---|---|
+| **signal** (recommended) | ✅ written client-side from `xhr.upload.onprogress` | drive UI via Datastar attributes on the signal |
+| **cursor** / atom | ❌ server-only (`:idle → :processing → :done`) | branch server-side: `(case (:phase @status*) …)` |
+
+A **signal** is the natural home because it's the one ref both sides can write:
+the client sets `:phase :uploading` + `:percent` during transfer (no round
+trip), and the server sets `:processing` → `:done`/`:error` over SSE. The server
+never writes `:percent` mid-transfer, so it can't clobber the live client value
+(it sets `100` only once the body has fully arrived).
+
+Because a signal holds a map, read its fields as Datastar **paths**, not with
+Clojure keyword access — in render `@status*` is the expression string
+`"$avatarUpload"`, so build the path with `str` (`(:phase @status*)` would be
+evaluated as Clojure and yield `null`):
+
+```clojure
+[:progress {:data-show     (str @status* ".phase === 'uploading'")
+            :max           100
+            :data-attr:value (str @status* ".percent")}]
+[:p {:data-show (str @status* ".phase === 'done'")}
+ "Saved " [:strong {:data-text (str @status* ".result.filename")}]]
+```
+
+With a **cursor** the page re-renders server-side, so ordinary Clojure works
+(`(case (:phase @status*) :processing [:p "…"] :done …)`) — you just don't get a
+live transfer percentage.
+
+The action's return value becomes `:result`, and an uncaught throw becomes
+`:error`. Since the ref is yours, the handler can also write it directly for
+richer status (e.g. per-file results when a `multiple` input or repeated field
+yields several files).
+
+`:upload` is optional — omit it for a fire-and-forget upload with no
+status/progress.
+
+### Signals and form fields
+
+The upload sends the form's named fields (a `data-bind` input with a `name` is
+included automatically), so they arrive in `:form`. They are also folded into
+`*signals*`, so `@a-signal*` reads in the handler resolve to the submitted value
+when the input's `name` matches the signal (e.g. a `data-bind` input named
+`userName` satisfies `(h/signal :user-name)`). For a signal not represented as a
+named form field, add a hidden bound input
+(`[:input {:type "hidden" :name "token" :data-bind token*}]`).
+
+### Streaming, memory, and limits
+
+Uploads stream to disk: Jetty hands the request body to Ring as an
+`InputStream`, and the multipart temp-file store writes each part to a temp file
+as bytes arrive — so large files never buffer in heap. Your handler gets a
+`:tempfile` (a `File`); **move or stream it** to permanent storage rather than
+reading it whole into memory. Temp files left behind are reaped after
+`:upload-expires-in` seconds (default 3600).
+
+Configure limits on `create-handler`:
+
+| Option | Meaning | Default |
+|---|---|---|
+| `:max-file-size` | max bytes per file (413 when exceeded) | no limit |
+| `:max-file-count` | max files per request | no limit |
+| `:upload-expires-in` | temp-file TTL in seconds | `3600` |
+
+```clojure
+(h/create-handler #'routes
+  :max-file-size  (* 25 1024 1024)
+  :max-file-count 5)
+```
+
+> For very large files over flaky networks, resumable/chunked uploads (each
+> chunk a bounded request) are the principled answer — both for resume and to
+> keep per-request memory flat. That's a planned future addition; today's
+> single-request uploads cover the common case with a size cap.
+
 ## Render Middleware
 
 Render middleware lets you wrap every page render with cross-cutting logic —
@@ -650,10 +960,10 @@ should run before (or around) the render function. Middleware follows the same
       {:status 302 :headers {"Location" "/login"} :body ""})))
 ```
 
-Middleware runs inside the render context — `context/*request*` is bound, cursors
-work, and the full Ring request (cookies, headers, query-params) is available on
-initial page loads. On SSE re-renders, a minimal synthetic request is passed
-instead, but cursors and app-state are always available.
+Middleware runs inside the render context — cursors work, and the full Ring
+request (cookies, headers, query-params) is available on initial page loads.
+On SSE re-renders, a minimal synthetic request is passed instead, but cursors
+and app-state are always available.
 
 Returning a Ring response map from middleware (e.g. `{:status 302 ...}`)
 short-circuits the render. On initial HTTP requests this produces a normal
@@ -779,7 +1089,7 @@ The execution order for `:middleware` is:
 
 ```
 Request arrives
-  → Hyper built-ins: cookies → params → keyword-params → gzip → hyper-context
+  → Hyper built-ins: cookies → params → keyword-params → brotli → hyper-context
   → Your :middleware (first in vector = outermost, runs first)
   → Router dispatch (page-handler, action-handler, etc.)
 ```
@@ -1032,8 +1342,8 @@ navbars and breadcrumbs:
    [:h1 "Home"]])
 ```
 
-You can also read it from `context/*request*` inside actions or anywhere within
-the request context — the value is always consistent with the tab's current
+You can also read it from `(h/route)` inside actions or anywhere within the
+request context — the value is always consistent with the tab's current
 route.
 
 ### Parameter coercion
@@ -1096,9 +1406,8 @@ when client-side navigation hits a dead URL. Override it with `:not-found`, a
     :not-found #'not-found-page))
 ```
 
-Pass a Var to pick up REPL redefinitions without restarting. The default lives
-at `hyper.render.error/not-found`. Pass `:not-found nil` to disable the feature
-and fall back to Reitit's plain-text 404.
+Pass a Var to pick up REPL redefinitions without restarting. Pass `:not-found
+nil` to disable the feature and fall back to Reitit's plain-text 404.
 
 ## Suppress hyper wrapping certain endpoints
 
@@ -1173,9 +1482,11 @@ and `:unmount`:
 ```
 
 `:render` is required; `:mount`/`:unmount` are optional. The view (re)mounts
-when the page first renders or the route handler identity changes (navigation,
-or a Var redefinition during REPL development); a superseded view is unmounted
-first. There is deliberately **no** mutable per-view slot — the server always
+when the page first renders, the route handler identity changes (navigation, or
+a Var redefinition during REPL development), or the route's **path-params**
+change (the same handler serving a different path-param value); a superseded
+view is unmounted first. Query-param changes re-render in place. There is deliberately
+**no** mutable per-view slot — the server always
 re-renders declaratively, so a resource opened at mount, read during renders,
 and closed at unmount is just a value threaded through the lifecycle.
 
@@ -1264,8 +1575,10 @@ and pushes an update to the client. `watch!` is an *effect*, so it belongs in a
             [:li (:name r)])]]))
 ```
 
-Watches are reference-counted and automatically cleaned up when the tab is torn
-down (navigation away, or a disconnect that is not reconnected within the
+Watches are reference-counted and automatically cleaned up when the page
+remounts (navigation, or a path-param change — which re-runs setup, so a
+path-param-keyed watch re-subscribes to the new source) or the tab is torn down
+(a disconnect not reconnected within the
 [grace window](#reconnection-and-the-disconnect-grace-window)). A transient
 disconnect leaves watches in place, so a reconnect does not re-run their setup.
 
@@ -1277,12 +1590,10 @@ disconnect leaves watches in place, so a reconnect does not re-run their setup.
 
 By default, `watch!` works with anything that implements `clojure.lang.IRef`
 (atoms, refs, agents, vars). For custom external sources, extend
-`hyper.protocols/Watchable`:
+`h/Watchable`:
 
 ```clojure
-(require '[hyper.protocols :as proto])
-
-(extend-protocol proto/Watchable
+(extend-protocol h/Watchable
   my.db/QueryResult
   (-add-watch [this key callback]
     ;; callback is (fn [old-val new-val])
@@ -1367,8 +1678,9 @@ expensive stats section is not re-executed.
 `reactive` takes a vector of deps (any `Watchable` source — atoms, cursors,
 etc.) and a body. It:
 
-1. Injects a stable ID onto the returned element (or uses an existing `:id` if
-   present)
+1. Resolves the region's identity — an explicit `:key` > the root element's
+   `:id` > a positional fallback — and uses it as both the morph anchor and the
+   server-side registry key
 2. Registers watches on the deps
 3. **On dep change**: re-renders only this component and sends a targeted
    Datastar fragment — no full page re-render
@@ -1384,6 +1696,38 @@ etc.) and a body. It:
 (h/reactive [clock*]
   [:p {:id "my-clock"} "Time: " @clock*])
 ```
+
+### Identity in dynamic lists
+
+Region identity is positional by default: it's stable as long as every render
+emits the same sequence of regions. In a **dynamic or reordered list of
+stateful regions**, that breaks — an item changing shape or moving shifts the
+positional ids of later items, so they remount (scroll resets, in-flight
+`async` fetches interrupted).
+
+Give such a region a stable identity and it follows the item instead. The
+identity drives both the morph anchor and the server-side region state, so the
+DOM and any in-flight work move together:
+
+```clojure
+;; A stable root :id is enough — identity rides the id idiomorph already keys on
+(for [node (sort-by :order @nodes*)]
+  (h/reactive [(grid-cursor node)]
+    [:div {:id (str "grid-" (:id node))} (render-grid node)]))
+
+;; Or an explicit :key — the escape hatch when the root can't carry a stable
+;; :id (e.g. an async region whose body shape-shifts between states)
+(h/async {:key (:id node)} [(fold-cursor node)]
+  (fetch-fold node)
+  {:keys [status result]}
+  (case status :ready (render-fold result) [:p "Loading…"]))
+```
+
+`:key` accepts any value (a hash is derived for non-trivial ones). Keys nest:
+a region's `:key` is scoped by its enclosing keyed region, so a key only has to
+be unique among its siblings (like React keys). Two regions resolving to the
+same id in one render is an error. Anonymous regions keep the positional
+fallback, which is fine for static layouts.
 
 ### Nesting
 
@@ -1456,9 +1800,12 @@ render body wherever the data is shown.
 The shape is a sibling of `reactive`:
 
 ```
-(h/async [deps] fetch-expr binding & render-body)
+(h/async {opts}? [deps] fetch-expr binding & render-body)
 ```
 
+- **`opts`** — an optional leading map. `:key` gives the region a stable
+  identity so its in-flight fetch follows the item in a dynamic/keyed list (see
+  [Identity in dynamic lists](#identity-in-dynamic-lists)).
 - **`deps`** — a vector of `Watchable` sources. `[]` fetches once per mount;
   otherwise a change to a dep refetches (see `:reloading`).
 - **`fetch-expr`** — a single expression evaluated on a background virtual
@@ -1523,7 +1870,7 @@ handlers the linter cannot identify statically.
 
 Most hyper UIs need no client-side code at all — but some islands genuinely
 do: charts, editors, maps, anything built on a JavaScript library that owns
-its own DOM. `hyper.component/defc` lets you author those islands as
+its own DOM. `h/defc` lets you author those islands as
 **web components** written in a ClojureScript dialect
 ([Squint](https://github.com/squint-cljs/squint)), compiled to JavaScript
 **on the JVM at macro-expansion time** — no Node, no build step, no npm.
@@ -1561,6 +1908,29 @@ components like ordinary hiccup functions:
                   :data-on:gauge-selected
                   (h/action (handle-selection! $detail))})]))
 ```
+
+Trailing children are appended to the host element's light DOM. Render a
+`<slot>` inside the component to choose where that content appears:
+
+```clojure
+(h/defc info-card
+  [{:keys [title]}]
+  (render
+    [:div.card
+     [:h3 title]
+     [:slot]]))            ;; ← children are projected here
+```
+
+```clojure
+;; in a page handler — children follow the attribute map
+(info-card {:title "CPU"}
+  [:p "Usage is nominal."]
+  [:p "All systems go."])
+```
+
+This renders `<info-card title="CPU">` with the two paragraphs in its light
+DOM, slotted into the component's shadow DOM where `<slot>` sits. A
+component with no `<slot>` simply ignores any children.
 
 ### Attributes are the boundary
 
@@ -1667,11 +2037,24 @@ signal, or a test — components stay pure functions of their attributes.
 
 ### Styles
 
-Components render into shadow DOM (which also makes them invisible to
-Datastar's morph — internals are never clobbered). Document stylesheets
-are inherited into each shadow root automatically, so global CSS — e.g. a
-Tailwind build included via `:head` — styles component internals without
-extra wiring.
+Components render into shadow DOM, which keeps them invisible to Datastar's
+morph (internals are never clobbered). Document stylesheets are inherited
+into each shadow root automatically, so global CSS — e.g. a Tailwind build
+included via `:head` — styles component internals without extra wiring.
+
+Each shadow root also gets these base defaults, which global CSS and a
+component's own `<style>` can override:
+
+```css
+:host            { display: block; }
+[data-hyper-root]{ display: block; height: 100%; }
+```
+
+So `:host` is the component's box and your render output is plain HTML
+inside it. Set the box on `:host` (size, `display`, margin); lay out
+content on your own render elements. To fill the parent, give `:host` a
+definite height (`:host{height:100%}` or a flex/grid item) and it carries
+through to your output.
 
 ### Live reload
 
@@ -1694,10 +2077,6 @@ not Clojure — they compile to JavaScript and run in the browser:
 Hyper ships clj-kondo config (see [clj-kondo](#clj-kondo)) that validates
 `defc` structure at lint time and makes attrs, `emit`, and `ctx` resolve
 inside segments.
-
-`h/defc` is a re-export; the canonical namespace is `hyper.component`,
-which also houses the lower-level API (`register-component!`, `attrs`,
-the bundle registry).
 
 For self-hosted/air-gapped deploys, override the Squint runtime CDN URL
 with the `:squint-core-url` option on `create-handler`.
@@ -1734,13 +2113,12 @@ Editors learn this differently:
 
   ```clojure
   {:extra-indents
-   {defc                 [[:block 1] [:inner 1]]
-    hyper.core/defc      [[:block 1] [:inner 1]]
-    hyper.component/defc [[:block 1] [:inner 1]]}}
+   {defc            [[:block 1] [:inner 1]]
+    hyper.core/defc [[:block 1] [:inner 1]]}}
   ```
 
   The unqualified entry covers `defc` called via `:refer`; the qualified
-  entries cover `h/defc` / `component/defc`.
+  entry covers `h/defc`.
 
 ## Batched cursor updates
 
@@ -1897,6 +2275,29 @@ Hyper's built-in `/hyper/events` endpoint automatically sends SSE-friendly
 headers, including `Cache-Control: no-cache, no-transform` and
 `X-Accel-Buffering: no`, to improve compatibility with reverse proxies.
 
+### WebKit/Safari SSE shim
+
+WebKit/Safari's `fetch` + `ReadableStream` delivery holds back the trailing
+bytes of a large SSE write until the next read wakeup, so a large isolated DOM
+patch can render one write behind and a quiet connection can appear frozen until
+the next update or heartbeat. Native `EventSource` does not have this problem.
+
+To work around it, Hyper injects a tiny client shim into the `<head>` — **only
+for WebKit/Safari user agents** — that routes the GET render stream through a
+native `EventSource` instead of `fetch`. It fails open (falls back to the real
+fetch if `EventSource` can't be used), lets Datastar drive reconnection on drop,
+and tears the connection down cleanly on navigation so nothing leaks. Other
+browsers never receive it.
+
+It's on by default; pass `:webkit-sse-shim? false` to disable:
+
+```clojure
+(def handler
+  (h/create-handler
+    #'routes
+    :webkit-sse-shim? false))
+```
+
 ### Heartbeat keepalive
 
 An otherwise-idle SSE connection (no state changes for a while) sends a periodic
@@ -2046,31 +2447,10 @@ after a server redeploy where client code may have changed).
 > reconnecting starts a fresh tab — the connection comes back, but tab-local
 > state does not. Word any "Retry" copy accordingly.
 
-## Gzip compression
+## Brotli compression
 
-Hyper compresses both initial page responses and streaming SSE updates with
-gzip, using only `java.util.zip` (no native dependency).
-
-- **Initial page responses** are compressed one-shot at maximum level
-  (`Deflater/BEST_COMPRESSION`) by the built-in `wrap-gzip` middleware.
-- **SSE updates** are compressed with a single streaming `GZIPOutputStream`
-  per connection (so the deflate window is shared across patches for better
-  ratios), flushed after every patch with `SYNC_FLUSH` so the browser paints
-  each patch the moment it is written.
-
-Compression is enabled whenever the client advertises `Accept-Encoding: gzip`,
-which every browser does over both HTTP and HTTPS.
-
-### Why gzip and not brotli?
-
-hyper streams SSE patches compressed, flushing after each one. A brotli flush
-emits a block that is only surfaced by an *eager* decoder — and WebKit/Safari's
-decoder is not eager, so a flushed-but-not-final brotli block stays buffered
-until the *next* write arrives. The visible symptom is Safari rendering each SSE
-patch one event behind (most noticeable with large, discrete patches). gzip's
-`SYNC_FLUSH` boundary (the `00 00 FF FF` marker) is surfaced mid-stream by every
-browser, so patches paint immediately. Standardising on gzip also lets hyper
-drop the brotli4j JNI native dependency entirely.
+Hyper uses [brotli4j](https://github.com/hyperxpro/Brotli4j) to compress both
+initial page responses and streaming SSE updates.
 
 ## clj-kondo
 
@@ -2156,11 +2536,14 @@ making it easy to find and invoke specific actions in tests:
 ```
 
 Without `:as`, actions are keyed by their auto-generated action ID. `:as` can
-be combined with `:when`:
+be combined with other options such as `:key`:
 
 ```clojure
-(h/action {:as "search" :when (h/expr (= evt.key "Enter"))} (search! $value))
+(h/action {:as "delete" :key (:id node)} (delete! (:id node)))
 ```
+
+To gate an action on a client-side condition, embed it in `expr` — see
+[Client-side guards](#client-side-guards).
 
 ### `test-action`
 
@@ -2241,7 +2624,7 @@ clojure -M:test
 ### Unit tests
 
 Unit tests live in `test/hyper/` and cover cursors, actions, navigation, routing,
-rendering, state management, effects, render middleware, and gzip compression.
+rendering, state management, effects, render middleware, and brotli compression.
 They run in-process with no server or browser — just bind `*request*` and
 exercise the API directly.
 

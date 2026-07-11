@@ -4,6 +4,7 @@
             [dev.onionpancakes.chassis.core :as c]
             [hyper.context :as context]
             [hyper.core :as h]
+            [hyper.expr :refer [->expr]]
             [hyper.signal :as signal]
             [hyper.state :as state]))
 
@@ -446,3 +447,294 @@
         ;; terminal failure
         (is (clojure.string/includes?
               js "'retries-failed' ? ($_hyperConnection = 'error', $_hyperConnected = false)"))))))
+
+;; ---------------------------------------------------------------------------
+;; Optimistic — derived naming
+;; ---------------------------------------------------------------------------
+
+(def ^:private opt-session-id "ses_opt")
+(def ^:private opt-tab-id "tab_opt")
+
+(defmacro ^:private with-render-ctx
+  "Bind a render context (request + declared-signals accumulator) for body."
+  [app-state* & body]
+  `(binding [context/*request*          {:hyper/session-id opt-session-id
+                                         :hyper/tab-id     opt-tab-id
+                                         :hyper/app-state  ~app-state*}
+             context/*declared-signals* (atom [])]
+     ~@body))
+
+(defn- fresh-opt-state []
+  (let [app-state* (atom (state/init-state))]
+    (state/get-or-create-tab! app-state* opt-session-id opt-tab-id)
+    app-state*))
+
+(deftest derived-signal-path-test
+  (testing "scope + logical path, flattened"
+    (is (= :global-theme (signal/derived-signal-path :global [:theme])))
+    (is (= :tab-count (signal/derived-signal-path :tab [:count])))
+    (is (= :session-user-name (signal/derived-signal-path :session [:user :name])))
+    (is (= :path-page (signal/derived-signal-path :path [:page]))))
+
+  (testing "numeric segments round-trip the wire format"
+    ;; The derived path must equal what parse-signals produces for its own
+    ;; camelCase wire name, or client-reported values miss the store path.
+    (is (= :session-cols-0-width (signal/derived-signal-path :session [:cols 0 :width])))
+    (is (= "sessionCols0Width"
+           (signal/signal-js-name (signal/derived-signal-path :session [:cols 0 :width]))))))
+
+;; ---------------------------------------------------------------------------
+;; Optimistic — creation, rendering, declaration
+;; ---------------------------------------------------------------------------
+
+(deftest optimistic-render-test
+  (let [app-state* (fresh-opt-state)]
+    (with-render-ctx app-state*
+      (let [w* (h/optimistic (h/session-cursor [:cols 0 :width] 240))]
+        (testing "render deref returns the Datastar expression string"
+          (is (= "$sessionCols0Width" @w*)))
+
+        (testing "renders as the signal name in attribute position"
+          (is (clojure.string/includes? (c/html [:input {:data-bind w*}])
+                                        "data-bind=\"sessionCols0Width\"")))
+
+        (testing "expr treats it as a signal"
+          (is (= "$sessionCols0Width = 5" (->expr (reset! w* 5))))
+          (is (= "$sessionCols0Width = ($sessionCols0Width + 1)" (->expr (swap! w* inc))))
+          (is (= "$sessionCols0Width" (->expr @w*))))
+
+        (testing "declares the signal with the current committed value"
+          (is (some #(and (= :session-cols-0-width (:path %))
+                          (= 240 (:default-val %)))
+                    @context/*declared-signals*)))))
+
+    (testing "declaration default follows the committed value across renders"
+      (swap! app-state* assoc-in [:sessions opt-session-id :data :cols 0 :width] 300)
+      (with-render-ctx app-state*
+        (h/optimistic (h/session-cursor [:cols 0 :width] 240))
+        (is (some #(and (= :session-cols-0-width (:path %))
+                        (= 300 (:default-val %)))
+                  @context/*declared-signals*))))))
+
+(deftest optimistic-validation-test
+  (let [app-state* (fresh-opt-state)]
+    (with-render-ctx app-state*
+      (testing "unscoped cursors are rejected"
+        (is (thrown-with-msg?
+              Exception #"scoped cursor"
+              (h/optimistic (state/create-cursor app-state* [:custom] :x)))))
+
+      (testing "unknown options are rejected"
+        (is (thrown-with-msg?
+              Exception #"unknown option"
+              (h/optimistic (h/session-cursor :title "") {:as :nope}))))
+
+      (testing "bad :on-conflict is rejected"
+        (is (thrown-with-msg?
+              Exception #"on-conflict"
+              (h/optimistic (h/session-cursor :title "") {:on-conflict :merge})))))))
+
+(deftest optimistic-duplicate-test
+  (let [app-state* (fresh-opt-state)]
+    (with-render-ctx app-state*
+      (testing "the same cursor wrapped twice with the same opts is fine"
+        (let [a* (h/optimistic (h/session-cursor :title ""))
+              b* (h/optimistic (h/session-cursor :title ""))]
+          (is (= (str a*) (str b*)))))
+
+      (testing "the same cursor with different opts throws"
+        (is (thrown-with-msg?
+              Exception #"different options"
+              (h/optimistic (h/session-cursor :title "") {:auto-commit? true})))))
+
+    (testing "opts may change across renders (fresh declaration scope)"
+      (with-render-ctx app-state*
+        (is (some? (h/optimistic (h/session-cursor :title "") {:auto-commit? true})))))))
+
+;; ---------------------------------------------------------------------------
+;; Optimistic — render-time down-sync
+;; ---------------------------------------------------------------------------
+
+(deftest optimistic-sync-test
+  (let [app-state* (fresh-opt-state)
+        sig-path   [:session-cols-0-width]
+        render!    #(with-render-ctx app-state*
+                      (h/optimistic (h/session-cursor [:cols 0 :width] 240)))]
+    (testing "first render records the committed value as synced, no patch state"
+      (render!)
+      (is (= 240 (get-in @app-state* [:tabs opt-tab-id :optimistic-synced sig-path])))
+      (is (= 240 (get-in @app-state* (into [:tabs opt-tab-id :signals] sig-path)))))
+
+    (testing "cursor unchanged — a client-side value in signal state is left alone"
+      (swap! app-state* assoc-in (into [:tabs opt-tab-id :signals] sig-path) 275)
+      (render!)
+      (is (= 275 (get-in @app-state* (into [:tabs opt-tab-id :signals] sig-path)))
+          "mid-gesture client state must not be stomped by a re-render")
+      (is (= 240 (get-in @app-state* [:tabs opt-tab-id :optimistic-synced sig-path]))))
+
+    (testing "server-side cursor change syncs signal state for patching"
+      (swap! app-state* assoc-in [:sessions opt-session-id :data :cols 0 :width] 500)
+      (render!)
+      (is (= 500 (get-in @app-state* (into [:tabs opt-tab-id :signals] sig-path))))
+      (is (= 500 (get-in @app-state* [:tabs opt-tab-id :optimistic-synced sig-path]))))
+
+    (testing "a committed client value syncs without altering signal state"
+      ;; Simulates a commit round trip: the POST merge already put 320 in
+      ;; signal state, then the commit moved the cursor to 320.
+      (swap! app-state* assoc-in (into [:tabs opt-tab-id :signals] sig-path) 320)
+      (swap! app-state* assoc-in [:sessions opt-session-id :data :cols 0 :width] 320)
+      (render!)
+      (is (= 320 (get-in @app-state* (into [:tabs opt-tab-id :signals] sig-path))))
+      (is (= 320 (get-in @app-state* [:tabs opt-tab-id :optimistic-synced sig-path]))))))
+
+;; ---------------------------------------------------------------------------
+;; Optimistic — action-context semantics
+;; ---------------------------------------------------------------------------
+
+(deftest optimistic-action-test
+  (let [app-state* (fresh-opt-state)
+        w*         (with-render-ctx app-state*
+                     (h/optimistic (h/session-cursor [:cols 0 :width] 240)))]
+    (testing "deref returns the client-reported value"
+      (binding [context/*signals* {:session-cols-0-width 300}]
+        (is (= 300 @w*))))
+
+    (testing "deref falls back to the committed value when the signal is absent"
+      (binding [context/*signals* {}]
+        (is (= 240 @w*))))
+
+    (testing "reset! writes the cursor, not the signal"
+      (binding [context/*signals* {:session-cols-0-width 300}]
+        (reset! w* 500)
+        (is (= 500 (get-in @app-state* [:sessions opt-session-id :data :cols 0 :width])))
+        (is (= 240 (get-in @app-state* [:tabs opt-tab-id :signals :session-cols-0-width]))
+            "tab signal state is untouched — down-sync patches the client")))
+
+    (testing "swap! operates on the committed value"
+      (binding [context/*signals* {:session-cols-0-width 300}]
+        (swap! w* + 10)
+        (is (= 510 (get-in @app-state* [:sessions opt-session-id :data :cols 0 :width])))))))
+
+;; ---------------------------------------------------------------------------
+;; Optimistic — commit and conflict policies
+;; ---------------------------------------------------------------------------
+
+(deftest resolve-commit-test
+  (let [ctx        {:base 100 :committed 100 :reported 150}
+        conflicted (assoc ctx :committed 120)]
+    (testing "default and :client-wins are last-write-wins"
+      (is (= 150 (signal/resolve-commit nil conflicted)))
+      (is (= 150 (signal/resolve-commit :client-wins conflicted))))
+
+    (testing "clean commit (base = committed) always takes the reported value"
+      (is (= 150 (signal/resolve-commit :server-wins ctx)))
+      (is (= 150 (signal/resolve-commit (fn [_] (throw (ex-info "not called" {}))) ctx))))
+
+    (testing ":server-wins keeps the committed value on conflict"
+      (is (= 120 (signal/resolve-commit :server-wins conflicted))))
+
+    (testing "a fn policy resolves the conflict"
+      (is (= 135 (signal/resolve-commit (fn [{:keys [committed reported]}]
+                                          (quot (+ committed reported) 2))
+                                        conflicted))))
+
+    (testing "nil base with a differing committed value counts as a conflict"
+      (is (= 120 (signal/resolve-commit :server-wins (assoc conflicted :base nil))))
+      (is (= :from-fn (signal/resolve-commit (fn [{:keys [base]}]
+                                               (is (nil? base))
+                                               :from-fn)
+                                             (assoc conflicted :base nil)))))))
+
+(deftest optimistic-commit-test
+  (testing "commit! outside an action throws"
+    (let [app-state* (fresh-opt-state)
+          w*         (with-render-ctx app-state*
+                       (h/optimistic (h/session-cursor :col-w 100)))]
+      (is (thrown-with-msg? Exception #"inside an action" (h/commit! w*)))))
+
+  (testing "commit! when the signal did not ride the request throws"
+    (let [app-state* (fresh-opt-state)
+          w*         (with-render-ctx app-state*
+                       (h/optimistic (h/session-cursor :col-w 100)))]
+      (binding [context/*signals* {:name "form-field"}]
+        (is (thrown-with-msg? Exception #"did not accompany" (h/commit! w*))))))
+
+  (testing "commit! writes the reported value (LWW default)"
+    (let [app-state* (fresh-opt-state)
+          w*         (with-render-ctx app-state*
+                       (h/optimistic (h/session-cursor :col-w 100)))]
+      (binding [context/*signals* {:session-col-w 150}]
+        (is (= 150 (h/commit! w*)))
+        (is (= 150 (get-in @app-state* [:sessions opt-session-id :data :col-w]))))))
+
+  (testing ":server-wins declares a base signal and rejects stale commits"
+    (let [app-state* (fresh-opt-state)]
+      (with-render-ctx app-state*
+        (let [w* (h/optimistic (h/session-cursor :col-w 100) {:on-conflict :server-wins})]
+          (is (some #(= :session-col-w-base (:path %)) @context/*declared-signals*)
+              "a base companion signal is declared")
+          ;; Another writer moved the cursor to 120 after this client synced.
+          (swap! app-state* assoc-in [:sessions opt-session-id :data :col-w] 120)
+          (binding [context/*signals* {:session-col-w 150 :session-col-w-base 100}]
+            (is (= 120 (h/commit! w*)) "stale base → committed value wins")
+            (is (= 120 (get-in @app-state* [:sessions opt-session-id :data :col-w]))))
+          ;; A fresh base commits cleanly.
+          (binding [context/*signals* {:session-col-w 150 :session-col-w-base 120}]
+            (is (= 150 (h/commit! w*))))))))
+
+  (testing "a fn policy resolves conflicted commits"
+    (let [app-state* (fresh-opt-state)]
+      (with-render-ctx app-state*
+        (let [w* (h/optimistic (h/session-cursor :col-w 100)
+                               {:on-conflict (fn [{:keys [committed reported]}]
+                                               (max committed reported))})]
+          (swap! app-state* assoc-in [:sessions opt-session-id :data :col-w] 200)
+          (binding [context/*signals* {:session-col-w 150 :session-col-w-base 100}]
+            (is (= 200 (h/commit! w*)) "max of committed 200 and reported 150"))))))
+
+  (testing "a pure rejection still corrects the client"
+    ;; The cursor does not change on rejection, so the down-sync alone
+    ;; would never patch — the commit path must write the correction.
+    (let [app-state* (fresh-opt-state)]
+      (with-render-ctx app-state*
+        (let [w* (h/optimistic (h/session-cursor :col-w 100) {:on-conflict :server-wins})]
+          (swap! app-state* assoc-in [:sessions opt-session-id :data :col-w] 120)
+          (with-render-ctx app-state*
+            (h/optimistic (h/session-cursor :col-w 100) {:on-conflict :server-wins}))
+          ;; Client reports 150 off a stale base; the merge already put 150
+          ;; into tab signal state, as the action handler would.
+          (swap! app-state* assoc-in [:tabs opt-tab-id :signals :session-col-w] 150)
+          (binding [context/*signals* {:session-col-w 150 :session-col-w-base 100}]
+            (is (= 120 (h/commit! w*))))
+          (is (= 120 (get-in @app-state* [:tabs opt-tab-id :signals :session-col-w]))
+              "the rejected value is replaced in signal state → patch flows")
+          (is (= 120 (get-in @app-state* [:tabs opt-tab-id :signals :session-col-w-base])))
+          (is (= 120 (get-in @app-state* [:tabs opt-tab-id :optimistic-synced [:session-col-w]])))))))
+
+  (testing "down-sync keeps the base signal in step with the committed value"
+    (let [app-state* (fresh-opt-state)
+          render!    #(with-render-ctx app-state*
+                        (h/optimistic (h/session-cursor :col-w 100) {:on-conflict :server-wins}))]
+      (render!)
+      (swap! app-state* assoc-in [:sessions opt-session-id :data :col-w] 300)
+      (render!)
+      (is (= 300 (get-in @app-state* [:tabs opt-tab-id :signals :session-col-w])))
+      (is (= 300 (get-in @app-state* [:tabs opt-tab-id :signals :session-col-w-base]))
+          "value and base patch together"))))
+
+(deftest optimistic-auto-commit-test
+  (let [app-state* (fresh-opt-state)]
+    (with-render-ctx app-state*
+      (h/optimistic (h/session-cursor :col-w 100) {:auto-commit? true})
+      (h/optimistic (h/session-cursor :title "untitled")))
+
+    (testing "auto-commit persists a riding signal value"
+      (signal/auto-commit! app-state* opt-tab-id {:session-col-w 175 :session-title "draft"})
+      (is (= 175 (get-in @app-state* [:sessions opt-session-id :data :col-w]))))
+
+    (testing "non-auto-commit optimistics are untouched"
+      (is (= "untitled" (get-in @app-state* [:sessions opt-session-id :data :title]))))
+
+    (testing "absent signals are skipped"
+      (signal/auto-commit! app-state* opt-tab-id {:unrelated 1})
+      (is (= 175 (get-in @app-state* [:sessions opt-session-id :data :col-w]))))))

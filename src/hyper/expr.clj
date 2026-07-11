@@ -1,4 +1,4 @@
-(ns hyper.expr
+(ns ^:no-doc hyper.expr
   "Clojure → Datastar expression transpiler.
 
    Write Datastar (data-*) expressions as s-expressions with hyper's own
@@ -23,6 +23,16 @@
    - Keyword-call forms `(:id person)` evaluate as Clojure at runtime and
      splice as literals (keywords are not callable client-side).
    - `~form` explicitly splices any other Clojure expression.
+   - `(h/action ...)` (any var tagged `:hyper/datastar-expr`) runs as Clojure
+     at render time — registering the action — and contributes its raw
+     `@post(...)` expression, so actions compose inside client-side control
+     flow: `(->expr (when (= $key \"Enter\") (h/action ...)))`.
+   - Client-param symbols (`$value`, `$checked`, `$key`, `$detail`,
+     `$form-data`, and any registered via `hyper.client-params`) expand to
+     their client-side JS accessor, the same vocabulary `action` uses:
+     `$key` → `evt.key`, `$value` → `evt.target.value`.  These names take
+     precedence, so a signal literally named `value` is reached via its
+     signal object (`@value*`), not the raw `$value` symbol.
    - Everything else is client-side: `$signal` symbols, `evt`/`el`,
      Datastar actions (`(@post \"/x\")`), JS interop and operators.
 
@@ -41,6 +51,8 @@
    remain the escape hatch everywhere expressions are accepted."
   (:require [clojure.string :as str]
             [clojure.walk :as walk]
+            [hyper.client-params :as client-params]
+            [hyper.datastar :as datastar]
             [hyper.signal :as signal]
             [squint.compiler :as squint]))
 
@@ -164,8 +176,28 @@
         node))
     form))
 
+(defn- process-client-params
+  "Replace client-param symbols ($value, $key, $form-data, … and any
+   user-registered ones) with their client-side JS, so expr shares the
+   event-accessor vocabulary of `action`: `(= $key \"Enter\")` compiles the
+   same as `(= evt.key \"Enter\")`.
+
+   These are the same registry symbols `action` uses; there, they also ride a
+   server round-trip, but expr is purely client-side, so only the `:js` is
+   emitted.  Because these names take precedence, a Datastar signal literally
+   named e.g. `value` must be referenced via its signal object (`@value*`)
+   rather than the raw `$value` symbol."
+  [form]
+  (let [params (client-params/defined-client-params)]
+    (walk/postwalk
+      (fn [node]
+        (if (and (symbol? node) (contains? params node))
+          (list 'js* (:js (client-params/client-param node)))
+          node))
+      form)))
+
 (defn- pre-process [form]
-  (-> form process-not-equals process-macros))
+  (-> form process-not-equals process-macros process-client-params))
 
 ;; ---------------------------------------------------------------------------
 ;; Post-processing (compiled JS level)
@@ -227,6 +259,17 @@
        (when-let [v (try (resolve sym) (catch Exception _ nil))]
          (and (var? v) (signal/any-signal? (deref v))))))
 
+(defn- datastar-expr-head?
+  "True when `sym` resolves (in the caller's ns at macro-expansion) to a Var
+   marked `:hyper/datastar-expr` — a macro/fn that produces a finished
+   Datastar expression, e.g. `h/action`.  Such a form is opaque to Squint:
+   `->expr` splices it whole so it runs as Clojure (in render context,
+   registering the action) and contributes its raw JS."
+  [sym]
+  (and (symbol? sym)
+       (when-let [v (try (resolve sym) (catch Exception _ nil))]
+         (boolean (:hyper/datastar-expr (meta v))))))
+
 (defn- add-placeholder!
   "Register expr for runtime splicing; returns the placeholder symbol.
    mode is :value (signals -> $ref, other values -> JS literal) or
@@ -267,6 +310,12 @@
 
               ;; (:kw m) — keyword calls are Clojure, not client-side
               (and (seq? node) (keyword? (first node)))
+              (add-placeholder! pairs* node :value)
+
+              ;; (action ...) and friends — a form producing a finished
+              ;; Datastar expression.  Splice the whole form as Clojure; it
+              ;; contributes its raw JS at runtime.
+              (and (seq? node) (datastar-expr-head? (first node)))
               (add-placeholder! pairs* node :value)
 
               ;; calls: keep the head symbol (or @action head) client-side,
@@ -318,16 +367,17 @@
 
 (defn splice
   "Encode a spliced runtime value.  :signal mode requires a signal object
-   (the target of reset!/swap!); :value mode turns signals into $refs and
-   everything else into a JS literal."
+   (the target of reset!/swap!); :value mode renders anything implementing
+   DatastarExpr (signals -> $ref, actions -> raw @post(...)) as raw JS and
+   everything else as a JS literal."
   [v mode]
   (case mode
     :signal (if (signal/any-signal? v)
               (signal/js-ref v)
               (throw (ex-info "reset!/swap! target in an expression must be a signal"
                               {:value v})))
-    :value  (if (signal/any-signal? v)
-              (signal/js-ref v)
+    :value  (if (datastar/datastar-expr? v)
+              (datastar/-datastar-js v)
               (signal/clj->js-literal v))))
 
 (defn substitute

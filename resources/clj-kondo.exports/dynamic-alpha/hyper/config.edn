@@ -1,6 +1,9 @@
 {:hooks
  {:analyze-call {hyper.component/defc hooks.hyper.component/defc
-                 hyper.core/defc      hooks.hyper.component/defc}}
+                 hyper.core/defc      hooks.hyper.component/defc
+                 hyper.core/async     hooks.hyper.async/async
+                 hyper.core/reactive  hooks.hyper.reactive/reactive
+                 hyper.core/action    hooks.hyper.action/action}}
 
  :config-in-call
  {hyper.component/defc
@@ -28,4 +31,4 @@
 
  :linters
  {:unresolved-symbol
-  {:exclude [(hyper.core/action [$value $checked $key $detail $form-data])]}}}
+  {:exclude [(hyper.core/action [$value $checked $key $detail $form-data $form $files])]}}}
