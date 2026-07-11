@@ -20,8 +20,16 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Run the same build/lint/format/test gate CI uses. The deploy job depends on
+  # this, so a release can't reach Clojars unless every check CI enforces
+  # passes — no release-only path that skips lint/format.
+  checks:
+    name: Checks
+    uses: ./.github/workflows/checks.yaml
+
   deploy:
     name: Deploy to Clojars
+    needs: checks
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -102,9 +110,6 @@ jobs:
             exit 1
           fi
           echo "✓ Found CHANGELOG.md entry for ${VERSION}"
-
-      - name: Run tests
-        run: nix-shell --run "clojure -M:main:test"
 
       - name: Deploy to Clojars
         env:
