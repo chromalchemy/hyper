@@ -47,6 +47,7 @@
 ;;                {:kind :update :path p :f g}
 ;;                {:kind :reset  :path p :value v}
 ;;                {:kind :cas    :path p :old o :new n}
+;;                {:kind :init   :path p :value v}   ;; set only if p absent
 ;;   :owner   — the Thread that created the overlay (see ownership below)
 ;;
 ;; Bound during render (read consistency) and inside `batch` (atomicity).
@@ -85,8 +86,10 @@
   "Replay an ordered op-log against a state value, returning the new state.
    :update applies its fn to the current value (composing with concurrent
    writes), :reset overwrites the path, :cas writes only when the value
-   still equals the expected old.  Pure — runs inside flush-overlay!'s
-   swap!, so op fns must be side-effect free, as with clojure.core/swap!."
+   still equals the expected old, :init writes only when the path is still
+   absent (a default-init that yields to any concurrent write, including one
+   that set the path to nil).  Pure — runs inside flush-overlay!'s swap!, so
+   op fns must be side-effect free, as with clojure.core/swap!."
   [state ops]
   (reduce (fn [s {:keys [kind path] :as op}]
             (case kind
@@ -94,6 +97,9 @@
               :reset  (assoc-in s path (:value op))
               :cas    (if (= (get-in s path) (:old op))
                         (assoc-in s path (:new op))
+                        s)
+              :init   (if (identical? ::absent (get-in s path ::absent))
+                        (assoc-in s path (:value op))
                         s)))
           state
           ops))
