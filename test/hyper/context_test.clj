@@ -89,6 +89,14 @@
     (is (= {:x 9} (context/apply-ops {:x 9} [{:kind :cas :path [:x] :old 1 :new 2}]))
         "diverged old → no-op (yields to the concurrent value)"))
 
+  (testing ":init writes only when the path is still absent"
+    (is (= {:x 5} (context/apply-ops {} [{:kind :init :path [:x] :value 5}]))
+        "absent path → applies the default")
+    (is (= {:x nil} (context/apply-ops {:x nil} [{:kind :init :path [:x] :value 5}]))
+        "explicit nil present → no-op (nil is a real value, not absent)")
+    (is (= {:x 7} (context/apply-ops {:x 7} [{:kind :init :path [:x] :value 5}]))
+        "existing value present → no-op"))
+
   (testing "ops are replayed in recorded order"
     (is (= {:x 3}
            (context/apply-ops {:x 0}
@@ -149,8 +157,8 @@
           (is (nil? (live app :x)) "still not live"))))))
 
 (deftest default-init-yields-to-concurrent-live-write
-  (testing "a default-value init is a CAS that yields to a real write landing
-            before flush, rather than clobbering it"
+  (testing "a default-value init is a set-if-absent op that yields to a real
+            write landing before flush, rather than clobbering it"
     (let [app (fresh-app)]
       (with-overlay app
         (state/tab-cursor app tab :x 42)
@@ -158,6 +166,29 @@
         (swap! app assoc-in [:tabs tab :data :x] 99)
         (context/flush-overlay! app)
         (is (= 99 (live app :x)))))))
+
+(deftest default-init-preserves-explicit-nil-at-flush
+  (testing "a default-value init yields even to a concurrent write of nil —
+            an explicit nil is a real value, not 'unset', so it is not
+            clobbered by the default at flush"
+    (let [app (fresh-app)]
+      (with-overlay app
+        (state/tab-cursor app tab :x 42)
+        ;; concurrent writer sets an explicit nil before the flush
+        (swap! app assoc-in [:tabs tab :data :x] nil)
+        (context/flush-overlay! app)
+        (is (contains? (get-in @app [:tabs tab :data]) :x)
+            "the key is present with a nil value")
+        (is (nil? (live app :x)) "explicit nil survived the default init"))))
+
+  (testing "a default-value init leaves an explicit nil already in live state
+            untouched"
+    (let [app (fresh-app)]
+      (swap! app assoc-in [:tabs tab :data :x] nil)
+      (with-overlay app
+        (state/tab-cursor app tab :x 42)
+        (context/flush-overlay! app))
+      (is (nil? (live app :x))))))
 
 (deftest pre-flush-writes-land-in-one-transition
   (testing "all user writes buffered before the flush commit in a single

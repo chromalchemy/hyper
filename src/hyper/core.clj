@@ -84,21 +84,26 @@
    to update the browser URL bar.
 
    Path can be a keyword or vector of keywords for the query param key(s).
-   If default-value is provided and the query param is nil, initializes with default-value.
+   If default-value is provided and the query param is unset, initializes with
+   default-value.  A query param explicitly holding nil is left untouched.
 
    Example:
-     (path-cursor :count 0)     ;; URL: /?count=0
-     (path-cursor :search \"\")   ;; URL: /?search=hello"
+     (path-cursor :count 0)      ;; URL: /?count=0
+     (path-cursor :search \"\")    ;; URL: /?search=   (an empty string is kept)
+
+     ;; The default only fills an *unset* param; an explicit nil is preserved
+     ;; (not re-defaulted) and, unlike \"\", is omitted from the URL.  A write's
+     ;; URL shows on the next render, not the one that made it:
+     (path-cursor :filter \"all\")               ;; unset → \"all\" (URL: /?filter=all)
+     (reset! (path-cursor :filter \"all\") nil)  ;; clear to nil (URL: /)
+     (path-cursor :filter \"all\")               ;; still nil — default not reapplied"
   ([path]
    (let [{:keys [tab-id app-state*]} (context/require-context! "path-cursor")]
      (state/stamp-scope!
        (state/create-cursor app-state* [:tabs tab-id :route :query-params] path)
        :path path)))
   ([path default-value]
-   (let [cursor (path-cursor path)]
-     ;; cas so the default init yields to a concurrent write (see state/Cursor).
-     (compare-and-set! cursor nil default-value)
-     cursor)))
+   (state/init-default! (path-cursor path) default-value)))
 
 (def Watchable
   "Protocol for external state sources that `watch!` can observe. Extended

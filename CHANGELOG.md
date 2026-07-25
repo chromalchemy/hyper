@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.2 — 2026-07-14
+
+### Bug Fixes
+- Preserve explicit nil in cursor default init
+
+### Build
+- Gate Clojars release on CI
+
 ## 0.2.1 — 2026-07-10
 
 ### Bug Fixes

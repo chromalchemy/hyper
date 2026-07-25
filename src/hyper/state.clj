@@ -140,6 +140,29 @@
   (let [full-path (into (vec path-prefix) (normalize-path path))]
     (->Cursor parent-atom full-path (atom {}) nil (atom {}))))
 
+(defn init-default!
+  "Initialize a cursor's path with `default-value`, but only when the path is
+   currently *absent* — never written.  A path explicitly holding nil is left
+   untouched, so a value a component set to nil is not silently reset to the
+   default on the next render.  Returns the cursor.
+
+   Under an owned overlay (render or `batch`) the init is recorded as an
+   :init op replayed at flush, so it yields to any concurrent same-path write
+   — including one that sets the path to nil — rather than clobbering it."
+  [^Cursor cursor default-value]
+  (let [full-path   (.-full-path cursor)
+        parent-atom (.-parent-atom cursor)]
+    (if-let [{state* :state* ops* :ops*} (context/current-overlay)]
+      (when (identical? ::absent (get-in @state* full-path ::absent))
+        (swap! state* assoc-in full-path default-value)
+        (swap! ops* conj {:kind :init :path full-path :value default-value}))
+      (loop []
+        (let [s @parent-atom]
+          (when (identical? ::absent (get-in s full-path ::absent))
+            (when-not (compare-and-set! parent-atom s (assoc-in s full-path default-value))
+              (recur)))))))
+  cursor)
+
 (defn stamp-scope!
   "Stamp a cursor with :hyper/scope and :hyper/path metadata.  Returns the
    cursor."
@@ -150,39 +173,34 @@
 
 (defn session-cursor
   "Create a cursor to session state at the given path.
-   If default-value is provided and the path is nil, initializes with default-value."
+   If default-value is provided and the path is unset, initializes with
+   default-value.  A path explicitly holding nil is left untouched."
   ([app-state* session-id path]
    (stamp-scope! (create-cursor app-state* [:sessions session-id :data] path)
                  :session path))
   ([app-state* session-id path default-value]
-   (let [cursor (session-cursor app-state* session-id path)]
-     ;; cas (not read-then-reset) so a default init yields to a concurrent
-     ;; write at flush rather than clobbering it.
-     (compare-and-set! cursor nil default-value)
-     cursor)))
+   (init-default! (session-cursor app-state* session-id path) default-value)))
 
 (defn tab-cursor
   "Create a cursor to tab state at the given path.
-   If default-value is provided and the path is nil, initializes with default-value."
+   If default-value is provided and the path is unset, initializes with
+   default-value.  A path explicitly holding nil is left untouched."
   ([app-state* tab-id path]
    (stamp-scope! (create-cursor app-state* [:tabs tab-id :data] path)
                  :tab path))
   ([app-state* tab-id path default-value]
-   (let [cursor (tab-cursor app-state* tab-id path)]
-     (compare-and-set! cursor nil default-value)
-     cursor)))
+   (init-default! (tab-cursor app-state* tab-id path) default-value)))
 
 (defn global-cursor
   "Create a cursor to global state at the given path.
    Global state is shared across all sessions and tabs.
-   If default-value is provided and the path is nil, initializes with default-value."
+   If default-value is provided and the path is unset, initializes with
+   default-value.  A path explicitly holding nil is left untouched."
   ([app-state* path]
    (stamp-scope! (create-cursor app-state* [:global] path)
                  :global path))
   ([app-state* path default-value]
-   (let [cursor (global-cursor app-state* path)]
-     (compare-and-set! cursor nil default-value)
-     cursor)))
+   (init-default! (global-cursor app-state* path) default-value)))
 
 (defn init-state
   "Create initial app state structure."

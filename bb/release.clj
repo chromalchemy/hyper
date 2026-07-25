@@ -5,18 +5,20 @@
     bb release <patch|minor|major>   ; bump the latest vX.Y.Z tag
     bb release X.Y.Z                 ; release an explicit version
     bb release ... --retag           ; reuse an existing tag (re-stamp + move it)
+    bb release ... --no-tag          ; stamp + commit the changelog only, no tag
     bb release ... --push            ; also push the branch and tag
 
   The generated section is inserted beneath the hand-written CHANGELOG.md
   preamble. Pushing a vX.Y.Z tag is what triggers the Clojars deploy, so this
-  task stops at the tag by default and prints the push command."
+  task stops at the tag by default and prints the push command. Pass --no-tag
+  to only stamp and commit the changelog (no tag is created or pushed)."
   (:require [babashka.process :as p]
             [clojure.string :as str]))
 
 (def ^:private changelog "CHANGELOG.md")
 
 (def ^:private usage
-  "Usage: bb release <patch|minor|major|X.Y.Z> [--retag] [--push]")
+  "Usage: bb release <patch|minor|major|X.Y.Z> [--retag] [--no-tag] [--push]")
 
 (defn- fail [msg]
   (binding [*out* *err*] (println "release:" msg))
@@ -117,7 +119,8 @@
         positional (remove #(str/starts-with? % "--") args)
         spec       (first positional)
         retag?     (contains? flags "--retag")
-        push?      (contains? flags "--push")]
+        push?      (contains? flags "--push")
+        no-tag?    (contains? flags "--no-tag")]
     (when-not spec
       (println usage)
       (System/exit 2))
@@ -128,9 +131,12 @@
           existed? (tag-exists? tag)]
       (when (and existed? (not retag?))
         (fail (str "tag " tag " already exists — pass --retag to re-stamp and move it.")))
-      (println (str "Releasing " tag (when (and existed? retag?) " (retag)")))
+      (println (str "Releasing " tag
+                    (when (and existed? retag?) " (retag)")
+                    (when no-tag? " (no tag)")))
       ;; Retag: drop the local tag so those commits count as unreleased again.
-      (when (and existed? retag?)
+      ;; Skipped under --no-tag, which never touches tags.
+      (when (and existed? retag? (not no-tag?))
         (git "tag" "-d" tag)
         (println (str "  deleted local tag " tag)))
       (let [content (slurp changelog)]
@@ -143,16 +149,28 @@
           (git "add" changelog)
           (git "commit" "-m" (str "docs: changelog for " tag))
           (println "  committed changelog")
-          (git "tag" tag)
-          (println (str "  tagged " tag))
-          (if push?
+          (if no-tag?
+            (println "  skipped tag (--no-tag)")
+            (do (git "tag" tag)
+                (println (str "  tagged " tag))))
+          (cond
+            push?
             (do
               (println "Pushing…")
               (git "push" "origin" "HEAD")
-              (if (and existed? (remote-tag-exists? tag))
-                (git "push" "origin" tag "--force")
-                (git "push" "origin" tag))
+              (when-not no-tag?
+                (if (and existed? (remote-tag-exists? tag))
+                  (git "push" "origin" tag "--force")
+                  (git "push" "origin" tag)))
               (println "Pushed."))
+
+            ;; --no-tag: just a changelog commit, no tag to push.
+            no-tag?
+            (do
+              (println "\nChangelog committed (no tag). Push when ready:")
+              (println "  git push origin HEAD"))
+
+            :else
             (let [force? (and existed? (remote-tag-exists? tag))]
               (println "\nReview, then push to trigger the release:")
               (println (str "  git push origin HEAD"

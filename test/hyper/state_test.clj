@@ -249,6 +249,73 @@
         (is (= {} @cursor))
         (is (= {} (get-in @app-state* [:sessions session-id :data :user :preferences])))))))
 
+(deftest cursor-default-value-preserves-explicit-nil-test
+  (testing "session-cursor default does not overwrite an explicit nil"
+    (let [app-state* (atom (state/init-state))
+          session-id "sess-nil"]
+      (state/get-or-create-session! app-state* session-id)
+      ;; first render initializes an absent path
+      (is (= "default" @(state/session-cursor app-state* session-id :sel "default")))
+      ;; a component writes nil (e.g. "nothing selected")
+      (reset! (state/session-cursor app-state* session-id :sel) nil)
+      (is (contains? (get-in @app-state* [:sessions session-id :data]) :sel)
+          "the key is present with a nil value, not absent")
+      ;; next render re-creates the cursor with the same default — nil must survive
+      (is (nil? @(state/session-cursor app-state* session-id :sel "default")))))
+
+  (testing "tab-cursor default does not overwrite an explicit nil"
+    (let [app-state* (atom (state/init-state))
+          session-id "sess-nil-2"
+          tab-id     "tab_nil"]
+      (state/get-or-create-tab! app-state* session-id tab-id)
+      (is (= "default" @(state/tab-cursor app-state* tab-id :sel "default")))
+      (reset! (state/tab-cursor app-state* tab-id :sel) nil)
+      (is (nil? @(state/tab-cursor app-state* tab-id :sel "default")))))
+
+  (testing "global-cursor default does not overwrite an explicit nil"
+    (let [app-state* (atom (state/init-state))]
+      (is (= "default" @(state/global-cursor app-state* :sel "default")))
+      (reset! (state/global-cursor app-state* :sel) nil)
+      (is (nil? @(state/global-cursor app-state* :sel "default")))))
+
+  (testing "nested-path default does not overwrite an explicit nil"
+    (let [app-state* (atom (state/init-state))
+          session-id "sess-nil-3"]
+      (state/get-or-create-session! app-state* session-id)
+      (is (= 0 @(state/session-cursor app-state* session-id [:a :b] 0)))
+      (reset! (state/session-cursor app-state* session-id [:a :b]) nil)
+      (is (nil? @(state/session-cursor app-state* session-id [:a :b] 0))))))
+
+(deftest init-default!-test
+  (testing "initializes an absent path"
+    (let [app-state* (atom (state/init-state))]
+      (state/get-or-create-session! app-state* "s")
+      (let [cursor (state/session-cursor app-state* "s" :k)]
+        (state/init-default! cursor 42)
+        (is (= 42 @cursor)))))
+
+  (testing "leaves an explicit nil in place"
+    (let [app-state* (atom (state/init-state))]
+      (state/get-or-create-session! app-state* "s")
+      (swap! app-state* assoc-in [:sessions "s" :data :k] nil)
+      (let [cursor (state/session-cursor app-state* "s" :k)]
+        (state/init-default! cursor 42)
+        (is (nil? @cursor)))))
+
+  (testing "leaves an existing non-nil value in place"
+    (let [app-state* (atom (state/init-state))]
+      (state/get-or-create-session! app-state* "s")
+      (swap! app-state* assoc-in [:sessions "s" :data :k] 7)
+      (let [cursor (state/session-cursor app-state* "s" :k)]
+        (state/init-default! cursor 42)
+        (is (= 7 @cursor)))))
+
+  (testing "returns the cursor"
+    (let [app-state* (atom (state/init-state))]
+      (state/get-or-create-session! app-state* "s")
+      (let [cursor (state/session-cursor app-state* "s" :k)]
+        (is (identical? cursor (state/init-default! cursor 1)))))))
+
 (deftest global-cursor-test
   (testing "global-cursor reads/writes to global state"
     (let [app-state* (atom (state/init-state))
